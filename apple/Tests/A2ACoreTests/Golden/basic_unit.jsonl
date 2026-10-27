@@ -1,0 +1,28 @@
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"session.start","pair":"zh-CN>en-US","schema":0}
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"state.change","from":"idle","to":"arming","reason":"arm"}
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"state.change","from":"arming","to":"listening","reason":"armed"}
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"gain.ramp","original":1.0,"translated":0.0,"ms":0}
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"profile.ready","spk":"S1","prof":1}
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"buf.capture","span":[0,4800],"frames":4800}
+{"v":0,"t_ns":100000000,"session":"golden","epoch":1,"gen":1,"ev":"vad.start","src_sample":4800}
+{"v":0,"t_ns":100000000,"session":"golden","epoch":1,"gen":1,"ev":"state.change","from":"listening","to":"acquiring_voice(S1)","reason":"speech"}
+{"v":0,"t_ns":400000000,"session":"golden","epoch":1,"gen":1,"ev":"asr.partial","span":[4800,19200],"utt":1,"text":"我们下周"}
+{"v":0,"t_ns":700000000,"session":"golden","epoch":1,"gen":1,"ev":"asr.partial","span":[4800,33600],"utt":1,"text":"我们下周开会。"}
+{"v":0,"t_ns":900000000,"session":"golden","epoch":1,"gen":1,"ev":"asr.partial","span":[4800,43200],"utt":1,"text":"我们下周开会。"}
+{"v":0,"t_ns":900000000,"session":"golden","epoch":1,"gen":1,"ev":"commit.source","unit":"u1","spk":"S1","span":[4800,43200],"reason":"sentence_end","timing_estimated":true,"wait_ms":200,"text":"我们下周开会。"}
+{"v":0,"t_ns":900000000,"session":"golden","epoch":1,"gen":1,"ev":"mt.request","unit":"u1","context_pairs":0}
+{"v":0,"t_ns":1000000000,"session":"golden","epoch":1,"gen":1,"ev":"mt.result","unit":"u1","ok":true}
+{"v":0,"t_ns":1000000000,"session":"golden","epoch":1,"gen":1,"ev":"commit.target","unit":"u1","spk":"S1","prof":1,"span":[4800,43200],"text":"We will meet next week."}
+{"v":0,"t_ns":1000000000,"session":"golden","epoch":1,"gen":1,"ev":"tts.request","unit":"u1","prof":1,"chars":23}
+{"v":0,"t_ns":1200000000,"session":"golden","epoch":1,"gen":1,"ev":"tts.first_chunk","unit":"u1","frames":1200,"rate":24000}
+{"v":0,"t_ns":1250000000,"session":"golden","epoch":1,"gen":1,"ev":"tts.chunk","unit":"u1","frames":2400,"rate":24000}
+{"v":0,"t_ns":1250000000,"session":"golden","epoch":1,"gen":1,"ev":"state.change","from":"acquiring_voice(S1)","to":"translating(S1)","reason":"handoff u1"}
+{"v":0,"t_ns":1250000000,"session":"golden","epoch":1,"gen":1,"ev":"play.scheduled","unit":"u1","handoff":true}
+{"v":0,"t_ns":1250000000,"session":"golden","epoch":1,"gen":1,"ev":"gain.ramp","original":0.0,"translated":1.0,"ms":30}
+{"v":0,"t_ns":1300000000,"session":"golden","epoch":1,"gen":1,"ev":"play.start","unit":"u1","out_sample":62400}
+{"v":0,"t_ns":1700000000,"session":"golden","epoch":1,"gen":1,"ev":"vad.end","src_sample":81600}
+{"v":0,"t_ns":1700000000,"session":"golden","epoch":1,"gen":1,"ev":"asr.finalize_request","utt":1}
+{"v":0,"t_ns":1800000000,"session":"golden","epoch":1,"gen":1,"ev":"asr.final","span":[4800,86400],"utt":1,"text":"我们下周开会。"}
+{"v":0,"t_ns":2900000000,"session":"golden","epoch":1,"gen":1,"ev":"play.end","unit":"u1","out_sample":141600}
+{"v":0,"t_ns":2900000000,"session":"golden","epoch":1,"gen":1,"ev":"source.disposition","unit":"u1","span":[4800,43200],"disposition":"translated","reason":"handoff"}
+{"v":0,"t_ns":3000000000,"session":"golden","epoch":1,"gen":1,"ev":"queue.depth","debt_ms":0,"oldest_source_age_ms":0,"units_pending":0}

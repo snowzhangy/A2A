@@ -1,0 +1,50 @@
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"session.start","pair":"zh-CN>en-US","schema":0}
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"state.change","from":"idle","to":"arming","reason":"arm"}
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"state.change","from":"arming","to":"listening","reason":"armed"}
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"gain.ramp","original":1.0,"translated":0.0,"ms":0}
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"profile.ready","spk":"S1","prof":1}
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"buf.capture","span":[0,48000],"frames":48000}
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"vad.start","src_sample":0}
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"state.change","from":"listening","to":"acquiring_voice(S1)","reason":"speech"}
+{"v":0,"t_ns":500000000,"session":"golden","epoch":1,"gen":1,"ev":"asr.partial","span":[0,24000],"utt":1,"text":"第一句话。"}
+{"v":0,"t_ns":600000000,"session":"golden","epoch":1,"gen":1,"ev":"asr.partial","span":[0,28800],"utt":1,"text":"第一句话。"}
+{"v":0,"t_ns":600000000,"session":"golden","epoch":1,"gen":1,"ev":"commit.source","unit":"u1","spk":"S1","span":[0,28800],"reason":"sentence_end","timing_estimated":true,"wait_ms":0,"text":"第一句话。"}
+{"v":0,"t_ns":600000000,"session":"golden","epoch":1,"gen":1,"ev":"mt.request","unit":"u1","context_pairs":0}
+{"v":0,"t_ns":700000000,"session":"golden","epoch":1,"gen":1,"ev":"mt.result","unit":"u1","ok":true}
+{"v":0,"t_ns":700000000,"session":"golden","epoch":1,"gen":1,"ev":"commit.target","unit":"u1","spk":"S1","prof":1,"span":[0,28800],"text":"First sentence."}
+{"v":0,"t_ns":700000000,"session":"golden","epoch":1,"gen":1,"ev":"tts.request","unit":"u1","prof":1,"chars":15}
+{"v":0,"t_ns":800000000,"session":"golden","epoch":1,"gen":1,"ev":"tts.first_chunk","unit":"u1","frames":4800,"rate":24000}
+{"v":0,"t_ns":800000000,"session":"golden","epoch":1,"gen":1,"ev":"state.change","from":"acquiring_voice(S1)","to":"translating(S1)","reason":"handoff u1"}
+{"v":0,"t_ns":800000000,"session":"golden","epoch":1,"gen":1,"ev":"play.scheduled","unit":"u1","handoff":true}
+{"v":0,"t_ns":800000000,"session":"golden","epoch":1,"gen":1,"ev":"gain.ramp","original":0.0,"translated":1.0,"ms":30}
+{"v":0,"t_ns":900000000,"session":"golden","epoch":1,"gen":1,"ev":"asr.partial","span":[0,43200],"utt":1,"text":"第一句话。第二句话。"}
+{"v":0,"t_ns":1000000000,"session":"golden","epoch":1,"gen":1,"ev":"asr.partial","span":[0,48000],"utt":1,"text":"第一句话。第二句话。"}
+{"v":0,"t_ns":1000000000,"session":"golden","epoch":1,"gen":1,"ev":"commit.source","unit":"u2","spk":"S1","span":[28800,48000],"reason":"sentence_end","timing_estimated":true,"wait_ms":0,"text":"第二句话。"}
+{"v":0,"t_ns":1000000000,"session":"golden","epoch":1,"gen":1,"ev":"mt.request","unit":"u2","context_pairs":1}
+{"v":0,"t_ns":1100000000,"session":"golden","epoch":1,"gen":1,"ev":"mt.result","unit":"u2","ok":true}
+{"v":0,"t_ns":1100000000,"session":"golden","epoch":1,"gen":1,"ev":"commit.target","unit":"u2","spk":"S1","prof":1,"span":[28800,48000],"text":"Second sentence."}
+{"v":0,"t_ns":1100000000,"session":"golden","epoch":1,"gen":1,"ev":"tts.request","unit":"u2","prof":1,"chars":16}
+{"v":0,"t_ns":1200000000,"session":"golden","epoch":1,"gen":1,"ev":"queue.depth","debt_ms":4567,"oldest_source_age_ms":1600,"units_pending":2}
+{"v":0,"t_ns":1200000000,"session":"golden","epoch":1,"gen":1,"ev":"state.change","from":"translating(S1)","to":"degraded","reason":"debt"}
+{"v":0,"t_ns":1200000000,"session":"golden","epoch":1,"gen":1,"ev":"gain.ramp","original":1.0,"translated":0.0,"ms":30}
+{"v":0,"t_ns":1200000000,"session":"golden","epoch":1,"gen":2,"ev":"unit.cancel","unit":"u1","reason":"fallback"}
+{"v":0,"t_ns":1200000000,"session":"golden","epoch":1,"gen":2,"ev":"source.disposition","unit":"u1","span":[0,28800],"disposition":"abandoned","reason":"fallback"}
+{"v":0,"t_ns":1200000000,"session":"golden","epoch":1,"gen":2,"ev":"unit.cancel","unit":"u2","reason":"fallback"}
+{"v":0,"t_ns":1200000000,"session":"golden","epoch":1,"gen":2,"ev":"source.disposition","unit":"u2","span":[28800,48000],"disposition":"abandoned","reason":"fallback"}
+{"v":0,"t_ns":1200000000,"session":"golden","epoch":1,"gen":2,"ev":"fallback.enter","reason":"debt"}
+{"v":0,"t_ns":1300000000,"session":"golden","epoch":1,"gen":2,"ev":"pcm.reject","unit":"u2","chunk_gen":1,"reason":"stale_generation"}
+{"v":0,"t_ns":1400000000,"session":"golden","epoch":1,"gen":2,"ev":"queue.depth","debt_ms":0,"oldest_source_age_ms":1400,"units_pending":0}
+{"v":0,"t_ns":1500000000,"session":"golden","epoch":1,"gen":2,"ev":"asr.partial","span":[0,72000],"utt":1,"text":"第一句话。第二句话。第三句。"}
+{"v":0,"t_ns":1600000000,"session":"golden","epoch":1,"gen":2,"ev":"asr.partial","span":[0,76800],"utt":1,"text":"第一句话。第二句话。第三句。"}
+{"v":0,"t_ns":1600000000,"session":"golden","epoch":1,"gen":2,"ev":"commit.source","unit":"u3","spk":"S1","span":[48000,76800],"reason":"sentence_end","timing_estimated":true,"wait_ms":0,"text":"第三句。"}
+{"v":0,"t_ns":1600000000,"session":"golden","epoch":1,"gen":2,"ev":"mt.request","unit":"u3","context_pairs":2}
+{"v":0,"t_ns":1700000000,"session":"golden","epoch":1,"gen":2,"ev":"mt.result","unit":"u3","ok":true}
+{"v":0,"t_ns":1700000000,"session":"golden","epoch":1,"gen":2,"ev":"commit.target","unit":"u3","spk":"S1","prof":1,"span":[48000,76800],"text":"Third."}
+{"v":0,"t_ns":1700000000,"session":"golden","epoch":1,"gen":2,"ev":"tts.request","unit":"u3","prof":1,"chars":6}
+{"v":0,"t_ns":1800000000,"session":"golden","epoch":1,"gen":2,"ev":"tts.first_chunk","unit":"u3","frames":4800,"rate":24000}
+{"v":0,"t_ns":2000000000,"session":"golden","epoch":1,"gen":2,"ev":"queue.depth","debt_ms":200,"oldest_source_age_ms":2000,"units_pending":1}
+{"v":0,"t_ns":3500000000,"session":"golden","epoch":1,"gen":2,"ev":"queue.depth","debt_ms":200,"oldest_source_age_ms":3500,"units_pending":1}
+{"v":0,"t_ns":3500000000,"session":"golden","epoch":1,"gen":2,"ev":"state.change","from":"degraded","to":"translating(S1)","reason":"recovered u3"}
+{"v":0,"t_ns":3500000000,"session":"golden","epoch":1,"gen":2,"ev":"play.scheduled","unit":"u3","handoff":true}
+{"v":0,"t_ns":3500000000,"session":"golden","epoch":1,"gen":2,"ev":"fallback.exit","unit":"u3"}
+{"v":0,"t_ns":3500000000,"session":"golden","epoch":1,"gen":2,"ev":"gain.ramp","original":0.0,"translated":1.0,"ms":30}

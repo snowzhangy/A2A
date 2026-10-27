@@ -1,0 +1,21 @@
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"session.start","pair":"zh-CN>en-US","schema":0}
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"state.change","from":"idle","to":"arming","reason":"arm"}
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"state.change","from":"arming","to":"listening","reason":"armed"}
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"gain.ramp","original":1.0,"translated":0.0,"ms":0}
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"profile.ready","spk":"S1","prof":1}
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"vad.start","src_sample":0}
+{"v":0,"t_ns":0,"session":"golden","epoch":1,"gen":1,"ev":"state.change","from":"listening","to":"acquiring_voice(S1)","reason":"speech"}
+{"v":0,"t_ns":200000000,"session":"golden","epoch":1,"gen":1,"ev":"asr.final","span":[0,9600],"utt":1,"text":"这是测试。"}
+{"v":0,"t_ns":200000000,"session":"golden","epoch":1,"gen":1,"ev":"commit.source","unit":"u1","spk":"S1","span":[0,9600],"reason":"sentence_end","timing_estimated":true,"wait_ms":0,"text":"这是测试。"}
+{"v":0,"t_ns":200000000,"session":"golden","epoch":1,"gen":1,"ev":"mt.request","unit":"u1","context_pairs":0}
+{"v":0,"t_ns":300000000,"session":"golden","epoch":1,"gen":1,"ev":"mt.result","unit":"u1","ok":true}
+{"v":0,"t_ns":300000000,"session":"golden","epoch":1,"gen":1,"ev":"commit.target","unit":"u1","spk":"S1","prof":1,"span":[0,9600],"text":"This is a test."}
+{"v":0,"t_ns":300000000,"session":"golden","epoch":1,"gen":1,"ev":"tts.request","unit":"u1","prof":1,"chars":15}
+{"v":0,"t_ns":400000000,"session":"golden","epoch":1,"gen":1,"ev":"error","where":"source","message":"discontinuity: device change"}
+{"v":0,"t_ns":400000000,"session":"golden","epoch":1,"gen":1,"ev":"unit.cancel","unit":"u1","reason":"discontinuity"}
+{"v":0,"t_ns":400000000,"session":"golden","epoch":1,"gen":1,"ev":"source.disposition","unit":"u1","span":[0,9600],"disposition":"abandoned","reason":"discontinuity"}
+{"v":0,"t_ns":400000000,"session":"golden","epoch":2,"gen":2,"ev":"state.change","from":"idle","to":"arming","reason":"arm"}
+{"v":0,"t_ns":400000000,"session":"golden","epoch":2,"gen":2,"ev":"state.change","from":"arming","to":"listening","reason":"armed"}
+{"v":0,"t_ns":400000000,"session":"golden","epoch":2,"gen":2,"ev":"gain.ramp","original":1.0,"translated":0.0,"ms":0}
+{"v":0,"t_ns":500000000,"session":"golden","epoch":2,"gen":2,"ev":"pcm.reject","unit":"u1","chunk_gen":1,"reason":"stale_epoch"}
+{"v":0,"t_ns":600000000,"session":"golden","epoch":2,"gen":2,"ev":"mt.result","unit":"u1","ok":false,"reason":"stale"}

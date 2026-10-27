@@ -1,0 +1,25 @@
+# Local caches: models, consented/licensed evaluation audio, run directories, apps.
+.local/
+# Per-machine runtime captures/inventories; publish aggregate reports instead.
+reports/week2/raw/
+
+# Swift
+apple/.build/
+apple/.swiftpm/
+*.xcuserstate
+xcuserdata/
+DerivedData/
+
+# Python
+harness/.venv/
+research/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Raw participant audio, transcripts, voice prompts, and full text traces never go in git.
+*.participant.*
+fixtures/**/*.wav
+!fixtures/contract/**/*.wav
+
+.DS_Store

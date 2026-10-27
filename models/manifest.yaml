@@ -1,0 +1,403 @@
+# Model manifest (IMPLEMENTATION_PLAN.md section 5, ticket T0.2).
+#
+# status: declared  → candidate named in the plan; nothing pinned or verified
+#         verified  → revision, file hashes, and license evidence recorded by a named verifier
+#         qualified → passed the adapter contract and parity checks; shippable
+# Only `enabled: true` entries can be fetched, and only when named explicitly:
+#   uv run --project harness python scripts/fetch_models.py --models <id>[,<id>]
+# `scripts/fetch_models.py --check` is the CI gate: enabled rows need complete provenance.
+# Never invent revisions, hashes, or license verdicts here; leave them null until verified.
+
+schema: 1
+cache_dir: .local/models
+
+entries:
+  - id: silero-vad
+    stage: vad
+    status: declared
+    enabled: false
+    upstream: {repo: "https://github.com/snakers4/silero-vad", revision: null, license: MIT, license_evidence: null}
+    converted: {repo: null, revision: null, license: null, license_evidence: null}
+    runtime: "speech-swift (Core ML/MLX) or sherpa-onnx"
+    native_format: {sample_rate: 16000, channels: 1}
+    streaming: {audio_input: true}
+    backend: "verify (CPU/ANE)"
+    open_question: "False triggers on music"
+    files: []
+
+  - id: campplus-3dspeaker
+    stage: speaker_embedding
+    status: declared
+    enabled: false
+    upstream: {repo: "https://github.com/modelscope/3D-Speaker", revision: null, license: "Apache-2.0 (code); checkpoint license unverified", license_evidence: null}
+    converted: {repo: null, revision: null, license: null, license_evidence: null}
+    runtime: "speech-swift or sherpa-onnx"
+    native_format: {sample_rate: 16000, channels: 1}
+    streaming: {window: true}
+    backend: "verify"
+    open_question: "Change-detection threshold on meeting audio"
+    files: []
+
+  - id: sherpa-onnx-streaming-zipformer-bilingual-zh-en
+    stage: asr
+    status: declared
+    enabled: false
+    upstream: {repo: "https://github.com/k2-fsa/sherpa-onnx", revision: null, license: "Apache-2.0 (runtime); checkpoint unverified", license_evidence: null}
+    converted: {repo: null, revision: null, license: null, license_evidence: null}
+    runtime: "sherpa-onnx C API"
+    native_format: {sample_rate: 16000, channels: 1}
+    streaming: {audio_input: true, token_timing: "verify in adapter"}
+    backend: "CPU"
+    open_question: "Accuracy on spontaneous meeting speech"
+    files: []
+
+  - id: qwen3-asr-0.6b
+    stage: asr
+    status: declared
+    enabled: false
+    upstream: {repo: "https://github.com/QwenLM/Qwen3-ASR", revision: null, license: Apache-2.0, license_evidence: null}
+    converted: {repo: null, revision: null, license: null, license_evidence: null}
+    runtime: "speech-swift (MLX)"
+    native_format: {sample_rate: 16000, channels: 1}
+    streaming: {upstream: "vLLM only, no timestamps", mlx_port: "verify"}
+    backend: "GPU (MLX)"
+    open_question: "Accuracy gain versus GPU contention"
+    files: []
+
+  - id: qwen3-4b-instruct-2507-4bit-mlx
+    stage: mt
+    status: declared
+    enabled: false
+    upstream:
+      repo: "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507"
+      revision: null
+      license: Apache-2.0
+      license_evidence: "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507 (model card, checked in the 2026-10-24 planning review)"
+    converted: {repo: null, revision: null, license: null, license_evidence: null, note: "verify 4-bit MLX conversion provenance or convert locally"}
+    runtime: "MLX (mlx-swift-lm)"
+    streaming: {closed_units: true, prefix_continuation: "experimental; needs decoder tests"}
+    backend: "GPU (MLX)"
+    open_question: "Clause adequacy and complete-unit latency while TTS runs"
+    files: []
+
+  - id: translategemma-4b-it-4bit
+    stage: mt
+    status: declared
+    enabled: false
+    upstream: {repo: "https://huggingface.co/google/translategemma-4b-it", revision: null, license: "Gemma Terms of Use", license_evidence: null}
+    converted: {repo: null, revision: null, license: null, license_evidence: null}
+    pass_on_use_restrictions: true
+    runtime: "MLX"
+    streaming: {closed_units: true, context: false}
+    backend: "GPU (MLX)"
+    open_question: "Is zh accepted as source_lang_code by the template?"
+    files: []
+
+  - id: hy-mt1.5
+    stage: mt
+    status: declared
+    enabled: false
+    restricted: true
+    restriction: >-
+      Tencent HY Community license excludes the EU, UK, and South Korea and forbids using outputs to
+      improve other models. Benchmark only after a recorded license/territory determination; never a
+      product dependency, CI download, or distillation teacher.
+    license_determination: null
+    upstream: {repo: "https://github.com/Tencent-Hunyuan/HY-MT", revision: null, license: "Tencent HY Community License", license_evidence: "https://github.com/Tencent-Hunyuan/HY-MT/blob/main/License.txt"}
+    converted: {repo: null, revision: null, license: null, license_evidence: null}
+    runtime: "research only"
+    files: []
+
+  - id: fun-cosyvoice3-0.5b-2512
+    stage: tts
+    status: declared
+    enabled: false
+    upstream: {repo: "https://github.com/FunAudioLLM/CosyVoice", revision: null, license: Apache-2.0, license_evidence: null, note: "follow the repository redirect and pin the resolved commit"}
+    converted: {repo: null, revision: null, license: null, license_evidence: null}
+    runtime: "speech-swift (MLX)"
+    native_format: {sample_rate: 24000, channels: 1}
+    streaming: {audio_output: "verify", incremental_text: "verify in MLX port", continuation: "verify"}
+    backend: "GPU (MLX)"
+    open_question: "Cross-lingual identity; first audio under load"
+    files: []
+
+  - id: qwen3-tts-12hz-0.6b-base
+    experimental_key: qwen
+    worker_streaming: true
+    dependencies: []
+    stage: tts
+    status: verified
+    enabled: true
+    verified_by: "Codex"
+    verified_on: "2026-10-25"
+    research_only: true
+    upstream:
+      repo: "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+      revision: "5d83992436eae1d760afd27aff78a71d676296fc"
+      license: Apache-2.0
+      license_evidence: "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base/blob/5d83992436eae1d760afd27aff78a71d676296fc/README.md (pinned model-card license metadata; HF API checked by Codex)"
+    converted:
+      repo: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit"
+      revision: "0d6bb6fe33f92d47a507e23b9148940e8366ab5b"
+      license: Apache-2.0
+      license_evidence: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit/blob/0d6bb6fe33f92d47a507e23b9148940e8366ab5b/README.md (Apache-2.0 metadata; declares conversion from Qwen 0.6B Base with mlx-audio 0.3.0)"
+      note: "Upstream checkpoint revision at conversion time is not declared. Pins identify the inspected source and converted artifacts; numerical parity remains pending."
+    runtime: "mlx-audio 0.6.1 (research/uv.lock); offline local directory only"
+    native_format: {sample_rate: 24000, channels: 1}
+    streaming: {audio_output: "verify", incremental_text: "verify"}
+    backend: "GPU (MLX)"
+    open_question: "Mandarin reference to English identity; parity and live latency remain unqualified"
+    files:
+      - path: "README.md"
+        url: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit/resolve/0d6bb6fe33f92d47a507e23b9148940e8366ab5b/README.md"
+        sha256: "a07a52fb57724ce19ec9e89be3a8f58b1edd8211c1330e6fd97b253686c25223"
+        size: 1026
+      - path: "config.json"
+        url: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit/resolve/0d6bb6fe33f92d47a507e23b9148940e8366ab5b/config.json"
+        sha256: "ba59b8d2d47746e844f6a96e2232a969d8d89dcc34450fbad94d912bb9ee2e27"
+        size: 5522
+      - path: "generation_config.json"
+        url: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit/resolve/0d6bb6fe33f92d47a507e23b9148940e8366ab5b/generation_config.json"
+        sha256: "f1b90b4513f3b34c62851049e2492d7b4c5940daf1276f89c82b8ef04127f3aa"
+        size: 245
+      - path: "merges.txt"
+        url: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit/resolve/0d6bb6fe33f92d47a507e23b9148940e8366ab5b/merges.txt"
+        sha256: "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3"
+        size: 1671839
+      - path: "model.safetensors"
+        url: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit/resolve/0d6bb6fe33f92d47a507e23b9148940e8366ab5b/model.safetensors"
+        sha256: "07dcb37b323614af64624af687876edd5c9a8b442da2a7b549d62f9ba2770ec1"
+        size: 1024490700
+      - path: "model.safetensors.index.json"
+        url: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit/resolve/0d6bb6fe33f92d47a507e23b9148940e8366ab5b/model.safetensors.index.json"
+        sha256: "86f65f69204f3fb9dc5ec22ed94da4865594c901b45d2508c60a5931d12787d4"
+        size: 77731
+      - path: "preprocessor_config.json"
+        url: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit/resolve/0d6bb6fe33f92d47a507e23b9148940e8366ab5b/preprocessor_config.json"
+        sha256: "efdde1022ea9d76928bf7a9cd53139138f5ba2e466e837f08f6105ab1af1c119"
+        size: 127
+      - path: "speech_tokenizer/config.json"
+        url: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit/resolve/0d6bb6fe33f92d47a507e23b9148940e8366ab5b/speech_tokenizer/config.json"
+        sha256: "ee65bb901c876664ab8707c487157aa1a6ee57c65969b28fb5ec9dc211e68167"
+        size: 2336
+      - path: "speech_tokenizer/configuration.json"
+        url: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit/resolve/0d6bb6fe33f92d47a507e23b9148940e8366ab5b/speech_tokenizer/configuration.json"
+        sha256: "6bc26d64eb5024b4d1dab5a52371958b429256d6c9d59787f1f5294a54e0cebd"
+        size: 76
+      - path: "speech_tokenizer/model.safetensors"
+        url: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit/resolve/0d6bb6fe33f92d47a507e23b9148940e8366ab5b/speech_tokenizer/model.safetensors"
+        sha256: "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258"
+        size: 682293092
+      - path: "speech_tokenizer/preprocessor_config.json"
+        url: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit/resolve/0d6bb6fe33f92d47a507e23b9148940e8366ab5b/speech_tokenizer/preprocessor_config.json"
+        sha256: "fcb3805e597e786d4067706e602f6688524640f8d3396790e2e09b5942fcbdfb"
+        size: 234
+      - path: "tokenizer_config.json"
+        url: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit/resolve/0d6bb6fe33f92d47a507e23b9148940e8366ab5b/tokenizer_config.json"
+        sha256: "dc3c31c3bdaedd5016382bb3cbe07323026775ad51f5a4fb564505992ae4a670"
+        size: 7344
+      - path: "vocab.json"
+        url: "https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit/resolve/0d6bb6fe33f92d47a507e23b9148940e8366ab5b/vocab.json"
+        sha256: "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+        size: 2776833
+
+  - id: omnivoice-0.6b-mlx-bf16
+    stage: tts
+    status: verified
+    enabled: true
+    verified_by: Codex
+    verified_on: '2026-10-25'
+    research_only: true
+    upstream:
+      repo: https://huggingface.co/k2-fsa/OmniVoice
+      revision: c5fdb5ccb189668d56333f77ba2629f4cd7535f4
+      license: Apache-2.0 (TTS); Boson Higgs Audio 2 Community License (bundled audio tokenizer)
+      license_evidence: https://huggingface.co/k2-fsa/OmniVoice/blob/c5fdb5ccb189668d56333f77ba2629f4cd7535f4/README.md
+        ; https://huggingface.co/mlx-community/OmniVoice-bfloat16/blob/6119f7072580cc30c3cbdf496269216b03ad9742/audio_tokenizer/LICENSE
+        ; https://github.com/k2-fsa/OmniVoice/blob/master/LICENSE
+    converted:
+      repo: https://huggingface.co/mlx-community/OmniVoice-bfloat16
+      revision: 6119f7072580cc30c3cbdf496269216b03ad9742
+      license: Apache-2.0 (TTS); Boson Higgs Audio 2 Community License (bundled audio tokenizer)
+      license_evidence: https://huggingface.co/mlx-community/OmniVoice-bfloat16/blob/6119f7072580cc30c3cbdf496269216b03ad9742/README.md
+      note: Pinned source/conversion metadata inspected by Codex; SHA-256s from pinned HF LFS metadata or downloaded
+        file bytes. Numerical parity and product qualification pending.
+    runtime: mlx-audio 0.6.1; explicit local artifacts only
+    files:
+    - path: README.md
+      url: https://huggingface.co/mlx-community/OmniVoice-bfloat16/resolve/6119f7072580cc30c3cbdf496269216b03ad9742/README.md
+      size: 3433
+      sha256: 567ce176d98449efacb37734bd4e97dfb4db539cb60427a48f0797e9fd2de537
+    - path: audio_tokenizer/LICENSE
+      url: https://huggingface.co/mlx-community/OmniVoice-bfloat16/resolve/6119f7072580cc30c3cbdf496269216b03ad9742/audio_tokenizer/LICENSE
+      size: 9171
+      sha256: ac933dc084d119bd20401956b90d11ae87c248b2da62622cd580d82cdf2fa049
+    - path: audio_tokenizer/README.md
+      url: https://huggingface.co/mlx-community/OmniVoice-bfloat16/resolve/6119f7072580cc30c3cbdf496269216b03ad9742/audio_tokenizer/README.md
+      size: 5174
+      sha256: 0336368f8274a5ed09f54cee8d56a851ecee96026d9f391a6735762c16608a60
+    - path: audio_tokenizer/config.json
+      url: https://huggingface.co/mlx-community/OmniVoice-bfloat16/resolve/6119f7072580cc30c3cbdf496269216b03ad9742/audio_tokenizer/config.json
+      size: 2531
+      sha256: eefb20806f7104e77c9a5277c9df0f9bb8826b08eb1d4e8ab2b9829b6ef9fac1
+    - path: audio_tokenizer/model.safetensors
+      url: https://huggingface.co/mlx-community/OmniVoice-bfloat16/resolve/6119f7072580cc30c3cbdf496269216b03ad9742/audio_tokenizer/model.safetensors
+      size: 805665628
+      sha256: fe7c5e8785e0a05833e1bfc3e002ec7f55af21e306b2e7154a448c1f54ccfb0d
+    - path: audio_tokenizer/preprocessor_config.json
+      url: https://huggingface.co/mlx-community/OmniVoice-bfloat16/resolve/6119f7072580cc30c3cbdf496269216b03ad9742/audio_tokenizer/preprocessor_config.json
+      size: 206
+      sha256: ae61eea88558608ee2fa86d2aec9fce8d99a5ff75d09cb7651ccce21ae1d9084
+    - path: chat_template.jinja
+      url: https://huggingface.co/mlx-community/OmniVoice-bfloat16/resolve/6119f7072580cc30c3cbdf496269216b03ad9742/chat_template.jinja
+      size: 4168
+      sha256: a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8
+    - path: config.json
+      url: https://huggingface.co/mlx-community/OmniVoice-bfloat16/resolve/6119f7072580cc30c3cbdf496269216b03ad9742/config.json
+      size: 2238
+      sha256: 5e359117e13b420c5e0c925d4aba650d624767131f1d1746928f8b850d5dc372
+    - path: mlx_manifest.json
+      url: https://huggingface.co/mlx-community/OmniVoice-bfloat16/resolve/6119f7072580cc30c3cbdf496269216b03ad9742/mlx_manifest.json
+      size: 568
+      sha256: bf83bf7f2b66591ab4afd2f4611be26ee18755d8bfd48cf0860616dfb991e8c1
+    - path: model.safetensors
+      url: https://huggingface.co/mlx-community/OmniVoice-bfloat16/resolve/6119f7072580cc30c3cbdf496269216b03ad9742/model.safetensors
+      size: 1225189510
+      sha256: 56431e08b3cda725358b507e795955188e9a669833cc05ff1ecbe7cec06a78d3
+    - path: model.safetensors.index.json
+      url: https://huggingface.co/mlx-community/OmniVoice-bfloat16/resolve/6119f7072580cc30c3cbdf496269216b03ad9742/model.safetensors.index.json
+      size: 20462
+      sha256: b986e9b62c95b99a9c3aa1a3e9a91bf51b9d9f525e0379fc7fb4b0596c542f4c
+    - path: tokenizer.json
+      url: https://huggingface.co/mlx-community/OmniVoice-bfloat16/resolve/6119f7072580cc30c3cbdf496269216b03ad9742/tokenizer.json
+      size: 11423986
+      sha256: 408f669b7e2b045fdf54201d815bd364e6667dbd845115da81239c40bc6dcfd1
+    - path: tokenizer_config.json
+      url: https://huggingface.co/mlx-community/OmniVoice-bfloat16/resolve/6119f7072580cc30c3cbdf496269216b03ad9742/tokenizer_config.json
+      size: 533
+      sha256: 49f78845596a82bf15c83673794bdf9f76f812b11f60ab6a2239d9be65b00676
+    experimental_key: omnivoice
+    dependencies: []
+    worker_streaming: false
+    native_format:
+      sample_rate: 24000
+      channels: 1
+    backend: GPU (MLX)
+    open_question: Chinese/English identity, first audio, sustained throughput, and memory under full pipeline load
+    pass_on_use_restrictions: true
+  - id: chatterbox-multilingual-v3-mlx
+    stage: tts
+    status: verified
+    enabled: true
+    verified_by: Codex
+    verified_on: '2026-10-25'
+    research_only: true
+    upstream:
+      repo: https://huggingface.co/ResembleAI/chatterbox
+      revision: 5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18
+      license: MIT
+      license_evidence: https://huggingface.co/ResembleAI/chatterbox/blob/5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18/README.md
+    converted:
+      repo: https://huggingface.co/mlx-community/chatterbox-multilingual-v3
+      revision: 03565773edd72e949572557597af8063bb49a18a
+      license: MIT
+      license_evidence: https://huggingface.co/mlx-community/chatterbox-multilingual-v3/blob/03565773edd72e949572557597af8063bb49a18a/README.md
+      note: Pinned source/conversion metadata inspected by Codex; SHA-256s from pinned HF LFS metadata or downloaded
+        file bytes. Numerical parity and product qualification pending.
+    runtime: mlx-audio 0.6.1; explicit local artifacts only
+    files:
+    - path: Cangjie5_TC.json
+      url: https://huggingface.co/mlx-community/chatterbox-multilingual-v3/resolve/03565773edd72e949572557597af8063bb49a18a/Cangjie5_TC.json
+      size: 1920163
+      sha256: 7073fd9de919443ae88e0bd2449917a65fe54898a4413ed1edcc4b67f28bce8c
+    - path: README.md
+      url: https://huggingface.co/mlx-community/chatterbox-multilingual-v3/resolve/03565773edd72e949572557597af8063bb49a18a/README.md
+      size: 1289
+      sha256: 46c84fad9fced28abe32cd11a0ed6eb05ca25df722893bf4c3ddc7a03bd94343
+    - path: config.json
+      url: https://huggingface.co/mlx-community/chatterbox-multilingual-v3/resolve/03565773edd72e949572557597af8063bb49a18a/config.json
+      size: 666
+      sha256: b2097a15078624f41fcdaad9fc82f7b91ab0d39771aebc1af1775b0feaafe309
+    - path: model.safetensors
+      url: https://huggingface.co/mlx-community/chatterbox-multilingual-v3/resolve/03565773edd72e949572557597af8063bb49a18a/model.safetensors
+      size: 2711113780
+      sha256: e702f2c441e040bd360e59a86c85d462539759d665e41cfd1938adadd74187a3
+    - path: tokenizer.json
+      url: https://huggingface.co/mlx-community/chatterbox-multilingual-v3/resolve/03565773edd72e949572557597af8063bb49a18a/tokenizer.json
+      size: 69989
+      sha256: 69632f47220a788a52ce2661d096453c5655e9bf25289d89a8d832c46ee07dbf
+    experimental_key: chatterbox
+    dependencies:
+    - s3-tokenizer-v2-mlx
+    worker_streaming: false
+    native_format:
+      sample_rate: 24000
+      channels: 1
+    backend: GPU (MLX)
+    open_question: Chinese/English identity, first audio, sustained throughput, and memory under full pipeline load
+  - id: s3-tokenizer-v2-mlx
+    stage: speech_tokenizer
+    status: verified
+    enabled: true
+    verified_by: Codex
+    verified_on: '2026-10-25'
+    research_only: true
+    upstream:
+      repo: https://huggingface.co/FunAudioLLM/CosyVoice2-0.5B
+      revision: eec1ae6c79877dbd9379285cf8789c9e0879293d
+      license: Apache-2.0 (upstream checkpoint; conversion has no separate license declaration)
+      license_evidence: https://huggingface.co/FunAudioLLM/CosyVoice2-0.5B/blob/eec1ae6c79877dbd9379285cf8789c9e0879293d/README.md
+    converted:
+      repo: https://huggingface.co/mlx-community/S3TokenizerV2
+      revision: e0c9886f0e1c35ae85b1f27277416fb19fc72bec
+      license: Apache-2.0 (upstream checkpoint; conversion has no separate license declaration)
+      license_evidence: https://huggingface.co/mlx-community/S3TokenizerV2/blob/e0c9886f0e1c35ae85b1f27277416fb19fc72bec/README.md
+      note: Pinned source/conversion metadata inspected by Codex; SHA-256s from pinned HF LFS metadata or downloaded
+        file bytes. Numerical parity and product qualification pending. Conversion README identifies the Apache-2.0
+        CosyVoice2 source; no independent conversion license declaration. External release review required.
+    runtime: mlx-audio 0.6.1; explicit local artifacts only
+    files:
+    - path: README.md
+      url: https://huggingface.co/mlx-community/S3TokenizerV2/resolve/e0c9886f0e1c35ae85b1f27277416fb19fc72bec/README.md
+      size: 459
+      sha256: 7114249e13d3487e1b3d7f5f91fefdce746679342dca7afc8e52b1617b66bea5
+    - path: config.json
+      url: https://huggingface.co/mlx-community/S3TokenizerV2/resolve/e0c9886f0e1c35ae85b1f27277416fb19fc72bec/config.json
+      size: 126
+      sha256: 8591fcc0eaae8c2bbfc69cf9d439933ecdf2d58cb9be63d00ce88736c4f2aa9d
+    - path: model.safetensors
+      url: https://huggingface.co/mlx-community/S3TokenizerV2/resolve/e0c9886f0e1c35ae85b1f27277416fb19fc72bec/model.safetensors
+      size: 494868984
+      sha256: 928726bc1f206a613d36b8f49e297eae9c5593a21bf9b92ddfe2c23f85eb92cc
+
+  - id: streaming-sortformer-4spk
+    stage: diarization
+    status: declared
+    enabled: false
+    upstream: {repo: "https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2.1", revision: null, license: "verify: v2 reportedly CC-BY-4.0, v2.1 NVIDIA Open Model License", license_evidence: null}
+    converted: {repo: null, revision: null, license: null, license_evidence: null}
+    runtime: "speech-swift"
+    phase: "week 7+"
+    files: []
+
+# System frameworks: no bundled weights. Language assets are installed by the OS setup path and
+# tracked here separately from bundled models. Observations come from a2a-preflight.
+system:
+  - id: apple-speechtranscriber
+    stage: asr
+    framework: Speech (SpeechAnalyzer/SpeechTranscriber), macOS 26
+    locale: zh_CN
+    observed: {date: 2026-10-24, host: "M3 Pro 36 GB, macOS 27.0.1 (26A434)", supported: true, asset_status: installed, installed: true, evidence: "reports/week2/raw/preflight.json: speech.asset_status, speech.transcriber.zh_installed"}
+  - id: apple-translation
+    stage: mt
+    framework: Translation (TranslationSession installedSource:target:), macOS 26.0
+    pair: zh-Hans→en
+    observed:
+      date: 2026-10-24
+      host: "M3 Pro 36 GB, macOS 27.0.1 (26A434)"
+      cli_status: installed
+      cli_installed_session: "works when the executable records the current SDK (see reports/week2/verifications.md)"
+      historical_adhoc_app_bundle: "Before SDK-stamp fix: supported; installed-source session throws notInstalled"
+      xcode_test_host: "installed (com.apple.xctest); translated 我们下周开会。 → We will have a meeting next week."
+      evidence: "reports/week2/raw/preflight.json: translation.zh_en_status; reports/week2/verifications.md"
+      note: "Cause was LC_BUILD_VERSION sdk 26.0; sdkVersionStamp() records the actual SDK. Developer ID distribution remains unqualified."

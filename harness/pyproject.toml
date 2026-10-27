@@ -1,0 +1,27 @@
+[project]
+name = "a2a-harness"
+version = "0.1.0"
+description = "A2A replay harness, trace tooling, and metrics"
+requires-python = ">=3.12"
+dependencies = [
+    "jsonschema>=4.23",
+    "numpy>=2.1",
+    "pyyaml>=6.0.2",
+]
+
+# Heavy evaluation models (COMET, Whisper back-transcription, UTMOS, speaker verifier)
+# live in the research/ project so ordinary checks never resolve torch. See AGENTS.md.
+
+[dependency-groups]
+dev = ["pytest>=8.3"]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["a2a_harness"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
