@@ -182,8 +182,10 @@ public final class AppleSpeechRecognizer: StreamingRecognizer, @unchecked Sendab
 
 // MARK: Translation framework
 
-/// Closed-segment baseline. No context, glossary, or prefix support. Requests are
-/// serialized because TranslationSession is not documented as safe for overlapping calls.
+/// Closed-segment baseline. No context or prefix support. Glossary terms replace their
+/// source spellings with the agreed target term before translation, which the framework
+/// passes through. Requests are serialized because TranslationSession is not documented
+/// as safe for overlapping calls.
 public actor AppleTranslator: IncrementalTranslator {
     nonisolated(unsafe) private let session: TranslationSession
     private var tail: Task<Void, Never>?
@@ -210,7 +212,7 @@ public actor AppleTranslator: IncrementalTranslator {
         try Task.checkCancellation()
         let previous = tail
         nonisolated(unsafe) let session = self.session
-        let source = req.uncommittedSource
+        let source = TermMap(req.glossary).apply(req.uncommittedSource)
         let task = Task { () async throws -> String in
             await previous?.value
             try Task.checkCancellation()

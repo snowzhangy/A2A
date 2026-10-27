@@ -127,3 +127,31 @@ def test_remembered_voice_survives_restart_and_is_reused(pipeline_binary, tmp_pa
     assert list((tmp_path / "memory").glob("*.voice"))
     assert summaries[1]["clone"]["reference_stats"].get("reference_memory_reused", 0) >= 1
     assert any(p.get("reused") for p in summaries[1]["clone"]["profiles"])
+
+
+@pytest.mark.skipif(PYTHON is None, reason="needs /usr/bin/python3 for the fake worker")
+def test_pronunciation_map_changes_spoken_text_and_traces_pacing(synthetic_fixture, pipeline_binary, tmp_path):
+    fx = load(synthetic_fixture)
+    reference = tmp_path / "reference.wav"
+    samples, rate = read_wav(fx.audio)
+    write_wav(reference, samples[: rate * 4], rate)
+    reference_text = tmp_path / "reference.txt"
+    reference_text.write_text("Synthetic reference.")
+    pronounce = tmp_path / "pronounce.json"
+    pronounce.write_text(json.dumps({"the": "thuh", "we": "wee"}))   # in most fixture translations
+    cmd = [str(pipeline_binary), "--input", str(fx.audio), "--clock", "host", "--pace", "asap",
+           "--asr", "scripted", "--asr-script", str(fx.asr_script),
+           "--mt", "dictionary", "--mt-dictionary", str(fx.mt_dictionary),
+           "--tts", "clone", "--clone-fake", "--clone-python", PYTHON,
+           "--clone-worker", str(REPO_ROOT / "research" / "tts_worker.py"),
+           "--voice-ref", str(reference), "--voice-ref-text", str(reference_text), "--pronounce", str(pronounce),
+           # --pace asap outruns real time; generous limits let synthesis finish instead of falling back.
+           "--max-debt-seconds", "60", "--max-source-lag-seconds", "120",
+           "--trace", str(tmp_path / "trace.jsonl"), "--out", str(tmp_path / "out.wav")]
+    done = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    assert done.returncode == 0, done.stderr[-2000:]
+    events = trace.load(tmp_path / "trace.jsonl")
+    finished = [e for e in events if e["ev"] == "tts.done"]
+    assert finished, "no unit completed synthesis"
+    assert all(e["pace"] >= 1 and e["audio_ms"] > 0 and "text" not in e for e in finished)
+    assert any(e["respelled"] for e in finished)

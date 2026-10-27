@@ -437,7 +437,8 @@ class Worker:
             self.channel.send({"ev": "done", "id": job, "canceled": canceled, "audio_s": emitted / RATE,
                                "gen_s": time.perf_counter() - started, "first_s": first,
                                "language": voice.language,
-                               "pace": speed, "quiet_samples_removed": compactor.removed if compactor else 0})
+                               "pace": speed, "native_s": native_samples / RATE,
+                               "quiet_samples_removed": compactor.removed if compactor else 0})
         except Exception as error:
             self.channel.send({"ev": "error", "id": job, "message": self.message(error)})
         finally:

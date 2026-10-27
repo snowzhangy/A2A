@@ -20,6 +20,17 @@ public enum CloneConditioning: String, Sendable, CaseIterable {
     case xvector
 }
 
+/// Worker-side pacing of one completed unit: numbers only, no text or audio.
+public struct CloneSynthesisStats: Sendable, Equatable {
+    /// WSOLA speed-up applied to fit the source span (1 = none).
+    public let pace: Double
+    /// Shaped audio before pacing and quiet-run compaction.
+    public let nativeSeconds: Double
+    /// Audio actually sent to the host.
+    public let audioSeconds: Double
+    public let quietRemovedSeconds: Double
+}
+
 public struct CloneWorkerInfo: Sendable {
     public let model: String
     public let loadSeconds: Double
@@ -48,6 +59,8 @@ public final class CloneVoiceSynthesizer: VoiceSynthesizer, @unchecked Sendable 
     private struct State {
         var nextID = 0
         var streams: [Int: AsyncThrowingStream<SynthesizedAudio, Error>.Continuation] = [:]
+        var units: [Int: UnitID] = [:]
+        var stats: [UnitID: CloneSynthesisStats] = [:]
         var prepares: [String: CheckedContinuation<Void, Error>] = [:]
         var ready: CheckedContinuation<CloneWorkerInfo, Error>?
         var readyInfo: CloneWorkerInfo?
@@ -145,7 +158,10 @@ public final class CloneVoiceSynthesizer: VoiceSynthesizer, @unchecked Sendable 
         AsyncThrowingStream(bufferingPolicy: .bufferingOldest(256)) { continuation in
             let (id, failure) = shared.state.withLock { s -> (Int, String?) in
                 s.nextID += 1
-                if s.failure == nil { s.streams[s.nextID] = continuation }
+                if s.failure == nil {
+                    s.streams[s.nextID] = continuation
+                    s.units[s.nextID] = unit
+                }
                 return (s.nextID, s.failure)
             }
             if let failure {
@@ -155,7 +171,10 @@ public final class CloneVoiceSynthesizer: VoiceSynthesizer, @unchecked Sendable 
             continuation.onTermination = { [weak self] _ in
                 guard let self else { return }
                 // Still registered means the consumer stopped early: cancel in the worker.
-                if self.shared.state.withLock({ $0.streams.removeValue(forKey: id) }) != nil {
+                if self.shared.state.withLock({ s in
+                    s.units[id] = nil
+                    return s.streams.removeValue(forKey: id)
+                }) != nil {
                     self.send(["op": "cancel", "id": id])
                 }
             }
@@ -164,6 +183,11 @@ public final class CloneVoiceSynthesizer: VoiceSynthesizer, @unchecked Sendable 
             if let targetSeconds, targetSeconds.isFinite, targetSeconds > 0 { request["target_s"] = targetSeconds }
             send(request)
         }
+    }
+
+    /// Pacing of a unit whose synthesis completed, once; nil when canceled or unknown.
+    public func takeStats(for unit: UnitID) -> CloneSynthesisStats? {
+        shared.state.withLock { $0.stats.removeValue(forKey: unit) }
     }
 
     // MARK: Protocol
@@ -260,11 +284,27 @@ public final class CloneVoiceSynthesizer: VoiceSynthesizer, @unchecked Sendable 
             }
         case "done":
             guard let id else { return false }
-            shared.state.withLock { $0.streams.removeValue(forKey: id) }?.finish()
+            let number = { (key: String) in (event[key] as? NSNumber)?.doubleValue ?? 0 }
+            shared.state.withLock { s -> AsyncThrowingStream<SynthesizedAudio, Error>.Continuation? in
+                let unit = s.units.removeValue(forKey: id)
+                guard let continuation = s.streams.removeValue(forKey: id) else { return nil }
+                if let unit, event["canceled"] as? Bool != true {
+                    // Bounded: the driver takes each entry when the unit finishes.
+                    if s.stats.count >= 64 { s.stats.removeAll() }
+                    s.stats[unit] = CloneSynthesisStats(
+                        pace: (event["pace"] as? NSNumber)?.doubleValue ?? 1, nativeSeconds: number("native_s"),
+                        audioSeconds: number("audio_s"),
+                        quietRemovedSeconds: number("quiet_samples_removed") / Double(sampleRate))
+                }
+                return continuation
+            }?.finish()
         case "error":
             let message = event["message"] as? String ?? "worker error"
             if let id {
-                shared.state.withLock { $0.streams.removeValue(forKey: id) }?.finish(throwing: AdapterError.unsupported(message))
+                shared.state.withLock { s in
+                    s.units[id] = nil
+                    return s.streams.removeValue(forKey: id)
+                }?.finish(throwing: AdapterError.unsupported(message))
             } else if let voice = event["voice"] as? String {
                 shared.state.withLock { $0.prepares.removeValue(forKey: voice) }?.resume(throwing: AdapterError.unsupported(message))
             } else {
@@ -280,7 +320,7 @@ public final class CloneVoiceSynthesizer: VoiceSynthesizer, @unchecked Sendable 
     private static func fail(_ shared: Shared, _ message: String) {
         let (ready, prepares, streams) = shared.state.withLock { s in
             if s.failure == nil { s.failure = message }
-            defer { s.ready = nil; s.prepares.removeAll(); s.streams.removeAll() }
+            defer { s.ready = nil; s.prepares.removeAll(); s.streams.removeAll(); s.units.removeAll() }
             return (s.ready, Array(s.prepares.values), Array(s.streams.values))
         }
         let error = AdapterError.unsupported(message)

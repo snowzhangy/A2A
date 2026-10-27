@@ -29,6 +29,8 @@
 //   --playback original|translated --control-stdin   live selection; stdin commands are mode names, one per line
 //   --fluent                                         app playout: streaming clauses, speech paced to the source,
 //                                                    phrases never cut; soft pressure skips unheard units
+//   --glossary terms.json                            {"source term": "target term"}: replaced before Apple translation
+//   --pronounce words.json                           {"word": "respelling"}: spoken form only; captions unchanged
 //   --speakers single|auto                           auto: track speakers so each gets their own voice (system:
 //                                                    an installed voice cast by pitch; clone: a reference cut
 //                                                    from that speaker's speech); --profile-ready-ms is unused
@@ -89,6 +91,8 @@ struct Options {
     var controlStdin = false
     var fluent = false
     var speakers = "single"
+    var glossary: String?
+    var pronounce: String?
     var parentPID: Int32?
 
     var isTap: Bool { tapBundle != nil || tapPid != nil }
@@ -140,6 +144,8 @@ struct Options {
                 guard let model = ExperimentalVoiceModel(rawValue: value()) else { fail("--clone-model is qwen, omnivoice, or chatterbox") }
                 o.cloneModel = model
             case "--voice-memory": o.voiceMemory = value()
+            case "--glossary": o.glossary = value()
+            case "--pronounce": o.pronounce = value()
             case "--voice-ref": o.voiceRef = value()
             case "--voice-ref-text": o.voiceRefText = value()
             case "--clone-python": o.clonePython = value()
@@ -239,8 +245,18 @@ let usage = """
                         [--playback original|translated] [--control-stdin (one playback mode per line)]
                         [--fluent (streaming clauses, adaptive speech pace; catch-up skips unheard phrases, never cuts one)]
                         [--speakers single|auto (dialogue: one voice per detected speaker)]
+                        [--glossary terms.json (Apple MT only)] [--pronounce words.json (spoken text only)]
                         [--rendered-out post-gain-device-output.wav]
     """
+
+/// A JSON object of term → replacement (--glossary, --pronounce).
+func loadTerms(_ path: String) throws -> [String: String] {
+    let data = try Data(contentsOf: URL(fileURLWithPath: path))
+    guard let terms = try JSONSerialization.jsonObject(with: data) as? [String: String] else {
+        fail("\(path): expected a JSON object of strings")
+    }
+    return terms
+}
 
 /// The live tap, once created: every exit path destroys it so the source never stays muted.
 nonisolated(unsafe) var tapToRelease: TapSession?
@@ -550,6 +566,8 @@ final class Driver {
     var runtimeFailed = false
     /// Latest gains requested from the mixer (the stop path waits for them to land).
     var gainTarget = BusGains.original
+    /// Spoken respellings applied to the synthesizer's text only (--pronounce).
+    var pronunciation = TermMap([:], ignoresCase: true)
 
     init(options: Options, tap: TapSession? = nil, clone: CloneVoiceSynthesizer? = nil,
          playbackControls: PlaybackControls? = nil) async throws {
@@ -570,6 +588,8 @@ final class Driver {
         if let d = options.maxDebtSeconds { config.health.maxDebtSeconds = d }
         if let l = options.maxSourceLagSeconds { config.health.maxSourceLagSeconds = l }
         if let k = options.maxUnitKeys { config.commit.maxUnitKeys = k }
+        if let path = options.glossary { config.glossary = try loadTerms(path) }
+        if let path = options.pronounce { pronunciation = TermMap(try loadTerms(path), ignoresCase: true) }
         if options.speakers == "auto" {
             config.multiSpeaker = true
             tracker = VoiceprintSpeakerTracker()
@@ -1020,10 +1040,11 @@ final class Driver {
         }
         let inbox = self.inbox
         let tone = synthesizer as? ToneSynthesizer
+        let spoken = pronunciation.apply(job.text)
         tasks[job.unit] = Task.detached {
             do {
                 if let tone { try await Task.sleep(nanoseconds: tone.firstChunk.nanoseconds(units: 0)) }
-                for try await c in synthesizer.synthesize(unit: job.unit, text: job.text, voice: voice, targetSeconds: job.targetSeconds) {
+                for try await c in synthesizer.synthesize(unit: job.unit, text: spoken, voice: voice, targetSeconds: job.targetSeconds) {
                     if Task.isCancelled { return }
                     inbox.post(.chunk(job, c))
                     if let tone {
@@ -1056,6 +1077,16 @@ final class Driver {
         case .finished(let job):
             tasks[job.unit] = nil
             if activeSynthesis == job.unit { activeSynthesis = nil }
+            if let clone = synthesizer as? CloneVoiceSynthesizer, let stats = clone.takeStats(for: job.unit) {
+                let ms = { (seconds: Double) in Int((seconds * 1000).rounded()) }
+                var fields: [TraceEvent.Field] = [.unit(job.unit), .double("pace", stats.pace),
+                                                  .int("native_ms", ms(stats.nativeSeconds)), .int("audio_ms", ms(stats.audioSeconds)),
+                                                  .int("quiet_removed_ms", ms(stats.quietRemovedSeconds))]
+                if let target = job.targetSeconds { fields.append(.int("target_ms", ms(target))) }
+                if !pronunciation.isEmpty { fields.append(.bool("respelled", pronunciation.apply(job.text) != job.text)) }
+                trace.emit(TraceEvent(tNs: now, session: o.session, epoch: pipeline.gate.epoch, gen: pipeline.gate.generation,
+                                      kind: .ttsDone, fields: fields))
+            }
             guard plays[job.unit] != nil else { return }
             if plays[job.unit]?.start == nil, held[job.unit]?.isEmpty != false {
                 send(.synthesisFailed(job.unit, "synthesizer returned no audio"))

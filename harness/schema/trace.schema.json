@@ -18,7 +18,8 @@
         "mt.request", "mt.result", "commit.target", "tts.request", "tts.first_chunk", "tts.chunk",
         "play.scheduled", "play.start", "play.end", "unit.cancel", "source.disposition", "queue.depth",
         "clock.drift", "resource.sample", "fallback.enter", "fallback.exit", "trace.drop", "error",
-        "commit.hold", "commit.revision", "pcm.reject", "gain.ramp", "asr.finalize_request", "catch_up"
+        "commit.hold", "commit.revision", "pcm.reject", "gain.ramp", "asr.finalize_request", "catch_up",
+        "tts.done"
       ]
     },
     "span": {"$ref": "#/$defs/span"},
@@ -85,6 +86,8 @@
     {"if": {"properties": {"ev": {"const": "gain.ramp"}}},
      "then": {"required": ["original", "translated", "ms"]}},
     {"if": {"properties": {"ev": {"const": "catch_up"}}},
-     "then": {"required": ["units", "debt_ms", "oldest_source_age_ms"]}}
+     "then": {"required": ["units", "debt_ms", "oldest_source_age_ms"]}},
+    {"if": {"properties": {"ev": {"const": "tts.done"}}},
+     "then": {"required": ["unit", "pace", "native_ms", "audio_ms"]}}
   ]
 }

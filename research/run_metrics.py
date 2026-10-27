@@ -2,8 +2,10 @@
 
 Units, played units, source coverage, onset lag (source onset to first English sample on the
 offline output timeline), TTS first-chunk latency, commit reasons, dispositions, fallbacks,
-and synthesized English seconds per Mandarin source character. Diagnostic only: not the
-harness H2 metrics, not gate evidence. Needs --research-text traces for the per-char ratio.
+synthesized English seconds per Mandarin source character, and clone pacing (`tts.done`:
+speed-up applied, share of units at the 1.3x cap, and native length over the source span).
+Diagnostic only: not the harness H2 metrics, not gate evidence. Needs --research-text traces
+for the per-char ratio.
 
 usage: python research/run_metrics.py RUN_DIR [RUN_DIR ...]
 """
@@ -47,6 +49,9 @@ def summarize(run: str) -> dict:
             if chars:
                 per_char.append(english[u] / chars)
             ratio.append(english[u] / max(seconds(c), 1e-9))
+    done = [e for e in events if e["ev"] == "tts.done"]
+    paces = [e["pace"] for e in done]
+    native_over_target = [e["native_ms"] / e["target_ms"] for e in done if e.get("target_ms")]
     return {
         "run": run,
         "units": len(commits),
@@ -62,6 +67,10 @@ def summarize(run: str) -> dict:
         "dispositions": dict(collections.Counter(f"{e['disposition']}/{e['reason']}" for e in events
                                                  if e["ev"] == "source.disposition" and "unit" in e)),
         "fallbacks": dict(collections.Counter(e["reason"] for e in events if e["ev"] == "fallback.enter")),
+        "pacing": {"units": len(done), "pace_median": round(statistics.median(paces), 3) if paces else None,
+                   "at_cap": sum(p >= 1.299 for p in paces),
+                   "native_over_target_median": round(statistics.median(native_over_target), 2) if native_over_target else None,
+                   "native_over_target_p90": pct(native_over_target, 0.9)},
     }
 
 

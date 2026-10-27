@@ -40,6 +40,7 @@ public enum TraceKind: String, CaseIterable, Sendable {
     case gainRamp = "gain.ramp"
     case finalizeRequest = "asr.finalize_request"
     case catchUp = "catch_up"
+    case ttsDone = "tts.done"
 }
 
 public enum TraceValue: Hashable, Sendable {
