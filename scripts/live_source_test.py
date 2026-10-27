@@ -72,13 +72,13 @@ def main() -> None:
                 "--file", str(reference),
             ]
             player = subprocess.Popen(player_command, stdout=player_log, stderr=player_log)
-            (out / "player.pid").write_text(str(player.pid))
+            (out / "player.pid").write_text(str(player.pid), encoding="utf-8")
             command += ["--tap-pid", str(player.pid)]
             metadata = {"input": str(args.input.resolve()), "source_offset_s": args.source_offset,
                         "excerpt_seconds": args.seconds, "lead_seconds": lead, "tail_seconds": tail,
                         "captions_only": args.captions_only, "translation_only": not args.captions_only,
                         "pipeline_command": command, "player_command": player_command, "player_pid": player.pid}
-            (out / "run.json").write_text(json.dumps(metadata, indent=2))
+            (out / "run.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
             result = subprocess.run(command, stdout=stdout, stderr=pipeline_log, timeout=args.seconds + 80)
         finally:
             if player is not None and player.poll() is None:
@@ -88,10 +88,10 @@ def main() -> None:
                 except subprocess.TimeoutExpired:
                     player.kill()
                     player.wait(timeout=5)
-    rows = (out / "pipeline.stdout.jsonl").read_text().splitlines()
+    rows = (out / "pipeline.stdout.jsonl").read_text(encoding="utf-8").splitlines()
     if rows:
         summary = json.loads(rows[-1])
-        (out / "summary.json").write_text(json.dumps(summary, indent=2))
+        (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps({"run": str(out), "pipeline_exit_code": result.returncode,
                       "elapsed_seconds": round(time.time() - started, 2)}))
     raise SystemExit(result.returncode)

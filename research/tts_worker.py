@@ -1,7 +1,7 @@
 """Resident reference-conditioned TTS worker for a2a-pipeline (`--tts clone`).
 
-One process keeps the selected verified model resident on MLX and delivers PCM for one
-unit at a time. The host (A2AModels.CloneVoiceSynthesizer) talks to it over stdin/stdout
+One process keeps the selected verified model resident on MLX (or PyTorch on CUDA, MPS, or
+CPU with `--backend torch`, ADR-0007) and delivers PCM for one unit at a time. The host (A2AModels.CloneVoiceSynthesizer) talks to it over stdin/stdout
 with length-prefixed frames:
 
     <u32 header bytes, little endian> <u32 payload bytes> <header JSON> <payload>
@@ -47,6 +47,11 @@ import audio_pacing  # noqa: E402  (NumPy-optional; pacing is skipped without it
 
 class Channel:
     def __init__(self) -> None:
+        if sys.platform == "win32":
+            # Frames are binary: no CRLF translation on either pipe.
+            import msvcrt
+            msvcrt.setmode(_PROTOCOL_FD, os.O_BINARY)
+            msvcrt.setmode(0, os.O_BINARY)
         self.out = os.fdopen(_PROTOCOL_FD, "wb", buffering=0)
         self.lock = threading.Lock()
         self.inp = sys.stdin.buffer
@@ -305,6 +310,70 @@ class ModelBackend:
                 pass
 
 
+class TorchBackend:
+    """PyTorch backend (CUDA, MPS, or CPU) for hosts without MLX, e.g. Windows (ADR-0007).
+    Same contract as ModelBackend: verified local artifacts only, offline loading."""
+
+    def __init__(self, model_key: str, temperature: float | None, device: str) -> None:
+        self.model_key = model_key
+        self.temperature = temperature
+        self.requested_device = device
+        self.adapter = None
+        self.name = ""
+        self.device = ""
+        self.streaming = False
+        self.native_speed = False
+
+    def load(self) -> None:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        from voice_clone import verified_model  # verifies every manifest hash
+        from voice_models import selection
+        from tts_torch_adapters import device_label, load_adapter, pick_device
+
+        entries = selection(self.model_key, backend="torch")
+        paths = {entry["id"]: verified_model(entry["id"])[0] for entry in entries}
+        entry = entries[-1]
+        device = pick_device(self.requested_device)
+        self.adapter = load_adapter(self.model_key, paths[entry["id"]], device)
+        self.name = f"{entry['id']}@{entry['upstream']['revision'][:12]}"
+        self.device = device_label(device)
+        self.streaming = self.adapter.streaming
+        self.native_speed = getattr(self.adapter, "native_speed", False)
+
+    def prepare(self, voice: Voice) -> None:
+        voice.native = self.adapter.prepare(voice)
+        # Measure this voice's output level and pace on shaped audio, as ModelBackend does.
+        warm = array.array("f")
+        warm_text = "好的，我们开始吧。" if voice.language == "chinese" else "Okay, let's begin."
+        for pcm in self.generate(voice, warm_text, 2.0):
+            warm.extend(pcm)
+        level = voiced_rms(warm)
+        if level and voice.target_rms:
+            voice.gain = voice.target_rms / level
+        shaped = len(Shaper(None, 1.0).process(warm)) or len(warm)
+        voice.seconds_per_character = shaped / RATE / len(warm_text)
+
+    def generate(self, voice: Voice, text: str, interval: float, speed: float = 1.0):
+        step = max(1, int(RATE * interval))
+        for audio in self.adapter.generate(voice, text, speed):
+            pcm = array.array("f")
+            pcm.frombytes(audio.astype("<f4").tobytes())
+            for offset in range(0, len(pcm), step):
+                yield pcm[offset:offset + step]
+
+    def warmup(self) -> None:
+        # Compiles CUDA kernels and fills allocator caches before the first real unit.
+        tone = array.array("f", (0.1 * math.sin(2 * math.pi * 180 * i / RATE) * (1 + 0.3 * math.sin(i / 900))
+                                 for i in range(RATE * 3)))
+        voice = Voice(tone, "Warm up.", "icl")
+        self.prepare(voice)
+        for _ in self.generate(voice, "Warm up.", 0.32):
+            pass
+
+
 # MARK: Worker
 
 class Worker:
@@ -398,11 +467,17 @@ class Worker:
             compactor = None
             speed = 1.0
             native_samples = 0
+            native_speed = getattr(self.backend, "native_speed", False)
             if header.get("target_s") is not None and audio_pacing.available:
                 speed = audio_pacing.choose_speed(text, header.get("target_s"), voice.seconds_per_character)
-                pacing = audio_pacing.StreamingWSOLA(speed)
-                compactor = audio_pacing.QuietRunCompactor()
-            generator = self.backend.generate(voice, text, self.interval)
+                if not native_speed:
+                    pacing = audio_pacing.StreamingWSOLA(speed)
+                    compactor = audio_pacing.QuietRunCompactor()
+            if native_speed:
+                # The model renders the phrase at this pace itself; no time-stretching.
+                generator = self.backend.generate(voice, text, self.interval, speed)
+            else:
+                generator = self.backend.generate(voice, text, self.interval)
             try:
                 for pcm in generator:
                     if self.is_canceled(job):
@@ -430,6 +505,10 @@ class Worker:
                 if native_samples:
                     observed = native_samples / RATE / max(1, len(text))
                     voice.seconds_per_character = 0.7 * voice.seconds_per_character + 0.3 * observed
+            elif not canceled and native_speed and header.get("target_s") is not None and native_samples:
+                # Natively paced audio ran at `speed`: learn the voice's unhurried pace.
+                observed = native_samples * speed / RATE / max(1, len(text))
+                voice.seconds_per_character = 0.7 * voice.seconds_per_character + 0.3 * observed
             if not canceled:
                 gain = shaper.unit_gain()
                 if gain:
@@ -452,11 +531,20 @@ def main() -> None:
     parser.add_argument("--interval", type=float, default=0.32, help="streaming chunk interval in seconds")
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--research-text", action="store_true", help="include error text in messages")
+    parser.add_argument("--backend", choices=("mlx", "torch"), default="mlx",
+                        help="mlx on Apple silicon (default); torch for CUDA, MPS, or CPU (ADR-0007)")
+    parser.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto",
+                        help="torch backend device")
     args = parser.parse_args()
     if not 0.08 <= args.interval <= 2.0:
         parser.error("--interval must be between 0.08 and 2 seconds")
     channel = Channel()
-    backend = FakeBackend(args.model) if args.fake else ModelBackend(args.model, args.temperature)
+    if args.fake:
+        backend = FakeBackend(args.model)
+    elif args.backend == "torch":
+        backend = TorchBackend(args.model, args.temperature, args.device)
+    else:
+        backend = ModelBackend(args.model, args.temperature)
     started = time.perf_counter()
     try:
         backend.load()
@@ -468,7 +556,8 @@ def main() -> None:
         sys.exit(1)
     channel.send({"ev": "ready", "model": getattr(backend, "name", "fake"), "load_s": loaded,
                   "warmup_s": time.perf_counter() - started - loaded, "rate": RATE,
-                  "streaming": backend.streaming, "selected_model": args.model})
+                  "streaming": backend.streaming, "selected_model": args.model,
+                  "backend": "fake" if args.fake else args.backend, "device": getattr(backend, "device", None) or None})
     Worker(backend, channel, args.interval, args.research_text).run()
 
 

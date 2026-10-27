@@ -25,10 +25,15 @@ def pipeline_binary() -> Path:
     if shutil.which("swift"):
         try:
             bin_dir = subprocess.run(["swift", "build", "--package-path", str(REPO_ROOT / "apple"), "--show-bin-path"],
-                                     capture_output=True, text=True, timeout=60).stdout.strip()
+                                     capture_output=True, text=True, encoding="utf-8", timeout=60).stdout.strip()
             candidate = Path(bin_dir) / "a2a-pipeline"
             if candidate.exists():
                 return candidate
         except (OSError, subprocess.SubprocessError):
             pass
+    # The portable runtime's pipeline (ADR-0007), e.g. on Windows where Swift is not built.
+    scripts = "Scripts" if os.name == "nt" else "bin"
+    portable = REPO_ROOT / "runtime" / ".venv" / scripts / ("a2a-pipeline-portable" + (".exe" if os.name == "nt" else ""))
+    if portable.exists():
+        return portable
     pytest.skip("a2a-pipeline not built (run scripts/check.sh or set A2A_PIPELINE)")

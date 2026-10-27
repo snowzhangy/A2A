@@ -370,6 +370,190 @@ entries:
       size: 494868984
       sha256: 928726bc1f206a613d36b8f49e297eae9c5593a21bf9b92ddfe2c23f85eb92cc
 
+  # Portable runtime (ADR-0007): PyTorch/CTranslate2 artifacts for CUDA, MPS, and CPU hosts.
+  - id: faster-whisper-large-v3
+    stage: asr
+    status: verified
+    enabled: true
+    verified_by: "Claude (agent session for the cross-platform runtime)"
+    verified_on: "2026-10-27"
+    upstream:
+      repo: "https://huggingface.co/openai/whisper-large-v3"
+      revision: "06f233fe06e710322aca913c1bc4249a0d71fce1"
+      license: Apache-2.0
+      license_evidence: "https://huggingface.co/api/models/openai/whisper-large-v3 (cardData.license apache-2.0 at 06f233fe, checked 2026-10-27)"
+    converted:
+      repo: "https://huggingface.co/Systran/faster-whisper-large-v3"
+      revision: "edaa852ec7e145841d8ffdb056a99866b5f0a478"
+      license: MIT
+      license_evidence: "https://huggingface.co/Systran/faster-whisper-large-v3/blob/edaa852ec7e145841d8ffdb056a99866b5f0a478/README.md (license: mit; CTranslate2 conversion of openai/whisper-large-v3)"
+      note: "LFS SHA-256s from the pinned HF API metadata; small files hashed from downloaded bytes. Conversion parity against the upstream checkpoint is not yet measured."
+    runtime: "faster-whisper 1.2.1 / CTranslate2 4.8.4 (runtime/uv.lock); CUDA float16, CPU int8"
+    native_format: {sample_rate: 16000, channels: 1}
+    streaming: {audio_input: "re-decoded growing utterance window with word timestamps (LocalAgreement-2 in CommitPolicy)"}
+    backend: "CUDA (CTranslate2); CPU int8 on macOS and AMD"
+    open_question: "Partial-hypothesis stability and finalization latency on spontaneous Mandarin"
+    files:
+      - path: "README.md"
+        url: "https://huggingface.co/Systran/faster-whisper-large-v3/resolve/edaa852ec7e145841d8ffdb056a99866b5f0a478/README.md"
+        sha256: "39e96252229f5a3d0141dc81afb65a36fd205461ac21e5b70f2cd1248ef0082c"
+        size: 2052
+      - path: "config.json"
+        url: "https://huggingface.co/Systran/faster-whisper-large-v3/resolve/edaa852ec7e145841d8ffdb056a99866b5f0a478/config.json"
+        sha256: "a9306624f5ec14270a014b647e5c316b6e03a662c369758d1b90697a7b0655b9"
+        size: 2394
+      - path: "model.bin"
+        url: "https://huggingface.co/Systran/faster-whisper-large-v3/resolve/edaa852ec7e145841d8ffdb056a99866b5f0a478/model.bin"
+        sha256: "69f74147e3334731bc3a76048724833325d2ec74642fb52620eda87352e3d4f1"
+        size: 3087284237
+      - path: "preprocessor_config.json"
+        url: "https://huggingface.co/Systran/faster-whisper-large-v3/resolve/edaa852ec7e145841d8ffdb056a99866b5f0a478/preprocessor_config.json"
+        sha256: "7ccc62c6f2765af1f3b46c00c9b5894426835a05021c8b9c01eecb6dfb542711"
+        size: 340
+      - path: "tokenizer.json"
+        url: "https://huggingface.co/Systran/faster-whisper-large-v3/resolve/edaa852ec7e145841d8ffdb056a99866b5f0a478/tokenizer.json"
+        sha256: "6d8cbd7cd0d8d5815e478dac67b85a26bbe77c1f5e0c6d76d1ce2abc0e5f21ca"
+        size: 2480617
+      - path: "vocabulary.json"
+        url: "https://huggingface.co/Systran/faster-whisper-large-v3/resolve/edaa852ec7e145841d8ffdb056a99866b5f0a478/vocabulary.json"
+        sha256: "c69260f2ab26d659b7c398f9a2b2b48ed0df16c3b47d7326782fd9cba71690c1"
+        size: 1068114
+
+  - id: qwen3-4b-instruct-2507
+    stage: mt
+    status: verified
+    enabled: true
+    verified_by: "Claude (agent session for the cross-platform runtime)"
+    verified_on: "2026-10-27"
+    upstream:
+      repo: "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507"
+      revision: "cdbee75f17c01a7cc42f958dc650907174af0554"
+      license: Apache-2.0
+      license_evidence: "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/blob/cdbee75f17c01a7cc42f958dc650907174af0554/LICENSE (Apache-2.0 text; cardData.license apache-2.0)"
+    converted: {repo: null, revision: null, license: null, license_evidence: null}
+    runtime: "transformers 5.21 + torch 2.11 (runtime/uv.lock); bfloat16 on CUDA, float16 on MPS"
+    streaming: {closed_units: true, context: true, prefix_continuation: "not used"}
+    backend: "CUDA / MPS (PyTorch)"
+    open_question: "Clause adequacy and complete-unit latency while ASR and TTS share the GPU"
+    files:
+      - path: "LICENSE"
+        url: "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/resolve/cdbee75f17c01a7cc42f958dc650907174af0554/LICENSE"
+        sha256: "832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e"
+        size: 11343
+      - path: "README.md"
+        url: "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/resolve/cdbee75f17c01a7cc42f958dc650907174af0554/README.md"
+        sha256: "8e3dd0c3b5b11897cc71092ccfe517bb7a9783479baa3665aad73c8d1a2041cd"
+        size: 8168
+      - path: "config.json"
+        url: "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/resolve/cdbee75f17c01a7cc42f958dc650907174af0554/config.json"
+        sha256: "5beea1a4a34c62782bfb2f911c606741a3bab8f92d80a118fa053c28af12e8ba"
+        size: 727
+      - path: "generation_config.json"
+        url: "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/resolve/cdbee75f17c01a7cc42f958dc650907174af0554/generation_config.json"
+        sha256: "835fffe355c9438e7a25be099b3fccaa98350b83451f9fd2d99512e74f1ade48"
+        size: 238
+      - path: "merges.txt"
+        url: "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/resolve/cdbee75f17c01a7cc42f958dc650907174af0554/merges.txt"
+        sha256: "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3"
+        size: 1671839
+      - path: "model-00001-of-00003.safetensors"
+        url: "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/resolve/cdbee75f17c01a7cc42f958dc650907174af0554/model-00001-of-00003.safetensors"
+        sha256: "75311d91bb08cf0b882913da464a1e722a31fb44db35208663487efb7a3d8ed6"
+        size: 3957900840
+      - path: "model-00002-of-00003.safetensors"
+        url: "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/resolve/cdbee75f17c01a7cc42f958dc650907174af0554/model-00002-of-00003.safetensors"
+        sha256: "0b48adbb1f60e901153d91907ba11ce63bd4b8b584482e730f48808d055dfba1"
+        size: 3987450520
+      - path: "model-00003-of-00003.safetensors"
+        url: "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/resolve/cdbee75f17c01a7cc42f958dc650907174af0554/model-00003-of-00003.safetensors"
+        sha256: "7dd39ccca5e4de123c74c14af44c9bf2eb75df33b4614382af0134528e060d5d"
+        size: 99630640
+      - path: "model.safetensors.index.json"
+        url: "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/resolve/cdbee75f17c01a7cc42f958dc650907174af0554/model.safetensors.index.json"
+        sha256: "d6c42883a895dfef5b0080ed2116a1bcd764f558406b98923d675978a1abf29c"
+        size: 32819
+      - path: "tokenizer.json"
+        url: "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/resolve/cdbee75f17c01a7cc42f958dc650907174af0554/tokenizer.json"
+        sha256: "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+        size: 11422654
+      - path: "tokenizer_config.json"
+        url: "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/resolve/cdbee75f17c01a7cc42f958dc650907174af0554/tokenizer_config.json"
+        sha256: "a62ff0a2472a0fa1b8eaabcb57c59b58afa42a22831dc141400b6e0cf2b65ce3"
+        size: 9377
+      - path: "vocab.json"
+        url: "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/resolve/cdbee75f17c01a7cc42f958dc650907174af0554/vocab.json"
+        sha256: "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+        size: 2776833
+
+  - id: omnivoice-0.6b-torch
+    experimental_key: omnivoice
+    worker_backend: torch
+    worker_streaming: false
+    dependencies: []
+    stage: tts
+    status: verified
+    enabled: true
+    verified_by: "Claude (agent session for the cross-platform runtime)"
+    verified_on: "2026-10-27"
+    research_only: true
+    pass_on_use_restrictions: true
+    upstream:
+      repo: "https://huggingface.co/k2-fsa/OmniVoice"
+      revision: "c5fdb5ccb189668d56333f77ba2629f4cd7535f4"
+      license: Apache-2.0 (TTS); Boson Higgs Audio 2 Community License (bundled audio tokenizer)
+      license_evidence: "https://huggingface.co/k2-fsa/OmniVoice/blob/c5fdb5ccb189668d56333f77ba2629f4cd7535f4/README.md ; https://huggingface.co/k2-fsa/OmniVoice/blob/c5fdb5ccb189668d56333f77ba2629f4cd7535f4/audio_tokenizer/LICENSE"
+      note: "The PyTorch checkpoint that omnivoice-0.6b-mlx-bf16 was converted from; config, chat template, tokenizer config, and audio tokenizer weights hash identically to that verified entry."
+    converted: {repo: null, revision: null, license: null, license_evidence: null}
+    runtime: "omnivoice 0.2.1 + torch 2.11 (runtime/uv.lock); float16 on CUDA, float32 on CPU"
+    native_format: {sample_rate: 24000, channels: 1}
+    backend: "CUDA / MPS (PyTorch)"
+    open_question: "Chinese-to-English identity, first audio, sustained throughput, and memory under full pipeline load"
+    files:
+      - path: "README.md"
+        url: "https://huggingface.co/k2-fsa/OmniVoice/resolve/c5fdb5ccb189668d56333f77ba2629f4cd7535f4/README.md"
+        sha256: "b5d645a1874baa96a460a0e3a7d5a262811d682d04ce235878a16d5fed287fd3"
+        size: 9424
+      - path: "audio_tokenizer/LICENSE"
+        url: "https://huggingface.co/k2-fsa/OmniVoice/resolve/c5fdb5ccb189668d56333f77ba2629f4cd7535f4/audio_tokenizer/LICENSE"
+        sha256: "ac933dc084d119bd20401956b90d11ae87c248b2da62622cd580d82cdf2fa049"
+        size: 9171
+      - path: "audio_tokenizer/README.md"
+        url: "https://huggingface.co/k2-fsa/OmniVoice/resolve/c5fdb5ccb189668d56333f77ba2629f4cd7535f4/audio_tokenizer/README.md"
+        sha256: "0336368f8274a5ed09f54cee8d56a851ecee96026d9f391a6735762c16608a60"
+        size: 5174
+      - path: "audio_tokenizer/config.json"
+        url: "https://huggingface.co/k2-fsa/OmniVoice/resolve/c5fdb5ccb189668d56333f77ba2629f4cd7535f4/audio_tokenizer/config.json"
+        sha256: "eefb20806f7104e77c9a5277c9df0f9bb8826b08eb1d4e8ab2b9829b6ef9fac1"
+        size: 2531
+      - path: "audio_tokenizer/model.safetensors"
+        url: "https://huggingface.co/k2-fsa/OmniVoice/resolve/c5fdb5ccb189668d56333f77ba2629f4cd7535f4/audio_tokenizer/model.safetensors"
+        sha256: "fe7c5e8785e0a05833e1bfc3e002ec7f55af21e306b2e7154a448c1f54ccfb0d"
+        size: 805665628
+      - path: "audio_tokenizer/preprocessor_config.json"
+        url: "https://huggingface.co/k2-fsa/OmniVoice/resolve/c5fdb5ccb189668d56333f77ba2629f4cd7535f4/audio_tokenizer/preprocessor_config.json"
+        sha256: "ae61eea88558608ee2fa86d2aec9fce8d99a5ff75d09cb7651ccce21ae1d9084"
+        size: 206
+      - path: "chat_template.jinja"
+        url: "https://huggingface.co/k2-fsa/OmniVoice/resolve/c5fdb5ccb189668d56333f77ba2629f4cd7535f4/chat_template.jinja"
+        sha256: "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"
+        size: 4168
+      - path: "config.json"
+        url: "https://huggingface.co/k2-fsa/OmniVoice/resolve/c5fdb5ccb189668d56333f77ba2629f4cd7535f4/config.json"
+        sha256: "5e359117e13b420c5e0c925d4aba650d624767131f1d1746928f8b850d5dc372"
+        size: 2238
+      - path: "model.safetensors"
+        url: "https://huggingface.co/k2-fsa/OmniVoice/resolve/c5fdb5ccb189668d56333f77ba2629f4cd7535f4/model.safetensors"
+        sha256: "730839316de585f4c8298ec0e1712efc10fb19c6fa4e36eb741cb8d51ebcf6aa"
+        size: 2450344112
+      - path: "tokenizer.json"
+        url: "https://huggingface.co/k2-fsa/OmniVoice/resolve/c5fdb5ccb189668d56333f77ba2629f4cd7535f4/tokenizer.json"
+        sha256: "408f669b7e2b045fdf54201d815bd364e6667dbd845115da81239c40bc6dcfd1"
+        size: 11423986
+      - path: "tokenizer_config.json"
+        url: "https://huggingface.co/k2-fsa/OmniVoice/resolve/c5fdb5ccb189668d56333f77ba2629f4cd7535f4/tokenizer_config.json"
+        sha256: "49f78845596a82bf15c83673794bdf9f76f812b11f60ab6a2239d9be65b00676"
+        size: 533
+
   - id: streaming-sortformer-4spk
     stage: diarization
     status: declared

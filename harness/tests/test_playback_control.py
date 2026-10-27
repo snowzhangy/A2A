@@ -19,14 +19,14 @@ def test_playback_switch_controls_rendered_audio(pipeline_binary, tmp_path):
     source = tmp_path / "source.wav"
     write_wav(source, np.full(rate * 3, 0.25, dtype=np.float32), rate)
     script = tmp_path / "asr.json"
-    script.write_text(json.dumps({"hypotheses": []}))
+    script.write_text(json.dumps({"hypotheses": []}), encoding="utf-8")
     output = tmp_path / "output.wav"
     process = subprocess.Popen([
         str(pipeline_binary), "--input", str(source), "--clock", "host", "--pace", "realtime",
         "--asr", "scripted", "--asr-script", str(script), "--translation-only",
         "--control-stdin", "--events-stdout", "--tail-seconds", "0",
         "--trace", str(tmp_path / "trace.jsonl"), "--out", str(output),
-    ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
     messages = queue.Queue()
 
     def collect_events():
@@ -70,6 +70,6 @@ def test_playback_switch_controls_rendered_audio(pipeline_binary, tmp_path):
 
 def test_control_and_audio_cannot_share_stdin(pipeline_binary):
     result = subprocess.run([str(pipeline_binary), "--stdin", "--control-stdin"],
-                            capture_output=True, text=True, timeout=5)
+                            capture_output=True, text=True, encoding="utf-8", timeout=5)
     assert result.returncode == 2
     assert "cannot share stdin with audio" in result.stderr

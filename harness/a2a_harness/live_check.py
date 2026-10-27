@@ -65,7 +65,7 @@ def check(run: Path, expected_path: Path, transcript_path: Path | None = None) -
     expected = json.loads(expected_path.read_text(encoding="utf-8"))
     events = trace.load(run / "trace.jsonl")
     validation = trace.validate(events)
-    summary = json.loads((run / "summary.json").read_text())
+    summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
     rate = CANONICAL_RATE
 
     source, src_rate = read_wav(run / "source.wav")

@@ -17,7 +17,7 @@ PLAN_EXAMPLES = [
 
 
 def test_schema_is_valid_draft_2020_12():
-    jsonschema.Draft202012Validator.check_schema(json.loads(SCHEMA_PATH.read_text()))
+    jsonschema.Draft202012Validator.check_schema(json.loads(SCHEMA_PATH.read_text(encoding="utf-8")))
 
 
 def test_schema_covers_every_required_event_type():
@@ -28,7 +28,7 @@ def test_schema_covers_every_required_event_type():
         "play.end", "unit.cancel", "source.disposition", "queue.depth", "clock.drift", "resource.sample",
         "fallback.enter", "fallback.exit", "trace.drop", "error",
     }
-    enum = set(json.loads(SCHEMA_PATH.read_text())["properties"]["ev"]["enum"])
+    enum = set(json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))["properties"]["ev"]["enum"])
     assert required <= enum
 
 

@@ -24,7 +24,7 @@ def pct(values: list[float], q: float) -> float | None:
 
 
 def summarize(run: str) -> dict:
-    events = [json.loads(line) for line in open(f"{run}/trace.jsonl")]
+    events = [json.loads(line) for line in open(f"{run}/trace.jsonl", encoding="utf-8")]
     by = collections.defaultdict(dict)
     for e in events:
         if "unit" in e and e["ev"] in ("commit.source", "tts.request", "tts.first_chunk", "play.start", "play.end"):

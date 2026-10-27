@@ -15,7 +15,7 @@ from . import SCHEMA_PATH
 
 @lru_cache(maxsize=1)
 def _schema() -> dict:
-    schema = json.loads(SCHEMA_PATH.read_text())
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     jsonschema.Draft202012Validator.check_schema(schema)
     return schema
 

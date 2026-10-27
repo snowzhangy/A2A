@@ -29,8 +29,14 @@ CHUNK_FRAMES = CANONICAL_RATE // 50  # 20 ms
 
 
 def host_ns() -> int:
-    # Same base as mach_absolute_time, which the pipeline uses for t_ns.
-    return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+    """The pipeline's t_ns base: mach_absolute_time on macOS, the QPC counter on Windows
+    (what perf_counter_ns reads, and a2a_now_ns in the portable runtime), CLOCK_MONOTONIC
+    elsewhere."""
+    if sys.platform == "darwin":
+        return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+    if sys.platform == "win32":
+        return time.perf_counter_ns()
+    return time.clock_gettime_ns(time.CLOCK_MONOTONIC)
 
 
 @dataclass
@@ -61,25 +67,61 @@ def _sha256(path: Path) -> str | None:
 
 def _cmd(args: list[str]) -> str | None:
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=20).stdout.strip() or None
+        return subprocess.run(args, capture_output=True, text=True, encoding="utf-8", timeout=20).stdout.strip() or None
     except (OSError, subprocess.SubprocessError):
         return None
 
 
+def _windows_ram_bytes() -> int:
+    import ctypes
+
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+    status = MemoryStatus()
+    status.dwLength = ctypes.sizeof(MemoryStatus)
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+    return int(status.ullTotalPhys)
+
+
 def host_metadata() -> dict:
-    return {
-        "chip": _cmd(["sysctl", "-n", "machdep.cpu.brand_string"]),
-        "ram_bytes": int(_cmd(["sysctl", "-n", "hw.memsize"]) or 0),
-        "model": _cmd(["sysctl", "-n", "hw.model"]),
-        "os": platform.mac_ver()[0],
-        "os_build": _cmd(["sysctl", "-n", "kern.osversion"]),
-        "power": (_cmd(["pmset", "-g", "batt"]) or "").split("\n")[0],
-        "low_power_mode": (_cmd(["pmset", "-g"]) or "").find("lowpowermode         1") >= 0,
-        "swift": (_cmd(["swift", "--version"]) or "").split("\n")[0],
-        "developer_dir": os.environ.get("DEVELOPER_DIR"),
+    common = {
         "python": sys.version.split()[0],
         "git_rev": _cmd(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"]),
+        "gpu": _cmd(["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"]),
     }
+    if sys.platform == "darwin":
+        return {
+            "platform": "macOS",
+            "chip": _cmd(["sysctl", "-n", "machdep.cpu.brand_string"]),
+            "ram_bytes": int(_cmd(["sysctl", "-n", "hw.memsize"]) or 0),
+            "model": _cmd(["sysctl", "-n", "hw.model"]),
+            "os": platform.mac_ver()[0],
+            "os_build": _cmd(["sysctl", "-n", "kern.osversion"]),
+            "power": (_cmd(["pmset", "-g", "batt"]) or "").split("\n")[0],
+            "low_power_mode": (_cmd(["pmset", "-g"]) or "").find("lowpowermode         1") >= 0,
+            "swift": (_cmd(["swift", "--version"]) or "").split("\n")[0],
+            "developer_dir": os.environ.get("DEVELOPER_DIR"),
+            **common,
+        }
+    if sys.platform == "win32":
+        build = platform.version()
+        return {
+            "platform": "Windows",
+            "chip": _cmd(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).Name"])
+            or platform.processor(),
+            "ram_bytes": _windows_ram_bytes(),
+            "model": _cmd(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_ComputerSystem).Model"]),
+            "os": platform.release(),
+            "os_build": build,
+            **common,
+        }
+    return {"platform": platform.system(), "chip": platform.processor(), "ram_bytes": 0, "model": None,
+            "os": platform.release(), "os_build": platform.version(), **common}
 
 
 def _pipeline_args(cfg: RunConfig, fx: fixture_mod.Fixture, out: Path) -> list[str]:
@@ -136,7 +178,7 @@ def run(cfg: RunConfig) -> dict:
     feed_log: list[dict] = []
     t_wall = time.time()
     if cfg.mode == "offline":
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=600)
+        proc = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", timeout=600)
         stdout, stderr, code = proc.stdout, proc.stderr, proc.returncode
     elif cfg.mode == "paced":
         audio, rate = read_wav(fx.audio)
@@ -157,12 +199,12 @@ def run(cfg: RunConfig) -> dict:
         for r in readers:
             r.join(timeout=10)
         stdout, stderr = captured.get("stdout", b"").decode(), captured.get("stderr", b"").decode()
-        with open(out / "feed_log.jsonl", "w") as fh:
+        with open(out / "feed_log.jsonl", "w", encoding="utf-8") as fh:
             for e in feed_log:
                 fh.write(json.dumps(e) + "\n")
     else:
         raise SystemExit(f"unknown mode {cfg.mode}")
-    (out / "pipeline.stderr.txt").write_text(stderr)
+    (out / "pipeline.stderr.txt").write_text(stderr, encoding="utf-8")
     if code != 0:
         raise RuntimeError(f"pipeline exited {code}: {stderr.strip()[-2000:]}")
     summary = json.loads(stdout.strip().splitlines()[-1]) if stdout.strip() else {}
@@ -200,9 +242,9 @@ def run(cfg: RunConfig) -> dict:
         "identity_qualified": identity_qualified,
         "gate_valid": gate_valid,
     }
-    (out / "metrics.json").write_text(json.dumps(result, indent=2, ensure_ascii=False))
-    (out / "trace.perfetto.json").write_text(json.dumps(perfetto.convert(events)))
-    (out / "report.md").write_text(render_report(result))
+    (out / "metrics.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    (out / "trace.perfetto.json").write_text(json.dumps(perfetto.convert(events)), encoding="utf-8")
+    (out / "report.md").write_text(render_report(result), encoding="utf-8")
     return result
 
 
@@ -226,7 +268,9 @@ def render_report(r: dict) -> str:
         lines += ["> Not gate-valid (needs paced mode at speed 1.0, valid trace, no future access).", ""]
     lines += [
         f"- Adapters: ASR `{md['adapters']['asr']}`, MT `{md['adapters']['mt']}`, TTS `{md['adapters']['tts']}`; {md['warm_status']}",
-        f"- Host: {md['host'].get('chip')}, {md['host'].get('ram_bytes', 0) >> 30} GB, macOS {md['host'].get('os')} ({md['host'].get('os_build')})",
+        f"- Host: {md['host'].get('chip')}, {md['host'].get('ram_bytes', 0) >> 30} GB, "
+        f"{md['host'].get('platform', 'macOS')} {md['host'].get('os')} ({md['host'].get('os_build')})"
+        + (f", GPU {md['host']['gpu']}" if md['host'].get('gpu') else ""),
         f"- Trace: {r['validation']['events']} events, schema {'valid' if r['validation']['ok'] else 'INVALID'}, drops {r['validation']['trace_drops']}",
         f"- Future-audio access: {'none detected' if not r['future_access_violations'] else str(len(r['future_access_violations'])) + ' violations'}"
         + (" (checked against feed log)" if md["mode"] == "paced" else " (offline: reader-enforced)"),

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 
 import pytest
 import numpy as np
@@ -17,10 +18,12 @@ from a2a_harness import REPO_ROOT, trace
 from a2a_harness.audio import read_wav, write_wav
 from a2a_harness.fixture import load
 
-PYTHON = shutil.which("python3", path="/usr/bin")
+# The fake worker needs only the standard library: the system Python on macOS, this
+# interpreter elsewhere (Windows has no /usr/bin/python3).
+PYTHON = shutil.which("python3", path="/usr/bin") or sys.executable
 
 
-@pytest.mark.skipif(PYTHON is None, reason="needs /usr/bin/python3 for the fake worker")
+@pytest.mark.skipif(PYTHON is None, reason="needs a Python for the fake worker")
 def test_clone_acquires_reference_and_never_qualifies_identity(synthetic_fixture, pipeline_binary, tmp_path):
     fx = load(synthetic_fixture)
     cmd = [str(pipeline_binary), "--input", str(fx.audio), "--clock", "host", "--pace", "asap",
@@ -29,7 +32,7 @@ def test_clone_acquires_reference_and_never_qualifies_identity(synthetic_fixture
            "--tts", "clone", "--clone-fake", "--clone-python", PYTHON,
            "--clone-worker", str(REPO_ROOT / "research" / "tts_worker.py"),
            "--trace", str(tmp_path / "trace.jsonl"), "--out", str(tmp_path / "out.wav")]
-    done = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=180)
     assert done.returncode == 0, done.stderr[-2000:]
     summary = json.loads(done.stdout.strip().splitlines()[-1])
     assert summary["tts"] == "clone" and summary["tts_preserves_speaker_identity"]
@@ -48,7 +51,7 @@ def test_clone_acquires_reference_and_never_qualifies_identity(synthetic_fixture
     assert all(e["t_ns"] >= ready[0]["t_ns"] for e in requests)
 
 
-@pytest.mark.skipif(PYTHON is None, reason="needs /usr/bin/python3 for the fake worker")
+@pytest.mark.skipif(PYTHON is None, reason="needs a Python for the fake worker")
 @pytest.mark.parametrize("model", ["qwen", "omnivoice", "chatterbox"])
 def test_clone_fixed_reference_is_ready_before_the_first_unit(synthetic_fixture, pipeline_binary, tmp_path, model):
     fx = load(synthetic_fixture)
@@ -57,7 +60,7 @@ def test_clone_fixed_reference_is_ready_before_the_first_unit(synthetic_fixture,
     write_wav(reference, samples[: rate * 4], rate)
     mode = "xvector" if model == "qwen" else "icl"
     reference_text = tmp_path / "reference.txt"
-    reference_text.write_text("Synthetic reference.")
+    reference_text.write_text("Synthetic reference.", encoding="utf-8")
     cmd = [str(pipeline_binary), "--input", str(fx.audio), "--clock", "host", "--pace", "asap",
            "--asr", "scripted", "--asr-script", str(fx.asr_script),
            "--mt", "dictionary", "--mt-dictionary", str(fx.mt_dictionary),
@@ -65,7 +68,7 @@ def test_clone_fixed_reference_is_ready_before_the_first_unit(synthetic_fixture,
            "--voice-ref-text", str(reference_text),
            "--clone-worker", str(REPO_ROOT / "research" / "tts_worker.py"), "--voice-ref", str(reference),
            "--trace", str(tmp_path / "trace.jsonl"), "--out", str(tmp_path / "out.wav")]
-    done = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=180)
     assert done.returncode == 0, done.stderr[-2000:]
     summary = json.loads(done.stdout.strip().splitlines()[-1])
     assert summary["clone"]["reference"] == "fixed" and summary["clone"]["conditioning"] == mode
@@ -82,11 +85,11 @@ def test_clone_fixed_reference_is_ready_before_the_first_unit(synthetic_fixture,
 def test_clone_options_are_validated(pipeline_binary, tmp_path):
     done = subprocess.run([str(pipeline_binary), "--input", "x.wav", "--clock", "host", "--tts", "system",
                            "--voice-ref", "ref.wav", "--trace", str(tmp_path / "t.jsonl")],
-                          capture_output=True, text=True, timeout=30)
+                          capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert done.returncode == 2 and "need --tts clone" in done.stderr
     done = subprocess.run([str(pipeline_binary), "--input", "x.wav", "--clock", "host", "--tts", "clone",
                            "--voice-ref", "ref.wav", "--trace", str(tmp_path / "t.jsonl")],
-                          capture_output=True, text=True, timeout=30)
+                          capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert done.returncode == 2 and "--voice-ref-text" in done.stderr
 
 
@@ -97,11 +100,11 @@ def test_clone_options_are_validated(pipeline_binary, tmp_path):
 ])
 def test_invalid_model_combinations_fail_before_startup(pipeline_binary, args, message):
     done = subprocess.run([str(pipeline_binary), "--stdin"] + args,
-                          capture_output=True, text=True, timeout=5)
+                          capture_output=True, text=True, encoding="utf-8", timeout=5)
     assert done.returncode == 2 and message in done.stderr
 
 
-@pytest.mark.skipif(PYTHON is None, reason="needs /usr/bin/python3 for the fake worker")
+@pytest.mark.skipif(PYTHON is None, reason="needs a Python for the fake worker")
 def test_remembered_voice_survives_restart_and_is_reused(pipeline_binary, tmp_path):
     rate = 48_000
     source = tmp_path / "source.wav"
@@ -109,9 +112,9 @@ def test_remembered_voice_survives_restart_and_is_reused(pipeline_binary, tmp_pa
     script = tmp_path / "asr.json"
     script.write_text(json.dumps({"hypotheses": [
         {"at_sample": 201600, "utt": 1, "text": "我们下周开会。", "final": True,
-         "tokens": [{"text": "我们下周开会。", "start": 24000, "end": 192000}]}]}))
+         "tokens": [{"text": "我们下周开会。", "start": 24000, "end": 192000}]}]}), encoding="utf-8")
     dictionary = tmp_path / "mt.json"
-    dictionary.write_text(json.dumps({"我们下周开会。": "We will meet next week."}))
+    dictionary.write_text(json.dumps({"我们下周开会。": "We will meet next week."}), encoding="utf-8")
     summaries = []
     for attempt in ["cold", "warm"]:
         run = tmp_path / attempt
@@ -121,7 +124,7 @@ def test_remembered_voice_survives_restart_and_is_reused(pipeline_binary, tmp_pa
                "--tts", "clone", "--clone-fake", "--clone-python", PYTHON,
                "--clone-worker", str(REPO_ROOT / "research/tts_worker.py"), "--speakers", "auto",
                "--voice-memory", str(tmp_path / "memory"), "--events-stdout", "--trace", str(run / "trace.jsonl")]
-        done = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=60)
         assert done.returncode == 0, done.stderr[-2000:]
         summaries.append(json.loads(done.stdout.splitlines()[-1]))
     assert list((tmp_path / "memory").glob("*.voice"))

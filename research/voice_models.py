@@ -12,15 +12,23 @@ KEYS = ("qwen", "omnivoice", "chatterbox")
 
 def manifest() -> dict:
     import yaml
-    return yaml.safe_load((ROOT / "models/manifest.yaml").read_text())
+    return yaml.safe_load((ROOT / "models/manifest.yaml").read_text(encoding="utf-8"))
 
 
-def selection(key: str, doc: dict | None = None) -> list[dict]:
+BACKENDS = ("mlx", "torch")
+
+
+def selection(key: str, doc: dict | None = None, backend: str = "mlx") -> list[dict]:
+    """Manifest entries for one experimental model on one worker backend: MLX on Apple
+    silicon (the default), PyTorch for CUDA/MPS/CPU hosts (ADR-0007)."""
     if key not in KEYS:
         raise ValueError(f"unknown experimental model: {key}")
+    if backend not in BACKENDS:
+        raise ValueError(f"unknown worker backend: {backend}")
     doc = manifest() if doc is None else doc
     entries = {e["id"]: e for e in doc["entries"]}
-    matches = [e for e in entries.values() if e.get("experimental_key") == key]
+    matches = [e for e in entries.values()
+               if e.get("experimental_key") == key and e.get("worker_backend", "mlx") == backend]
     if len(matches) != 1:
         raise ValueError(f"expected one manifest entry for {key}")
     selected = matches[0]
@@ -45,11 +53,17 @@ def local_path(entry: dict, doc: dict) -> Path:
     return ROOT / doc["cache_dir"] / entry["id"] / entry["upstream"]["revision"]
 
 
-def installations(doc: dict | None = None) -> list[dict]:
+def available_keys(doc: dict, backend: str = "mlx") -> list[str]:
+    """Experimental keys that have a manifest entry for `backend`, in catalog order."""
+    return [k for k in KEYS if any(e.get("experimental_key") == k and e.get("worker_backend", "mlx") == backend
+                                   for e in doc["entries"])]
+
+
+def installations(doc: dict | None = None, backend: str = "mlx") -> list[dict]:
     doc = manifest() if doc is None else doc
     result = []
-    for key in KEYS:
-        entries = selection(key, doc)
+    for key in KEYS if backend == "mlx" else available_keys(doc, backend):
+        entries = selection(key, doc, backend)
         present = True
         for entry in entries:
             path = local_path(entry, doc)
@@ -68,16 +82,18 @@ def main() -> None:
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--list", action="store_true")
     action.add_argument("--install", choices=KEYS)
+    parser.add_argument("--backend", choices=BACKENDS, default="mlx",
+                        help="worker backend: mlx (Apple silicon, default) or torch (CUDA/MPS/CPU)")
     args = parser.parse_args()
     doc = manifest()
     if args.install:
         # The explicit setup action is the only network-capable path in this module.
         sys.path.insert(0, str(ROOT))
         from scripts.fetch_models import fetch
-        entries = selection(args.install, doc)
+        entries = selection(args.install, doc, args.backend)
         fetch(doc, [e["id"] for e in entries], ROOT / doc["cache_dir"],
               log=lambda message: print(message, file=sys.stderr, flush=True))
-    print(json.dumps(installations(doc)))
+    print(json.dumps(installations(doc, args.backend)))
 
 
 if __name__ == "__main__":

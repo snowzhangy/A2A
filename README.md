@@ -1,5 +1,9 @@
 # A2A
 
+The native application below targets macOS. An experimental Windows desktop preview is
+under `runtime/`; it has not passed live-audio lifecycle or voice-quality acceptance.
+See [the portable runtime guide](runtime/README.md) for setup and current limitations.
+
 Local Mandarin ↔ English translation on Apple silicon, targeting macOS 26 or later.
 
 The development app provides translated audio and captions from another app. Choose
