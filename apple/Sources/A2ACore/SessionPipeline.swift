@@ -82,6 +82,13 @@ public struct PipelineConfig: Sendable {
     /// listening run (`a2a-pipeline --no-turn-fill`).
     public var turnFillEnabled = true
 
+    /// Delivery conditioning (ADR-0015): offer each unit's own source audio to a
+    /// reference-conditioned synthesizer, so the take keeps how the actor said *that* line
+    /// instead of the average of everything else they said. Opt-in: it changes the character of
+    /// every cloned line, and a reference preparation per unit (~10 ms measured on Qwen3-TTS, but
+    /// it is model work on a busy machine). `a2a-pipeline --clone-delivery line`.
+    public var cloneDeliveryLine = false
+
     public init(session: String, direction: TranslationDirection = .chineseToEnglish) {
         self.session = session
         self.direction = direction
@@ -145,6 +152,10 @@ public struct SynthesisJob: Hashable, Sendable {
     /// where the actor stops (ADR-0013). Set only for a phrase that plays in a slot and is not
     /// yet late for it; see `SessionPipeline.synthesize`.
     public var allowFill: Bool = false
+    /// The driver may offer this unit's own source audio to the synthesizer as a delivery
+    /// reference (ADR-0015). Permission only: the driver supplies the audio, the worker decides
+    /// whether the clip can be appended, and a synthesizer without a reference ignores it.
+    public var deliveryAllowed: Bool = false
 }
 
 public enum PipelineEffect: Hashable, Sendable {
@@ -617,11 +628,23 @@ public struct SessionPipeline: Sendable {
         // A unit whose timing is estimated has no trustworthy speech end to pace against.
         let target = config.finishPhraseBeforeCatchUp && !r.source.timingEstimated
             ? max(0.5, r.source.span.durationSeconds) : nil
+        let delivery = allowDelivery(of: r)
         return [trace(.ttsRequest, [.unit(id), .int("prof", version), .int("chars", text.count)]
-                        + (target != nil && allowFill(of: r) ? [(.bool("fill", true))] : [])),
+                        + (target != nil && allowFill(of: r) ? [(.bool("fill", true))] : [])
+                        + (delivery ? [(.bool("delivery", true))] : [])),
                 .synthesize(SynthesisJob(unit: id, text: text, speaker: r.speaker, profileVersion: version,
                                          epoch: gate.epoch, generation: gate.generation, span: r.source.span,
-                                         targetSeconds: target, allowFill: target != nil && allowFill(of: r)))]
+                                         targetSeconds: target, allowFill: target != nil && allowFill(of: r),
+                                         deliveryAllowed: delivery))]
+    }
+
+    /// Delivery conditioning (ADR-0015): may this unit's own source audio go to the synthesizer?
+    /// It needs the speaker attribution to be real, because the clip is appended to *that actor's*
+    /// reference — a span the tracker is not sure about could otherwise teach one actor's voice to
+    /// speak with another's delivery. A forced split (`timingEstimated`) has no clean actor audio
+    /// either: its span is a guess at a boundary, not a performed line.
+    private func allowDelivery(of r: UnitRecord) -> Bool {
+        config.cloneDeliveryLine && !r.source.timingEstimated && hasSpeakerAttribution(for: r.source.span)
     }
 
     /// Fill (ADR-0013): slow a short take so it ends with the actor's own last sound rather
@@ -683,6 +706,11 @@ public struct SessionPipeline: Sendable {
     }
 
     /// The speaker labeling most of `span`, their share of it, and the share labeled at all.
+    /// The source words committed for a unit, as recognized. Delivery conditioning appends the
+    /// unit's own audio to a reference, and in-context conditioning pairs that audio with the words
+    /// spoken over it (ADR-0015). Local only: this travels to the synthesizer, never to a trace.
+    public func sourceText(of unit: UnitID) -> String? { units[unit]?.source.text }
+
     public func speakerCoverage(of span: SourceSpan) -> (speaker: SpeakerID, share: Double, labeled: Double)? {
         let all = overlaps(of: span)
         guard let best = all.first, span.count > 0 else { return nil }

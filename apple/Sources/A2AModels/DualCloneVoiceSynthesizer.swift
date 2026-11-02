@@ -43,9 +43,24 @@ public final class DualCloneVoiceSynthesizer: VoiceSynthesizer, @unchecked Senda
 
     public func synthesize(unit: UnitID, text: String, voice: PreparedVoice, targetSeconds: Double?,
                            allowFill: Bool, lane: Int) -> AsyncThrowingStream<SynthesizedAudio, Error> {
+        synthesize(unit: unit, text: text, voice: voice, targetSeconds: targetSeconds, allowFill: allowFill,
+                   delivery: nil, lane: lane)
+    }
+
+    /// Delivery conditioning is per line (ADR-0015), so it follows the lane that owns the unit:
+    /// both workers hold the same prepared profile, and the clip goes to whichever speaks.
+    public func synthesize(unit: UnitID, text: String, voice: PreparedVoice, targetSeconds: Double?,
+                           allowFill: Bool, delivery: DeliveryClip?) -> AsyncThrowingStream<SynthesizedAudio, Error> {
+        synthesize(unit: unit, text: text, voice: voice, targetSeconds: targetSeconds, allowFill: allowFill,
+                   delivery: delivery, lane: 0)
+    }
+
+    public func synthesize(unit: UnitID, text: String, voice: PreparedVoice, targetSeconds: Double?,
+                           allowFill: Bool, delivery: DeliveryClip?,
+                           lane: Int) -> AsyncThrowingStream<SynthesizedAudio, Error> {
         precondition((0..<workers.count).contains(lane))
         return workers[lane].synthesize(unit: unit, text: text, voice: voice, targetSeconds: targetSeconds,
-                                        allowFill: allowFill)
+                                        allowFill: allowFill, delivery: delivery)
     }
 
     public func takeStats(for unit: UnitID) -> CloneSynthesisStats? {

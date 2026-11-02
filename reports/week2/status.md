@@ -1,5 +1,33 @@
 **Implementation status — 25 October 2026**
 
+2 November, delivery. A pinned speaker profile fixes the right problem for identity and the wrong one
+for acting: a profile is the average of how an actor sounds, so a shout and a murmur come out at the
+same register. dub-anything dubs every line with that line's own clip in the prompt, and its listeners
+called the loud lines the ones that sell it; A2A had no instrument that could even see this, because
+BLEU and SECS are indifferent to delivery. Now a unit can carry its own source audio to the
+synthesizer (`DeliveryClip`) and the worker appends the loudest 4 s of it to that speaker's reference
+for that take alone — the profile stays pinned. The reducer owns the permission (`--clone-delivery
+line`, real token timing, speaker attribution per ADR-0005); the worker owns whether the clip is
+usable and says why not (`line` / `too_quiet` / `reference_bound` / `needs_source_text` / `failed`),
+which reaches `tts.done` so a run that stopped conditioning cannot read as a normal one.
+
+The instrument came first: `research/dub_delivery.py`, numpy only, ported from their `eval/score.py`
+— YIN pitch, spectral-tilt effort, level, z-scored on the actor's own lines, Spearman
+follow-through, `dynamics` (how much movement survives into the take), `shape` kept apart from
+`bias`, and the noise floor between lines. It reads a run directory directly, or explicit
+`--source/--takes/--units`, one units file per variant when two runs render the same lines at
+different lengths. On five actor lines of one real episode, same English, same profile: dynamics
+**1.28 → 2.76**, vocal effort correlation **−0.30 → +0.30**, arousal **0.10 → −0.20**, absolute
+offset to the actor's scale **1.03 → 1.96**. Read that as the mechanism moving real signal, not as a
+verdict: five lines cannot settle a correlation, and `shape` worsening is expected when a take stops
+sitting at the session average and starts sitting where the line was. Cost is real and it is exactly
+what pinning was invented to hide: **+30–47 ms** of reference preparation per line, **+30–50 ms** to
+first audio, and the appended clip lifts the bed between lines (−22 → −36 dBFS), which is one more
+reason isolated references are next. Off by default, research-only like cloning itself, until ears
+judge it. [ADR-0015](../../docs/adr/0015-per-line-delivery-conditioning.md),
+[the parity program](dub-parity.md). Tests: 11 instrument + 9 worker-capability (stub backend) + 4
+reducer permission.
+
 2 November, merge. GitHub's `main` had moved while this tree grew: the published branch carries
 *Add experimental Windows translation runtime and UI* (`runtime/`, with its own ADR-0007). The two
 sides met in three files, and both were kept. `research/tts_worker.py` holds the take retry, the

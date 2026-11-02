@@ -23,6 +23,8 @@
 //   --tts tone|system|clone
 //   --profile-ready-ms N                             0 = prepared profile at arm (tone/system only)
 //   --clone-mode icl|xvector                         clone conditioning (default icl)
+//   --clone-delivery pinned|line                     speak each line on the actor's own delivery of
+//                                                  that line (ADR-0015); research knob, off by default
 //   --voice-ref ref.wav [--voice-ref-text ref.txt]   clone: fixed reference prepared before capture;
 //                                                    otherwise the reference is acquired from the
 //                                                    source's first finalized utterances
@@ -131,6 +133,8 @@ struct Options {
     /// Turn fill (ADR-0013): a take shorter than its speech is slowed to end with the actor.
     /// Only ever applies with a picture delay; `--no-turn-fill` turns it off for an A/B listen.
     var turnFill = true
+    /// "line" conditions each cloned take on the actor's own audio of that line (ADR-0015).
+    var cloneDelivery = "pinned"
     /// Test only (virtual clock): no capture for `seconds` once the source reaches `at`, as when
     /// a paused video leaves the global tap without callbacks.
     var captureGap: (at: Double, seconds: Double)?
@@ -255,6 +259,10 @@ struct Options {
                 guard let ms = Int(value()), (0...30_000).contains(ms) else { fail("--presentation-delay-ms takes 0–30000") }
                 o.presentationDelayMs = ms
             case "--no-turn-fill": o.turnFill = false
+            case "--clone-delivery":
+                let mode = value()
+                guard ["pinned", "line"].contains(mode) else { fail("--clone-delivery is pinned or line") }
+                o.cloneDelivery = mode
             case "--background-out": o.backgroundOut = value()
             case "--speakers": o.speakers = value()
             case "--parent-pid": o.parentPID = pid()
@@ -312,6 +320,7 @@ struct Options {
             fail("--dual-clone requires --tts clone --clone-model qwen --fluent --clock host")
         }
         if o.voiceRefText != nil, o.voiceRef == nil { fail("--voice-ref-text needs --voice-ref") }
+        if o.cloneDelivery != "pinned", o.tts != "clone" { fail("--clone-delivery conditions cloned voices; use it with --tts clone") }
         if o.asr == "audio" && (!o.translatesAudio || (o.tts == "clone" && o.cloneMode != .xvector) || o.voiceMemory != nil) {
             fail("--asr audio requires --mt hy or hy-local, audio-only reference conditioning for clone, and no voice memory")
         }
@@ -778,6 +787,7 @@ final class Driver {
         // With a picture delay the lag limit counts from each unit's slot (ADR-0012).
         config.presentationDelaySeconds = Double(options.presentationDelayMs) / 1_000
         config.turnFillEnabled = options.turnFill
+        config.cloneDeliveryLine = options.cloneDelivery == "line"
         if let k = options.maxUnitKeys { config.commit.maxUnitKeys = k }
         if let s = options.maxUnitSeconds { config.commit.maxUnitSourceSeconds = s }
         if let c = options.speakerCarry { config.unlabeledSpeakerCarrySeconds = c }
@@ -1398,15 +1408,23 @@ final class Driver {
         let spoken = pronunciation.apply(job.text)
         let selectedLane = lane
         let fill = job.allowFill
+        // ADR-0015: this unit's own source audio, so the cloned take keeps the actor's delivery of
+        // this line rather than the average of their session. The adapter resamples it; nothing
+        // about the clip is written, traced, or kept past the unit.
+        var delivery: DeliveryClip? = nil
+        if job.deliveryAllowed, let pcm = historySlice(job.span) {
+            delivery = DeliveryClip(pcm: pcm, sampleRate: canonicalRate,
+                                    sourceText: pipeline.sourceText(of: job.unit) ?? "")
+        }
         tasks[job.unit] = Task.detached {
             do {
                 if let tone { try await Task.sleep(nanoseconds: tone.firstChunk.nanoseconds(units: 0)) }
                 let stream = if let dual = synthesizer as? DualCloneVoiceSynthesizer {
                     dual.synthesize(unit: job.unit, text: spoken, voice: voice, targetSeconds: job.targetSeconds,
-                                    allowFill: fill, lane: selectedLane)
+                                    allowFill: fill, delivery: delivery, lane: selectedLane)
                 } else {
                     synthesizer.synthesize(unit: job.unit, text: spoken, voice: voice, targetSeconds: job.targetSeconds,
-                                           allowFill: fill)
+                                           allowFill: fill, delivery: delivery)
                 }
                 for try await c in stream {
                     if Task.isCancelled { return }
@@ -1445,6 +1463,14 @@ final class Driver {
                 ?? (synthesizer as? DualCloneVoiceSynthesizer)?.takeStats(for: job.unit)
             if cloneStats?.truncated == true { stats["tts_truncated_units", default: 0] += 1 }
             if let retries = cloneStats?.retries, retries > 0 { stats["tts_silent_retries", default: 0] += retries }
+            if let done = cloneStats, done.delivery != "absent" {
+                // Conditioning is counted, and its refusal is named: a run that quietly stopped
+                // conditioning every line would otherwise read as a normal one.
+                stats[done.delivery == "line" ? "delivery_used_units" : "delivery_refused_units", default: 0] += 1
+                if done.delivery != "line" { stats["delivery_\(done.delivery)", default: 0] += 1 }
+                stats["delivery_prep_ms_max", default: 0] = max(stats["delivery_prep_ms_max", default: 0],
+                                                                Int((done.deliveryPrepSeconds * 1_000).rounded()))
+            }
             if let done = cloneStats {
                 let ms = { (seconds: Double) in Int((seconds * 1000).rounded()) }
                 var fields: [TraceEvent.Field] = [.unit(job.unit), .double("pace", done.pace),
@@ -1455,6 +1481,13 @@ final class Driver {
                 if done.truncated { fields.append(.bool("truncated", true)) }
                 // A silent first take was discarded and generated again with another seed.
                 if done.retries > 0 { fields.append(.int("retries", done.retries)) }
+                // Delivery conditioning (ADR-0015): the verdict and its cost, never the audio or
+                // the actor's words.
+                if done.delivery != "absent" {
+                    fields.append(.string("delivery", done.delivery))
+                    fields.append(.int("delivery_ms", ms(done.deliverySeconds)))
+                    fields.append(.int("delivery_prep_ms", ms(done.deliveryPrepSeconds)))
+                }
                 if let target = job.targetSeconds { fields.append(.int("target_ms", ms(target))) }
                 if !pronunciation.isEmpty { fields.append(.bool("respelled", pronunciation.apply(job.text) != job.text)) }
                 trace.emit(TraceEvent(tNs: now, session: o.session, epoch: pipeline.gate.epoch, gen: pipeline.gate.generation,
@@ -2003,6 +2036,7 @@ final class Driver {
             s["clone"] = ["model": info?.model ?? "", "selected_model": o.cloneModel.rawValue,
                           "audio_output_streaming": synthesizer.capabilities.audioOutputStreaming,
                           "conditioning": o.cloneMode.rawValue, "workers": o.dualClone ? 2 : 1,
+                          "delivery_conditioning": o.cloneDelivery,
                           "session_voice_locked": pipeline.config.pinSpeakerProfiles,
                           "speaker_attribution_required": pipeline.config.requireSpeakerAttribution && pipeline.config.multiSpeaker,
                           "reference": o.voiceRef == nil ? "acquired" : "fixed", "profiles": profileLog,

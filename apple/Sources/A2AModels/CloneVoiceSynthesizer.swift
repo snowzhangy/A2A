@@ -36,9 +36,17 @@ public struct CloneSynthesisStats: Sendable, Equatable {
     public let truncated: Bool
     /// Takes discarded because they produced no voiced audio before the worker's silent-take limit.
     public let retries: Int
+    /// Delivery conditioning (ADR-0015): `line` when the take was spoken on a reference that ended
+    /// with the actor's own audio of this line, otherwise the reason it was not — `absent`,
+    /// `too_quiet`, `reference_bound`, `needs_source_text`, `failed`. `absent` means the host never
+    /// asked. Seconds of appended clip and of the extra reference preparation.
+    public let delivery: String
+    public let deliverySeconds: Double
+    public let deliveryPrepSeconds: Double
 
     public init(pace: Double, nativeSeconds: Double, audioSeconds: Double, quietRemovedSeconds: Double,
-                budgetSeconds: Double = 0, truncated: Bool = false, retries: Int = 0) {
+                budgetSeconds: Double = 0, truncated: Bool = false, retries: Int = 0,
+                delivery: String = "absent", deliverySeconds: Double = 0, deliveryPrepSeconds: Double = 0) {
         self.pace = pace
         self.nativeSeconds = nativeSeconds
         self.audioSeconds = audioSeconds
@@ -46,6 +54,9 @@ public struct CloneSynthesisStats: Sendable, Equatable {
         self.budgetSeconds = budgetSeconds
         self.truncated = truncated
         self.retries = retries
+        self.delivery = delivery
+        self.deliverySeconds = deliverySeconds
+        self.deliveryPrepSeconds = deliveryPrepSeconds
     }
 }
 
@@ -177,6 +188,15 @@ public final class CloneVoiceSynthesizer: VoiceSynthesizer, @unchecked Sendable 
 
     public func synthesize(unit: UnitID, text: String, voice: PreparedVoice, targetSeconds: Double?,
                            allowFill: Bool) -> AsyncThrowingStream<SynthesizedAudio, Error> {
+        synthesize(unit: unit, text: text, voice: voice, targetSeconds: targetSeconds, allowFill: allowFill,
+                   delivery: nil)
+    }
+
+    /// `delivery` travels in the request payload: the actor's own audio of this line, which the
+    /// worker appends to this speaker's prepared reference for this one take (ADR-0015). Whether
+    /// it was used, and why not, comes back on the `done` event and is readable in `takeStats`.
+    public func synthesize(unit: UnitID, text: String, voice: PreparedVoice, targetSeconds: Double?,
+                           allowFill: Bool, delivery: DeliveryClip?) -> AsyncThrowingStream<SynthesizedAudio, Error> {
         // About 80 s of 0.32 s chunks; the driver forwards each chunk as it arrives.
         AsyncThrowingStream(bufferingPolicy: .bufferingOldest(256)) { continuation in
             let (id, failure) = shared.state.withLock { s -> (Int, String?) in
@@ -208,7 +228,14 @@ public final class CloneVoiceSynthesizer: VoiceSynthesizer, @unchecked Sendable 
                 // Only a slotted host may slow a take; see the protocol comment in A2ACore.
                 if allowFill { request["fill"] = true }
             }
-            send(request)
+            var payload: [Float] = []
+            if let delivery, !delivery.pcm.isEmpty {
+                request["delivery"] = true
+                if !delivery.sourceText.isEmpty { request["delivery_text"] = delivery.sourceText }
+                payload = delivery.sampleRate == Self.sampleRate ? delivery.pcm
+                    : StreamingResampler.resample(delivery.pcm, from: delivery.sampleRate, to: Self.sampleRate)
+            }
+            send(request, payload: payload)
         }
     }
 
@@ -323,7 +350,9 @@ public final class CloneVoiceSynthesizer: VoiceSynthesizer, @unchecked Sendable 
                         audioSeconds: number("audio_s"),
                         quietRemovedSeconds: number("quiet_samples_removed") / Double(sampleRate),
                         budgetSeconds: number("budget_s"), truncated: event["truncated"] as? Bool ?? false,
-                        retries: (event["retries"] as? NSNumber)?.intValue ?? 0)
+                        retries: (event["retries"] as? NSNumber)?.intValue ?? 0,
+                        delivery: event["delivery"] as? String ?? "absent",
+                        deliverySeconds: number("delivery_s"), deliveryPrepSeconds: number("delivery_prep_s"))
                 }
                 return continuation
             }?.finish()

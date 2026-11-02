@@ -21,7 +21,7 @@ honest about the rest. Every row below says which of these it is: **live-possibl
 | Voice-free background: music, laughter and effects stay in the original | Between lines you hear the film, not silence | Shipped: ADR-0008, `AUSoundIsolation` off the RT thread, its own bus and delay ([spike](dub-anything-review.md)) | live-possible, done |
 | Casting: every line gets its actor's voice, chosen across the whole file | A dub with one voice is not a dub | Shipped: `--speakers auto`, per-speaker cloned references, first profile pinned (ADR-0005/0009). The DSP tracker still merges same-gender actors and fails under music ([speaker-slots.md](speaker-slots.md)) | live-limited; the tracker is the weak part, not the cloning |
 | References cut from separated vocals | Cleaner clones, less noise between words (their finding 4) | **Not done.** References are cut from the mix, music and all, by `ReferencePolicy` | live-possible, open |
-| Per-line delivery conditioning: each line's reference is the actor's clips **plus the actor's own original of that line** | The single biggest acting gain: a shout stays a shout, a murmur stays a murmur (findings 6, 17-20; kept on for Mandarin → English, finding 20) | **Not done.** One pinned profile per speaker for the whole session: the right voice, delivered flat | live-possible, open, and the largest remaining gap. A2A already holds what it needs: the unit's source PCM and its own transcript |
+| Per-line delivery conditioning: each line's reference is the actor's clips **plus the actor's own original of that line** | The single biggest acting gain: a shout stays a shout, a murmur stays a murmur (findings 6, 17-20; kept on for Mandarin → English, finding 20) | **Built, off by default** (`--clone-delivery line`, [ADR-0015](../../docs/adr/0015-per-line-delivery-conditioning.md)): the unit's own audio is appended to its speaker's reference for that take, and the worker reports whether it could be used. Measured: +30–50 ms to first audio, and the take carries 2.2× the actor's register movement | live-possible, shipped as a research knob; unlistened-to, so it is not the default |
 | Timing: every take is re-timed to end where the actor stops | Their listeners ranked the rhythm of the exchange **at least as high as the acting** (findings 7-8) | **Shipped today** ([ADR-0013](../../docs/adr/0013-turn-timing-fill.md)), plus the metric that reference uses: dead air and overrun per unit | live-possible, done within a stretch bound |
 | Length: the translation is *written* to fill the actor's time, with the take's length predicted before rendering (`fit.py`) | Fills the time instead of needing fill; their finding 3 was that English ended far too early on many lines and nothing flagged it | **Partial.** Over-length is cut after synthesis (`TargetShortener`, simultaneous-interpreter deletion) and under-length is now stretched; nothing asks the translator for a length. The cut and the ask use the same rate constant, so they cannot disagree | live-limited: needs a translator that takes an instruction. Apple Translation does not; the research `--mt context` worker is the place, and `mlx_lm` is not installed in `research/` today |
 | Per-line QA: every rendered line is transcribed back, garbles re-rolled, best take kept | Nothing garbled reaches the listener | **Offline-only in general** — a line already played cannot be re-rendered. A2A retries only a take that produced no voiced audio. Live-possible subset: re-roll before playout when the unit still has slot slack, and after-the-fact flags in the report | both; the pre-playout subset is open |
@@ -87,13 +87,41 @@ stretched takes**, and the fixture's voice is a tone generator: this is the mech
 instrument, not a quality verdict. Identity, naturalness and the product gates are unchanged, and
 cloning stays research-only (`tts_identity_qualified: false`).
 
+## Delivery: does a shout survive the pipeline?
+
+The instrument landed before the feature, because without it every delivery claim is unfalsifiable:
+BLEU and SECS say nothing about whether a shout survived. `research/dub_delivery.py` scores the
+**contour** of register — pitch (YIN), vocal effort (spectral tilt, the cue their listeners voted
+strongest), and level — as rank correlation against the actor's own lines, because a dubbed voice is
+never the actor's absolute loudness: the target is *moving where the actor moved*, and the offset is
+reported apart (`shape`) from the follow-through. It also reports `dynamics`, how much of the
+actor's movement reaches the take at all, and the noise floor between lines.
+
+Same English lines, same pinned profile, one real episode excerpt, five actor lines
+(`.local/dub-parity/delivery/ab/`; research audio, aggregates only):
+
+| Conditioning | arousal | pitch | effort | level | dynamics | shape | floor dBFS |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| pinned profile | 0.10 | n/a | −0.30 | 0.60 | **1.28** | 1.03 | −22.1 |
+| + the line's own audio | −0.20 | n/a | **+0.30** | 0.30 | **2.76** | 1.96 | −36.3 |
+
+**Dynamics more than doubles**: the conditioned takes carry movement the pinned ones flatten away.
+The overall arousal correlation does not improve, and five lines cannot settle that — the interval on
+a five-point Spearman is wider than the effect, so the honest reading is *the mechanism moves real
+signal; whether it sounds better is unmeasured*. `shape` worsening is expected rather than damning: a
+pinned profile sits at the session average, a conditioned line sits where that line actually was.
+
+Cost on the same scene: **+30–47 ms** of reference preparation per line, **+30–50 ms** to first
+audio — real money on a live budget, and precisely the cost ADR-0009's pinning was invented to hide.
+The appended clip also lifts the bed between lines (−22 → −36 dBFS), which is one more reason
+isolated references are the next item.
+
 ## Next, in order of what a listener would notice
 
-1. **Per-line delivery conditioning** behind `--clone-delivery line` (the reference's biggest
-   acting lever; Mandarin → English keeps it, their finding 20). DoD: the unit's own source audio
-   appended to its speaker's prepared reference, guarded by the same voiceprint check that keeps a
-   reference off another actor; `research/tts_bench.py` reports the added per-unit preparation and
-   first-audio cost; a blinded A/B against the pinned-profile takes.
+1. **A listening test for delivery conditioning, and a corpus long enough to score it.** The flag is
+   built and costs are measured; no ear has judged it and five lines cannot resolve a correlation.
+   DoD: a blinded A/B of pinned vs conditioned takes over a full scene per speaker, scored with
+   `research/dub_delivery.py` on ≥ 20 lines, and a decision on whether it becomes the default.
 2. **Isolated-voice references** (their finding 4). DoD: reference cuts taken from the ADR-0008
    isolation path rather than the mix, with the noise floor between words and a reference-free
    quality estimate measured on the same lines both ways.

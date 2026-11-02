@@ -188,6 +188,48 @@ class Shaper:
 
 # MARK: Backends
 
+# ADR-0015 per-line delivery conditioning. The combined reference is bounded by what the model
+# accepts (the same 15 s `prepare` enforces), and a slice shorter than this carries no delivery
+# worth paying a reference preparation for.
+MAX_REFERENCE_SECONDS = 15.0
+MIN_DELIVERY_SECONDS = 0.3
+
+
+def loudest_window(pcm: array.array, seconds: float) -> array.array:
+    """The loudest contiguous `seconds` of `pcm`, so a long or half-silent line still contributes
+    its delivery and never its silence. One pass of 20 ms block energies, then a sliding sum."""
+    want = int(RATE * seconds)
+    if len(pcm) <= want:
+        return pcm
+    hop = RATE // 50
+    blocks = [sum(v * v for v in pcm[i:min(len(pcm), i + hop)]) / max(1, min(hop, len(pcm) - i))
+              for i in range(0, len(pcm), hop)]
+    span = max(1, min(len(blocks), want // hop))
+    total = sum(blocks[:span])
+    best, best_at = total, 0
+    for i in range(1, len(blocks) - span + 1):
+        total += blocks[i + span - 1] - blocks[i - 1]
+        if total > best:
+            best, best_at = total, i
+    start = best_at * hop
+    return pcm[start:start + want]
+
+
+def voiced_seconds(pcm: array.array) -> float:
+    """How much of a stretch clears 15% of its own voiced level: quiet room tone is not speech."""
+    if not len(pcm):
+        return 0.0
+    level = voiced_rms(pcm)
+    if level is None:            # nothing above -45 dBFS at all: silence, not a quiet voice
+        return 0.0
+    hop = RATE // 50
+    floor = max(0.006, level * 0.15)
+    counted = sum(1 for i in range(0, len(pcm), hop)
+                  if math.sqrt(sum(v * v for v in pcm[i:min(len(pcm), i + hop)])
+                               / max(1, min(hop, len(pcm) - i))) > floor)
+    return counted * hop / RATE
+
+
 class Voice:
     def __init__(self, pcm: array.array, text: str, mode: str, language: str = "english") -> None:
         if language not in ("english", "chinese"):
@@ -453,11 +495,13 @@ class TorchBackend:
 # MARK: Worker
 
 class Worker:
-    def __init__(self, backend, channel: Channel, interval: float, research_text: bool) -> None:
+    def __init__(self, backend, channel: Channel, interval: float, research_text: bool,
+                 max_delivery_seconds: float = 4.0) -> None:
         self.backend = backend
         self.channel = channel
         self.interval = interval
         self.research_text = research_text
+        self.max_delivery_seconds = max_delivery_seconds
         self.voices: dict[str, Voice] = {}
         self.jobs: queue.Queue = queue.Queue()
         self.canceled: set[int] = set()
@@ -498,7 +542,7 @@ class Worker:
             if header["op"] == "prepare":
                 self.prepare(header, payload)
             else:
-                self.synthesize(header)
+                self.synthesize(header, payload)
 
     def prepare(self, header: dict, payload: bytes) -> None:
         key = str(header["voice"])
@@ -526,15 +570,68 @@ class Worker:
         except Exception as error:
             self.channel.send({"ev": "error", "voice": key, "message": self.message(error)})
 
-    def synthesize(self, header: dict) -> None:
+    def conditioned_voice(self, pinned: Voice, payload: bytes, header: dict) -> tuple[Voice | None, str, float]:
+        """A one-unit variant of `pinned` whose reference ends with the actor's own delivery of
+        the line being spoken (ADR-0015).
+
+        The pinned reference stays first, so identity is still the profile the session cast; the
+        line's own audio is appended so a shout is not read as a calm sentence. Level and pace
+        stay the pinned profile's: this changes how the line is said, not how loud the listener
+        hears the speaker or how the next unit's pacing estimate is set. Every refusal is a
+        verdict in the `done` event, never a silent fallback.
+        """
+        clip = array.array("f")
+        clip.frombytes(payload)
+        if not len(clip):
+            return None, "absent", 0.0
+        room = int(RATE * MAX_REFERENCE_SECONDS) - len(pinned.pcm)
+        if room < int(RATE * MIN_DELIVERY_SECONDS):
+            return None, "reference_bound", 0.0
+        # `delivery_s` reports what is appended, because that is what the preparation costs.
+        clip = loudest_window(clip, min(self.max_delivery_seconds, room / RATE))
+        appended = len(clip) / RATE
+        if voiced_seconds(clip) < MIN_DELIVERY_SECONDS:
+            return None, "too_quiet", 0.0
+        text = pinned.text
+        if pinned.mode == "icl":
+            # In-context conditioning pairs audio with its transcript; appending audio whose words
+            # are unknown would teach the model to speak silence.
+            spoken = str(header.get("delivery_text", "")).strip()
+            if not spoken:
+                return None, "needs_source_text", 0.0
+            text = (pinned.text + " " + spoken).strip()
+        variant = Voice(pinned.pcm + clip, text, pinned.mode, pinned.language)
+        variant.target_rms = pinned.target_rms
+        variant.gain = pinned.gain
+        variant.seconds_per_character = pinned.seconds_per_character
+        self.backend.prepare(variant)
+        return variant, "line", appended
+
+    def synthesize(self, header: dict, payload: bytes = b"") -> None:
         job = int(header["id"])
         started = time.perf_counter()
         first = None
         emitted = 0
         try:
-            voice = self.voices.get(str(header["voice"]))
-            if voice is None:
+            pinned = self.voices.get(str(header["voice"]))
+            if pinned is None:
                 raise KeyError("voice not prepared")
+            voice = pinned
+            delivery, delivery_verdict, delivery_seconds = None, "absent", 0.0
+            delivery_prep_s = 0.0
+            if header.get("delivery"):
+                prep_started = time.perf_counter()
+                try:
+                    voice, delivery_verdict, delivery_seconds = self.conditioned_voice(pinned, payload, header)
+                    delivery = voice
+                except Exception:
+                    # A delivery clip that will not condition is worth reporting, never worth
+                    # failing the line over: the pinned profile speaks it instead.
+                    voice, delivery = None, None
+                    delivery_verdict = "failed"
+                delivery_prep_s = time.perf_counter() - prep_started
+                if voice is None:
+                    voice = pinned
             text = str(header["text"]).strip()
             if not text:
                 raise ValueError("empty text")
@@ -620,12 +717,19 @@ class Worker:
                 gain = shaper.unit_gain()
                 if gain:
                     voice.gain = gain if voice.gain is None else 0.5 * voice.gain + 0.5 * gain
+            if delivery is not None:
+                # The conditioned variant is thrown away with the unit; what it learned belongs to
+                # the speaker's pinned profile, so the next line starts from the same estimate.
+                pinned.seconds_per_character = delivery.seconds_per_character
+                pinned.gain = delivery.gain
             self.channel.send({"ev": "done", "id": job, "canceled": canceled, "audio_s": emitted / RATE,
                                "gen_s": time.perf_counter() - started, "first_s": first,
                                "language": voice.language,
                                "pace": speed, "native_s": native_samples / RATE,
                                "budget_s": budget_s, "generated_s": generated_samples / RATE,
                                "truncated": truncated, "retries": retries,
+                               "delivery": delivery_verdict, "delivery_s": round(delivery_seconds, 3),
+                               "delivery_prep_s": round(delivery_prep_s, 4),
                                "quiet_samples_removed": compactor.removed if compactor else 0})
         except Exception as error:
             self.channel.send({"ev": "error", "id": job, "message": self.message(error)})
@@ -647,6 +751,8 @@ def main() -> None:
                         help="mlx on Apple silicon (default); torch for CUDA, MPS, or CPU (ADR-0007)")
     parser.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto",
                         help="torch backend device")
+    parser.add_argument("--max-delivery-seconds", type=float, default=4.0,
+                        help="longest slice of the actor's own line appended to a reference (ADR-0015)")
     args = parser.parse_args()
     if not 0.08 <= args.interval <= 2.0:
         parser.error("--interval must be between 0.08 and 2 seconds")
@@ -678,7 +784,7 @@ def main() -> None:
                   "warmup_s": time.perf_counter() - started - loaded, "rate": RATE,
                   "streaming": backend.streaming, "selected_model": args.model,
                   "backend": "fake" if args.fake else args.backend, "device": getattr(backend, "device", None) or None})
-    Worker(backend, channel, args.interval, args.research_text).run()
+    Worker(backend, channel, args.interval, args.research_text, args.max_delivery_seconds).run()
 
 
 if __name__ == "__main__":

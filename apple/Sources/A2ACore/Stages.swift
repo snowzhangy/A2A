@@ -69,6 +69,30 @@ public protocol VoiceSynthesizer: Sendable {
     /// latency, and slowing it would push every later phrase back.
     func synthesize(unit: UnitID, text: String, voice: PreparedVoice,
                     targetSeconds: Double?, allowFill: Bool) -> AsyncThrowingStream<SynthesizedAudio, Error>
+    /// `delivery` is the actor's own audio of this very line, with the words they said
+    /// (ADR-0015). A reference-conditioned synthesizer may append it to the speaker's pinned
+    /// reference so the take keeps the line's delivery — a shout stays a shout, a murmur stays a
+    /// murmur — instead of the average of everything else that speaker said. nil means speak on
+    /// the pinned profile. A synthesizer with no reference ignores it, which is why the default
+    /// implementation drops it.
+    func synthesize(unit: UnitID, text: String, voice: PreparedVoice, targetSeconds: Double?,
+                    allowFill: Bool, delivery: DeliveryClip?) -> AsyncThrowingStream<SynthesizedAudio, Error>
+}
+
+/// One line's source audio for delivery conditioning (ADR-0015). Kept in memory for the unit:
+/// the actor's voice is participant data, and nothing here is written or traced.
+public struct DeliveryClip: Hashable, Sendable {
+    public let pcm: [Float]
+    public let sampleRate: Int
+    /// What the actor said over this audio. In-context conditioning pairs audio with its
+    /// transcript, so a clip without words cannot be appended to a transcript reference.
+    public let sourceText: String
+
+    public init(pcm: [Float], sampleRate: Int, sourceText: String = "") {
+        self.pcm = pcm
+        self.sampleRate = sampleRate
+        self.sourceText = sourceText
+    }
 }
 
 extension VoiceSynthesizer {
@@ -79,5 +103,12 @@ extension VoiceSynthesizer {
     public func synthesize(unit: UnitID, text: String, voice: PreparedVoice,
                            targetSeconds: Double?, allowFill: Bool) -> AsyncThrowingStream<SynthesizedAudio, Error> {
         synthesize(unit: unit, text: text, voice: voice, targetSeconds: targetSeconds)
+    }
+
+    public func synthesize(unit: UnitID, text: String, voice: PreparedVoice, targetSeconds: Double?,
+                           allowFill: Bool, delivery: DeliveryClip?) -> AsyncThrowingStream<SynthesizedAudio, Error> {
+        // Only a reference-conditioned voice can take a delivery; every other adapter speaks the
+        // text as it does without one.
+        synthesize(unit: unit, text: text, voice: voice, targetSeconds: targetSeconds, allowFill: allowFill)
     }
 }
