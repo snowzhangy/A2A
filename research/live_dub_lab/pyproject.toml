@@ -1,0 +1,9 @@
+[project]
+name = "a2a-context-translation-lab"
+version = "0.1.0"
+description = "Isolated causal contextual-translation experiments"
+requires-python = ">=3.12,<3.14"
+dependencies = ["mlx-lm==0.32.2", "pyyaml>=6.0"]
+
+[tool.uv]
+package = false
