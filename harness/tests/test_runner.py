@@ -9,6 +9,8 @@ import subprocess
 import pytest
 
 from a2a_harness.fixture import load
+from a2a_harness.metrics import normalize
+from a2a_harness.synth import SynthConfig, generate
 
 
 def _deterministic(events):
@@ -46,6 +48,38 @@ def test_fluent_replay_finishes_each_audible_phrase(synthetic_fixture, pipeline_
         elif event["ev"] == "fallback.enter":
             raise AssertionError(f"fixture speech unexpectedly fell back: {event['reason']}")
     assert active is None, "the final audible phrase was truncated"
+
+
+def test_long_utterances_close_at_the_source_time_budget(pipeline_binary, tmp_path):
+    """A recognizer that keeps one utterance open across several sentences must not hold the
+    first English audio behind the whole utterance (M4, commit-policy source-time budget)."""
+    fx = generate(tmp_path / "long", SynthConfig(sentences=6, utterance_sentences=3, fixture_id="long"))
+
+    def replay(budget: float) -> tuple[dict, list[dict]]:
+        out = tmp_path / f"budget-{budget}"
+        result = run(RunConfig(fixture=fx, pipeline=pipeline_binary, out_dir=out, mode="offline",
+                               extra_args=["--fluent", "--max-unit-seconds", str(budget)]))
+        assert result["validation"]["ok"], result["validation"]["errors"]
+        return result, trace.load(out / "trace.jsonl")
+
+    cut, cut_events = replay(3)
+    held, held_events = replay(0)
+    commits = [e for e in cut_events if e["ev"] == "commit.source"]
+    assert any(e["reason"] == "length_clause" for e in commits), "the budget must close long units"
+    assert all(e["reason"] != "length_clause" for e in held_events if e["ev"] == "commit.source")
+    # Estimated spans stay disjoint, so coverage cannot double-count source.
+    spans = sorted((e["span"] for e in commits))
+    assert all(a[1] <= b[0] for a, b in zip(spans, spans[1:])), "committed source spans overlap"
+    assert cut["metrics"]["lag_onset_s"]["p95"] < held["metrics"]["lag_onset_s"]["p95"], \
+        "the budget exists to cut the longest onset lags"
+    assert cut["metrics"]["catch_up_units"] <= held["metrics"]["catch_up_units"]
+    assert cut["metrics"]["translation_coverage"] >= held["metrics"]["translation_coverage"]
+    # Nothing spoken twice and nothing lost, even though the recognizer adds sentence
+    # terminators only in its final result.
+    finals = "".join(h["text"] for h in json.loads((fx.parent / "long.asr.json").read_text())["hypotheses"]
+                     if h["final"])
+    for events in (commits, [e for e in held_events if e["ev"] == "commit.source"]):
+        assert normalize("".join(e["text"] for e in events)) == normalize(finals)
 
 
 def test_english_to_chinese_replay_produces_captions_and_audio(synthetic_fixture, pipeline_binary, tmp_path):

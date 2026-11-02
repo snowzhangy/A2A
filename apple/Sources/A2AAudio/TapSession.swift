@@ -82,7 +82,17 @@ public final class TapSession: @unchecked Sendable {
     public var recordRing: OpaquePointer? { engine.map { a2a_engine_records($0) } }
 
     private func createTap() throws {
-        let description = CATapDescription(stereoMixdownOfProcesses: source.objectIDs)
+        // Two ways to choose what to hear: a global tap takes the machine's whole output mix, so there is
+        // no app to pick and apps started later are heard too; a process tap takes one app's objects.
+        let description: CATapDescription
+        if source.global {
+            // An empty exclusion list would hear our own English and translate it again: refuse instead.
+            let own = Self.ownProcessObjectIDs()
+            guard !own.isEmpty else { throw CoreAudioError(-1, "global tap: this process has no CoreAudio process object to exclude") }
+            description = CATapDescription(stereoGlobalTapButExcludeProcesses: own)
+        } else {
+            description = CATapDescription(stereoMixdownOfProcesses: source.objectIDs)
+        }
         description.uuid = tapUUID
         description.name = options.name
         description.isPrivate = options.privateTap
@@ -91,6 +101,17 @@ public final class TapSession: @unchecked Sendable {
         try check(AudioHardwareCreateProcessTap(description, &id), "AudioHardwareCreateProcessTap")
         tapID = id
         tapFormat = try HAL.scalar(id, kAudioTapPropertyFormat, default: AudioStreamBasicDescription())
+    }
+
+    /// Our own audio processes, looked up at tap time rather than taken from the resolved source, so a
+    /// helper of the app that registered with CoreAudio after resolution is still left out of the mix.
+    /// This process itself is registered by then: `AudioDevice.defaultOutput()` in `init` is a HAL client.
+    static func ownProcessObjectIDs() -> [AudioObjectID] {
+        let here = getpid()
+        let root = SourceResolver.ownAppRoot()
+        return (try? AudioProcessList.current())?.compactMap {
+            SourceResolver.isSelf($0, selfPID: here, selfBundleRoot: root) ? $0.objectID : nil
+        } ?? []
     }
 
     private func createAggregate() throws {
@@ -187,11 +208,6 @@ public final class TapSession: @unchecked Sendable {
     public func setGains(original: Float, translated: Float, rampMs: Int) {
         guard let engine else { return }
         a2a_engine_set_gains(engine, original, translated, UInt32(Double(rampMs) * max(sampleRate, 1) / 1_000))
-    }
-
-    public func setRenderOutput(_ enabled: Bool) {
-        guard let engine else { return }
-        a2a_engine_set_render_output(engine, enabled)
     }
 
     /// Reads interleaved captured frames (engine channels). Returns frames read.

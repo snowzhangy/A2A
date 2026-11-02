@@ -100,6 +100,8 @@ def main() -> None:
         else:
             generator = backend.generate(voice, row["text"], 0.32)
         for chunk in generator:
+            if shaper.gain is None and voice.gain is not None:
+                shaper.gain = voice.gain
             shaped = shaper.process(chunk)
             if shaped:
                 events.append(dict(arrival_s=time.perf_counter() - start, frames=len(shaped)))

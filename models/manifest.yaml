@@ -380,6 +380,264 @@ entries:
     phase: "week 7+"
     files: []
 
+  - id: qwen3-4b-instruct-2507-mlx-4bit
+    stage: mt
+    status: verified
+    enabled: true
+    verified_by: Codex
+    verified_on: '2026-10-27'
+    research_only: true
+    upstream:
+      repo: https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507
+      revision: cdbee75f17c01a7cc42f958dc650907174af0554
+      license: Apache-2.0
+      license_evidence: https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/blob/cdbee75f17c01a7cc42f958dc650907174af0554/README.md
+    converted:
+      repo: https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit
+      revision: 50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b
+      license: Apache-2.0
+      license_evidence: https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit/blob/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/README.md
+      note: Conversion card names upstream but does not identify its revision; numerical
+        parity unqualified.
+    runtime: mlx-lm 0.32.2; research lab only, explicit local directory; no runtime
+      downloads
+    backend: GPU (MLX)
+    open_question: Causal translation accuracy on actual ASR and contention with live
+      TTS
+    files:
+    - path: README.md
+      url: https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit/resolve/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/README.md
+      size: 969
+      sha256: 7b17ce562d7ea121c86d2ffdf660eed3726ac5b52cacfa9f1de11a65969f5657
+    - path: added_tokens.json
+      url: https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit/resolve/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/added_tokens.json
+      size: 707
+      sha256: c0284b582e14987fbd3d5a2cb2bd139084371ed9acbae488829a1c900833c680
+    - path: chat_template.jinja
+      url: https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit/resolve/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/chat_template.jinja
+      size: 4040
+      sha256: 40c21f34cf67d8c760ef72f8ad3ae5afad514299d4b06e91dd9a8d705af7b541
+    - path: config.json
+      url: https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit/resolve/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/config.json
+      size: 938
+      sha256: 574349e5a343236546fda55e4744a76e181f534182d7dc60ff1bad7e7a502849
+    - path: generation_config.json
+      url: https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit/resolve/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/generation_config.json
+      size: 238
+      sha256: 835fffe355c9438e7a25be099b3fccaa98350b83451f9fd2d99512e74f1ade48
+    - path: merges.txt
+      url: https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit/resolve/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/merges.txt
+      size: 1671853
+      sha256: 8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5
+    - path: model.safetensors
+      url: https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit/resolve/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/model.safetensors
+      size: 2263022417
+      sha256: 2a73c6c248601ab904e035548abd8e6abb65ea27dcb5f342fb0a8910eb44173f
+    - path: model.safetensors.index.json
+      url: https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit/resolve/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/model.safetensors.index.json
+      size: 63964
+      sha256: 388d811b8b7c2608dd04cce1bcb04a8bf715d19b42790894e6d3427ff429a777
+    - path: special_tokens_map.json
+      url: https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit/resolve/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/special_tokens_map.json
+      size: 613
+      sha256: 76862e765266b85aa9459767e33cbaf13970f327a0e88d1c65846c2ddd3a1ecd
+    - path: tokenizer.json
+      url: https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit/resolve/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/tokenizer.json
+      size: 11422654
+      sha256: aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4
+    - path: tokenizer_config.json
+      url: https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit/resolve/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/tokenizer_config.json
+      size: 5440
+      sha256: 4397cc477eb6d79715ccd2000accd6b3531928f30029665832fa1b255f24d2b9
+    - path: vocab.json
+      url: https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit/resolve/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b/vocab.json
+      size: 2776833
+      sha256: ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910
+
+  - id: qwen3-30b-a3b-instruct-2507-mlx-4bit
+    stage: mt
+    status: verified
+    enabled: true
+    verified_by: Codex
+    verified_on: '2026-10-27'
+    research_only: true
+    upstream:
+      repo: https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507
+      revision: 0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe
+      license: Apache-2.0
+      license_evidence: https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507/blob/0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe/README.md
+    converted:
+      repo: https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit
+      revision: e9675aa3ca5f900ccef55267914466d55ab325fa
+      license: Apache-2.0
+      license_evidence: https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit/blob/e9675aa3ca5f900ccef55267914466d55ab325fa/README.md
+      note: Conversion card names upstream but does not identify its revision; numerical
+        parity unqualified.
+    runtime: mlx-lm 0.32.2; research lab only, explicit local directory; no runtime
+      downloads
+    backend: GPU (MLX)
+    open_question: Causal translation accuracy on actual ASR and contention with live
+      TTS
+    files:
+    - path: README.md
+      url: https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit/resolve/e9675aa3ca5f900ccef55267914466d55ab325fa/README.md
+      size: 1009
+      sha256: 807bed75bf79c5da3e91010127c67338f1fccc35865115fed282635af6d88aab
+    - path: added_tokens.json
+      url: https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit/resolve/e9675aa3ca5f900ccef55267914466d55ab325fa/added_tokens.json
+      size: 707
+      sha256: c0284b582e14987fbd3d5a2cb2bd139084371ed9acbae488829a1c900833c680
+    - path: chat_template.jinja
+      url: https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit/resolve/e9675aa3ca5f900ccef55267914466d55ab325fa/chat_template.jinja
+      size: 4040
+      sha256: 40c21f34cf67d8c760ef72f8ad3ae5afad514299d4b06e91dd9a8d705af7b541
+    - path: config.json
+      url: https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit/resolve/e9675aa3ca5f900ccef55267914466d55ab325fa/config.json
+      size: 10866
+      sha256: e1caf81b25b71686af871f1147290a81cbcb81283b638f98957293990e031417
+    - path: generation_config.json
+      url: https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit/resolve/e9675aa3ca5f900ccef55267914466d55ab325fa/generation_config.json
+      size: 239
+      sha256: 19d306dd769db12a9d710b44cf7f83b635efbe5166b84fb4358a08fb7d88bb53
+    - path: merges.txt
+      url: https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit/resolve/e9675aa3ca5f900ccef55267914466d55ab325fa/merges.txt
+      size: 1671853
+      sha256: 8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5
+    - path: model-00001-of-00004.safetensors
+      url: https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit/resolve/e9675aa3ca5f900ccef55267914466d55ab325fa/model-00001-of-00004.safetensors
+      size: 5321473414
+      sha256: 70919a0f0b7d86c3100e30dfc2c72eb29909b841f9414b9c5ae3e8673ec9ff8c
+    - path: model-00002-of-00004.safetensors
+      url: https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit/resolve/e9675aa3ca5f900ccef55267914466d55ab325fa/model-00002-of-00004.safetensors
+      size: 5366644780
+      sha256: 1a0387973b19b0bac1201358d1f56989deaf595da34f307ec29777fa6f8469b8
+    - path: model-00003-of-00004.safetensors
+      url: https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit/resolve/e9675aa3ca5f900ccef55267914466d55ab325fa/model-00003-of-00004.safetensors
+      size: 5276887419
+      sha256: d1a627729b2791dba7db5cda5dd0d24ea4c44c5131981c258598d5d0c80e0df3
+    - path: model-00004-of-00004.safetensors
+      url: https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit/resolve/e9675aa3ca5f900ccef55267914466d55ab325fa/model-00004-of-00004.safetensors
+      size: 1216066381
+      sha256: b02f0e9f626bd2f5bb41e057216c9d6f594ddeac91cc3f2161cc935d050a12c6
+    - path: model.safetensors.index.json
+      url: https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit/resolve/e9675aa3ca5f900ccef55267914466d55ab325fa/model.safetensors.index.json
+      size: 119598
+      sha256: c100efb419233c6be585014ebd9f5a8c2a4fe9de63be6271172f0f70f1c315ea
+    - path: special_tokens_map.json
+      url: https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit/resolve/e9675aa3ca5f900ccef55267914466d55ab325fa/special_tokens_map.json
+      size: 613
+      sha256: 76862e765266b85aa9459767e33cbaf13970f327a0e88d1c65846c2ddd3a1ecd
+    - path: tokenizer.json
+      url: https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit/resolve/e9675aa3ca5f900ccef55267914466d55ab325fa/tokenizer.json
+      size: 11422654
+      sha256: aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4
+    - path: tokenizer_config.json
+      url: https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit/resolve/e9675aa3ca5f900ccef55267914466d55ab325fa/tokenizer_config.json
+      size: 5404
+      sha256: 355f2b4e5bad7b01f11ef6cb68ebc176f61b95c3276092ea225b1bea0e01e95c
+    - path: vocab.json
+      url: https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit/resolve/e9675aa3ca5f900ccef55267914466d55ab325fa/vocab.json
+      size: 2776833
+      sha256: ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910
+
+  - id: audio8-tts-realistic-0.6b-mlx-4bit
+    experimental_key: audio8
+    worker_streaming: false
+    dependencies: []
+    stage: tts
+    status: verified
+    enabled: true
+    verified_by: Codex
+    verified_on: '2026-10-30'
+    research_only: true
+    upstream:
+      repo: https://huggingface.co/Edge0/Audio8-TTS-Realistic-0.6b
+      revision: 1e857568bfd4f02931aca3988ee773a44d2d26d3
+      license: Apache-2.0
+      license_evidence: https://huggingface.co/Edge0/Audio8-TTS-Realistic-0.6b/blob/1e857568bfd4f02931aca3988ee773a44d2d26d3/LICENSE
+    converted:
+      repo: https://huggingface.co/nativ-community/Audio8-TTS-Realistic-0.6b-4bit
+      revision: d358839bd4e57c99b0da94659ec6f55ee68d8805
+      license: Apache-2.0
+      license_evidence: https://huggingface.co/nativ-community/Audio8-TTS-Realistic-0.6b-4bit/blob/d358839bd4e57c99b0da94659ec6f55ee68d8805/LICENSE
+      note: Conversion config identifies the pinned upstream revision; local parity
+        and voice identity remain unqualified.
+    runtime: mlx-audio 0.6.1; explicit local artifacts only
+    native_format:
+      sample_rate: 44100
+      channels: 1
+    streaming:
+      audio_output: false
+      incremental_text: false
+    backend: GPU (MLX)
+    open_question: Cross-lingual identity, compatible model runtime and live latency
+      require measurement
+    files:
+    - path: LICENSE
+      url: https://huggingface.co/nativ-community/Audio8-TTS-Realistic-0.6b-4bit/resolve/d358839bd4e57c99b0da94659ec6f55ee68d8805/LICENSE
+      size: 11357
+      sha256: c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4
+    - path: NOTICE
+      url: https://huggingface.co/nativ-community/Audio8-TTS-Realistic-0.6b-4bit/resolve/d358839bd4e57c99b0da94659ec6f55ee68d8805/NOTICE
+      size: 95
+      sha256: 819129644b28fb066221d782dd27a6fe1d35f33f46718d4e61570614fb38854e
+    - path: README.md
+      url: https://huggingface.co/nativ-community/Audio8-TTS-Realistic-0.6b-4bit/resolve/d358839bd4e57c99b0da94659ec6f55ee68d8805/README.md
+      size: 1383
+      sha256: de7c174399c15e1a25503d7df0ee0edd3092fae0e38695d452b665942142ad60
+    - path: config.json
+      url: https://huggingface.co/nativ-community/Audio8-TTS-Realistic-0.6b-4bit/resolve/d358839bd4e57c99b0da94659ec6f55ee68d8805/config.json
+      size: 1914
+      sha256: c544bf472db66327389dfdb4af7a01ac3e4769dc7bbe90f0fc8b88ac96eaf67b
+    - path: model.safetensors
+      url: https://huggingface.co/nativ-community/Audio8-TTS-Realistic-0.6b-4bit/resolve/d358839bd4e57c99b0da94659ec6f55ee68d8805/model.safetensors
+      size: 1687967684
+      sha256: aa6ecf6ac32699fddb0cdc40cd817be6b856558a56fb3465a2d42797c48638de
+    - path: model.safetensors.index.json
+      url: https://huggingface.co/nativ-community/Audio8-TTS-Realistic-0.6b-4bit/resolve/d358839bd4e57c99b0da94659ec6f55ee68d8805/model.safetensors.index.json
+      size: 73892
+      sha256: 038931a38ce81d01da0077a9383ced9cc1a86e197c6691110f31fa33be66752e
+    - path: special_tokens_map.json
+      url: https://huggingface.co/nativ-community/Audio8-TTS-Realistic-0.6b-4bit/resolve/d358839bd4e57c99b0da94659ec6f55ee68d8805/special_tokens_map.json
+      size: 101864
+      sha256: c2ff18fde6e43b7408435bc8ed079af74531befba549358a97cbc59ce606bc6b
+    - path: tokenizer.json
+      url: https://huggingface.co/nativ-community/Audio8-TTS-Realistic-0.6b-4bit/resolve/d358839bd4e57c99b0da94659ec6f55ee68d8805/tokenizer.json
+      size: 12217872
+      sha256: f24e08099d45a8adf3f52f5f0b03276e433bb9d689bb15fcbcc48ce58744588b
+    - path: tokenizer_config.json
+      url: https://huggingface.co/nativ-community/Audio8-TTS-Realistic-0.6b-4bit/resolve/d358839bd4e57c99b0da94659ec6f55ee68d8805/tokenizer_config.json
+      size: 860832
+      sha256: b8d149343ae425b0da67e6708686aceb51be7815d9792f265fc12ff04d5e9856
+
+  - id: hy-simulmt-30b-a3b-q4km-gguf
+    stage: speech_translation
+    status: verified
+    enabled: true
+    verified_by: "Claude"
+    verified_on: "2026-11-01"
+    research_only: true
+    upstream:
+      repo: "https://huggingface.co/tencent/Hy-SimulMT-30B-A3B-GGUF"
+      revision: "8d4e9381419ac17d17e29359a297109afce02066"
+      license: Apache-2.0
+      license_evidence: "https://huggingface.co/tencent/Hy-SimulMT-30B-A3B-GGUF/blob/8d4e9381419ac17d17e29359a297109afce02066/LICENSE.txt (20189 bytes, sha256 b426b0a4d3709b20313bed1bb6eca9842ca1ad7bcfa347b0c97b8e053bd77849, identical to github.com/Tencent-Hunyuan/Hy-SimulMT LICENSE-Hy-SimulMT.txt: Apache-2.0; third-party component Qwen3-ASR-0.6B, Apache-2.0). Revision and LFS sha256 from the HF API, checked by Claude."
+    converted: {repo: null, revision: null, license: null, license_evidence: null}
+    runtime: "llama.cpp fork lihy715/llama.cpp.Hyv3Speech @ e41ca4212f786815faa37606ee2e6fcf8611f9e4 (PR ggml-org/llama.cpp#31198, unmerged), built locally by scripts/build_hy_local.sh; run in-process by the native worker research/hy_worker/hy_worker.cpp (A2AModels.HyLocalTranslator)"
+    native_format: {sample_rate: 16000, channels: 1}
+    streaming: {audio_input: "turn by turn: 1600 ms then 800 ms per turn", incremental_text: true}
+    backend: "GPU (Metal), single-file GGUF with its own audio tower"
+    open_question: "Live latency next to the two Qwen3-TTS workers on a 36 GB Mac; output length has no control"
+    files:
+      - path: "Hy-SimulMT-30B-A3B-Q4_K_M.gguf"
+        url: "https://huggingface.co/tencent/Hy-SimulMT-30B-A3B-GGUF/resolve/8d4e9381419ac17d17e29359a297109afce02066/Hy-SimulMT-30B-A3B-Q4_K_M.gguf"
+        sha256: "350344d24911ab93fdaee8f9b78e6c06041bff942dc7bc578d8c78d185e4f281"
+        size: 19746809728
+      - path: "LICENSE.txt"
+        url: "https://huggingface.co/tencent/Hy-SimulMT-30B-A3B-GGUF/resolve/8d4e9381419ac17d17e29359a297109afce02066/LICENSE.txt"
+        sha256: "b426b0a4d3709b20313bed1bb6eca9842ca1ad7bcfa347b0c97b8e053bd77849"
+        size: 20189
+
 # System frameworks: no bundled weights. Language assets are installed by the OS setup path and
 # tracked here separately from bundled models. Observations come from a2a-preflight.
 system:

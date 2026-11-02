@@ -62,7 +62,7 @@ public enum CommitLexicon {
     /// Function words that leave a phrase incomplete when they end a clause.
     public static let dangling = ["的", "和", "跟", "与", "或", "或者", "还是", "但", "但是", "而", "而且", "因为",
                                   "所以", "如果", "虽然", "在", "把", "被", "对", "给", "从", "向", "比", "让",
-                                  "是", "就是", "第", "the", "a", "an", "and", "or", "to", "of"]
+                                  "是", "就是", "第", "只", "the", "a", "an", "and", "or", "to", "of"]
     /// Conjunctions that start a new clause; splitting before them is boundary evidence only.
     public static let clauseConjunctions = ["但是", "所以", "然后", "而且", "因为", "如果", "可是", "不过", "并且"]
     /// A clause ending in one of these may still be inside a number or date ("三月二十" → "二十五号").

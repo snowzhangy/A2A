@@ -238,6 +238,8 @@ def render_report(r: dict) -> str:
         f"| `lag_onset` char-weighted median (s) | {_fmt(m['lag_onset_s']['char_weighted_median'])} |",
         f"| `lag_live` median (s), diagnostic | {_fmt(m['lag_live_s']['median'])} |",
         f"| `lag_end` median (s), diagnostic | {_fmt(m['lag_end_s']['median'])} |",
+        f"| Turn end gap (s): dead air / overrun, median of {m['turn_timing_n']} | "
+        f"{_fmt(m['turn_dead_air_s']['median'])} / {_fmt(m['turn_overrun_s']['median'])} |",
         f"| Unit length median / p95 (chars) | {_fmt(m['unit_chars']['median'])} / {_fmt(m['unit_chars']['p95'])} |",
         f"| Translation coverage (warm interval) | {_fmt(m['translation_coverage'])} |",
         f"| Fallbacks | {m['fallbacks']} {m['fallback_reasons']} |",

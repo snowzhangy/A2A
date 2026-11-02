@@ -112,15 +112,18 @@ public struct TranslationRequest: Hashable, Sendable {
     public let context: [CommittedPair]
     public let glossary: [String: String]
     public let uncommittedSource: String
+    /// Audio corresponding to this committed source unit, in canonical sample time.
+    public let sourceSpan: SourceSpan?
     /// Prefix within this unit; empty for v0 closed-unit mode.
     public let committedTargetPrefix: String
 
     public init(unitID: UnitID, context: [CommittedPair], glossary: [String: String],
-                uncommittedSource: String, committedTargetPrefix: String = "") {
+                uncommittedSource: String, committedTargetPrefix: String = "", sourceSpan: SourceSpan? = nil) {
         self.unitID = unitID
         self.context = context
         self.glossary = glossary
         self.uncommittedSource = uncommittedSource
+        self.sourceSpan = sourceSpan
         self.committedTargetPrefix = committedTargetPrefix
     }
 }
@@ -130,11 +133,30 @@ public struct TranslationCandidate: Hashable, Sendable {
     public let text: String
     /// True when the adapter reports the generation completed rather than hitting a cap.
     public let complete: Bool
+    /// Timing a resident translation worker reported for this answer; nil for other adapters.
+    public let workerStats: TranslationWorkerStats?
 
-    public init(unitID: UnitID, text: String, complete: Bool = true) {
+    public init(unitID: UnitID, text: String, complete: Bool = true, workerStats: TranslationWorkerStats? = nil) {
         self.unitID = unitID
         self.text = text
         self.complete = complete
+        self.workerStats = workerStats
+    }
+}
+
+/// What a streaming speech translator spent on one span, numbers only (`mt.result` `worker_*`).
+public struct TranslationWorkerStats: Hashable, Sendable {
+    /// Worker time after the span closed: what the answer still cost once its audio was complete.
+    public let afterCloseMs: Int
+    /// Conversation turns the span was fed as.
+    public let turns: Int
+    /// Unanswered speech went through whole-segment translation at the close.
+    public let sentenceFallback: Bool
+
+    public init(afterCloseMs: Int, turns: Int, sentenceFallback: Bool) {
+        self.afterCloseMs = afterCloseMs
+        self.turns = turns
+        self.sentenceFallback = sentenceFallback
     }
 }
 
@@ -191,18 +213,6 @@ public struct PreparedVoice: Sendable {
     }
 }
 
-public struct TextChunk: Hashable, Sendable {
-    public let unitID: UnitID
-    public let text: String
-    public let isLast: Bool
-
-    public init(unitID: UnitID, text: String, isLast: Bool) {
-        self.unitID = unitID
-        self.text = text
-        self.isLast = isLast
-    }
-}
-
 public struct PCMFormat: Hashable, Sendable {
     public let sampleRate: Int
     public let channelCount: Int
@@ -238,16 +248,3 @@ public struct PCMChunkHeader: Hashable, Sendable {
     }
 }
 
-public struct PCMChunk: Sendable {
-    public let header: PCMChunkHeader
-    public let samples: [Float]
-
-    public init(header: PCMChunkHeader, samples: [Float]) {
-        self.header = header
-        self.samples = samples
-    }
-
-    public var durationSeconds: Double {
-        Double(samples.count) / Double(header.format.channelCount * header.format.sampleRate)
-    }
-}

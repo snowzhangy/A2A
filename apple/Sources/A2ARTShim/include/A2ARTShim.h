@@ -100,6 +100,11 @@ void a2a_engine_destroy(a2a_engine *_Nullable engine);
 a2a_ring *a2a_engine_capture_ring(a2a_engine *engine);
 /// Mono: the mixer feeds the same translated sample to every output channel.
 a2a_ring *a2a_engine_translated_ring(a2a_engine *engine);
+/// Before callbacks start only. Allocates a bounded, prefaulted mono background bus.
+bool a2a_engine_enable_background(a2a_engine *engine, uint32_t capacity_frames);
+a2a_ring *_Nullable a2a_engine_background_ring(a2a_engine *engine);
+/// Control thread. Independent linear background-gain ramp; original audio stays separate.
+void a2a_engine_set_background_gain(a2a_engine *engine, float gain, uint32_t ramp_frames);
 /// Post-gain render PCM at the device rate, or NULL without `rendered_ring_frames`.
 /// One non-RT consumer; engine owns the ring.
 a2a_ring *_Nullable a2a_engine_rendered_ring(a2a_engine *engine);
@@ -124,6 +129,7 @@ void a2a_engine_flush_translated(a2a_engine *engine);
 /// Current gains as seen by the render thread (for tests and telemetry).
 float a2a_engine_current_original_gain(const a2a_engine *engine);
 float a2a_engine_current_translated_gain(const a2a_engine *engine);
+float a2a_engine_current_background_gain(const a2a_engine *engine);
 uint64_t a2a_engine_callbacks(const a2a_engine *engine);
 uint64_t a2a_engine_captured_frames(const a2a_engine *engine);
 uint64_t a2a_engine_output_frames(const a2a_engine *engine);

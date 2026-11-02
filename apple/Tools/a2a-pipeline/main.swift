@@ -4,17 +4,22 @@
 // Output is rendered through the same A2ARTShim mixer the live host uses.
 //
 //   --input clip.wav | --stdin [--rate 48000]       source audio (mono; stdin is f32le)
-//   --tap-bundle ID | --tap-pid N [--seconds S]      live: tap an app (muted while tapped) and
-//                                                    play the translation on the default output
+//   --tap-global | --tap-bundle ID | --tap-pid N [--seconds S]
+//                                                    live: tap the whole output mix (global) or one app
+//                                                    (muted while tapped) and play the translation on the
+//                                                    default output
 //   --source-out src.wav --translated-out tr.wav     what the pipeline heard / translated audio
 //                                                    the mixer consumed (flushed audio excluded)
 //   --max-debt-seconds D --max-source-lag-seconds L  health thresholds (default 3 / 4)
 //   --max-unit-keys N                                commit-policy forced-split length (experiment
 //                                                    parameter recorded in the summary; default 60)
+//   --max-unit-seconds S                             source seconds a unit may accumulate before it
+//                                                    closes at its last safe clause boundary
+//                                                    (0 waits for finalization; default 4)
 //   --clock virtual|host                             virtual: time from samples (fixtures only)
 //   --pace realtime|asap                             file input pacing (host clock)
-//   --asr scripted|apple [--asr-script x.json]
-//   --mt dictionary|apple [--mt-dictionary x.json]
+//   --asr scripted|audio [--asr-script x.json]
+//   --mt dictionary|hy [--mt-dictionary x.json]
 //   --tts tone|system|clone
 //   --profile-ready-ms N                             0 = prepared profile at arm (tone/system only)
 //   --clone-mode icl|xvector                         clone conditioning (default icl)
@@ -29,7 +34,10 @@
 //   --playback original|translated --control-stdin   live selection; stdin commands are mode names, one per line
 //   --fluent                                         app playout: streaming clauses, speech paced to the source,
 //                                                    phrases never cut; soft pressure skips unheard units
-//   --glossary terms.json                            {"source term": "target term"}: replaced before Apple translation
+//   --presentation-delay-ms D                        with --fluent: the host shows the picture D ms late; each
+//                                                    phrase starts at its source start + D, the original bus and
+//                                                    --background bed are delayed by D, lag limits count from the slot
+//   --glossary terms.json                            {"source term": "target term"}: replaced before contextual translation
 //   --pronounce words.json                           {"word": "respelling"}: spoken form only; captions unchanged
 //   --speakers single|auto                           auto: track speakers so each gets their own voice (system:
 //                                                    an installed voice cast by pitch; clone: a reference cut
@@ -45,6 +53,14 @@ import CoreAudio
 import Darwin
 import Foundation
 
+/// Direct audio translation does not instantiate a speech recognizer.
+final class AudioOnlyRecognizer: StreamingRecognizer {
+    func accept(_ frame: AudioFrame16k) {}
+    func requestFinalize() {}
+    func drainHypotheses() -> [ASRHypothesis] { [] }
+    func reset() {}
+}
+
 // MARK: Arguments
 
 struct Options {
@@ -57,6 +73,11 @@ struct Options {
     var asrScript: String?
     var mt = "dictionary"
     var mtDictionary: String?
+    var hyServer = "http://10.0.1.29:8082"
+    var hyWorker: String?
+    var hyModel: String?
+    var qwenCloud = false
+    var cloudRegion = "ap-southeast-1"
     var tts = "tone"
     var direction = TranslationDirection.chineseToEnglish
     var profileReadyMs = 0
@@ -67,7 +88,9 @@ struct Options {
     var voiceRefText: String?
     var clonePython: String?
     var cloneWorker: String?
+    var referenceTranscriber: String?
     var cloneFake = false
+    var dualClone = false
     var trace = "trace.jsonl"
     var out: String?
     var stems: String?
@@ -77,6 +100,7 @@ struct Options {
     var vadThresholdDB: Float = -40
     var tapBundle: String?
     var tapPid: Int32?
+    var tapGlobal = false
     var seconds: Double?
     var sourceOut: String?
     var translatedOut: String?
@@ -84,18 +108,44 @@ struct Options {
     var maxDebtSeconds: Double?
     var maxSourceLagSeconds: Double?
     var maxUnitKeys: Int?
+    var maxUnitSeconds: Double?
+    var speakerCarry: Double?
+    var speakerCarryPause: Double?
+    var speakerCarryPiece: Double?
+    var shorten = true
+    /// --mt hy-local with --asr audio: stream each span to the worker while it is spoken.
+    var hyStream = true
+    var fillerSilence = true
+    var wordCuts = true
     var captionsOnly = false
     var translationOnly = false
     var eventsStdout = false
     var playbackMode = PlaybackMode.translated
     var controlStdin = false
     var fluent = false
+    var adaptivePrebuffer = false
+    var qualityFirst = false
+    var background = false
+    /// Picture delay D (ADR-0012): the host shows the source picture this late; 0 = live.
+    var presentationDelayMs = 0
+    /// Turn fill (ADR-0013): a take shorter than its speech is slowed to end with the actor.
+    /// Only ever applies with a picture delay; `--no-turn-fill` turns it off for an A/B listen.
+    var turnFill = true
+    /// Test only (virtual clock): no capture for `seconds` once the source reaches `at`, as when
+    /// a paused video leaves the global tap without callbacks.
+    var captureGap: (at: Double, seconds: Double)?
+    var backgroundOut: String?
+    var contextPython: String?
+    var contextWorker: String?
+    var contextSeries: String?
     var speakers = "single"
     var glossary: String?
     var pronounce: String?
     var parentPID: Int32?
 
-    var isTap: Bool { tapBundle != nil || tapPid != nil }
+    var isTap: Bool { tapBundle != nil || tapPid != nil || tapGlobal }
+    /// Hy-SimulMT translates source audio directly: on a server (`hy`) or on this Mac (`hy-local`).
+    var translatesAudio: Bool { mt == "hy" || mt == "hy-local" }
 
     static func parse(_ args: [String]) -> Options {
         var o = Options()
@@ -131,7 +181,21 @@ struct Options {
             case "--asr": o.asr = value()
             case "--asr-script": o.asrScript = value()
             case "--mt": o.mt = value()
+            case "--hy-server": o.hyServer = value()
+            case "--hy-worker": o.hyWorker = value()
+            case "--hy-model": o.hyModel = value()
+            case "--qwen-cloud": o.qwenCloud = true
+            case "--cloud-region": o.cloudRegion = value()
+            case "--context-python": o.contextPython = value()
+            case "--context-worker": o.contextWorker = value()
+            case "--context-series": o.contextSeries = value()
             case "--mt-dictionary": o.mtDictionary = value()
+            case "--speaker-carry": o.speakerCarry = decimal()
+            case "--speaker-carry-pause": o.speakerCarryPause = decimal()
+            case "--speaker-carry-piece": o.speakerCarryPiece = decimal()
+            case "--no-shorten": o.shorten = false
+            case "--no-hy-stream": o.hyStream = false
+            case "--no-filler-silence": o.fillerSilence = false
             case "--tts": o.tts = value()
             case "--direction":
                 guard let direction = TranslationDirection(rawValue: value()) else { fail("--direction is zh-en or en-zh") }
@@ -141,7 +205,7 @@ struct Options {
                 guard let mode = CloneConditioning(rawValue: value()) else { fail("--clone-mode is icl or xvector") }
                 o.cloneMode = mode
             case "--clone-model":
-                guard let model = ExperimentalVoiceModel(rawValue: value()) else { fail("--clone-model is qwen, omnivoice, or chatterbox") }
+                guard let model = ExperimentalVoiceModel(rawValue: value()) else { fail("--clone-model is qwen, audio8, omnivoice, or chatterbox") }
                 o.cloneModel = model
             case "--voice-memory": o.voiceMemory = value()
             case "--glossary": o.glossary = value()
@@ -150,7 +214,9 @@ struct Options {
             case "--voice-ref-text": o.voiceRefText = value()
             case "--clone-python": o.clonePython = value()
             case "--clone-worker": o.cloneWorker = value()
+            case "--reference-transcriber": o.referenceTranscriber = value()
             case "--clone-fake": o.cloneFake = true
+            case "--dual-clone": o.dualClone = true
             case "--trace": o.trace = value()
             case "--out": o.out = value()
             case "--stems": o.stems = value()
@@ -158,6 +224,7 @@ struct Options {
             case "--research-text": o.researchText = true
             case "--tail-seconds": o.tailSeconds = decimal()
             case "--vad-threshold-db": o.vadThresholdDB = Float(decimal())
+            case "--tap-global": o.tapGlobal = true
             case "--tap-bundle": o.tapBundle = value()
             case "--tap-pid": o.tapPid = pid()
             case "--seconds": o.seconds = decimal()
@@ -167,6 +234,8 @@ struct Options {
             case "--max-debt-seconds": o.maxDebtSeconds = decimal()
             case "--max-source-lag-seconds": o.maxSourceLagSeconds = decimal()
             case "--max-unit-keys": o.maxUnitKeys = integer()
+            case "--max-unit-seconds": o.maxUnitSeconds = decimal()
+            case "--no-word-cuts": o.wordCuts = false
             case "--captions-only": o.captionsOnly = true
             case "--translation-only": o.translationOnly = true
             case "--events-stdout": o.eventsStdout = true
@@ -175,6 +244,18 @@ struct Options {
                 o.playbackMode = mode
             case "--control-stdin": o.controlStdin = true
             case "--fluent": o.fluent = true
+            case "--adaptive-prebuffer": o.adaptivePrebuffer = true
+            case "--quality-first": o.qualityFirst = true
+            case "--background": o.background = true
+            case "--simulate-capture-gap":
+                let parts = value().split(separator: ":").compactMap { Double($0) }
+                guard parts.count == 2, parts[0] >= 0, parts[1] > 0, parts[1] <= 600 else { fail("--simulate-capture-gap takes AT:SECONDS") }
+                o.captureGap = (parts[0], parts[1])
+            case "--presentation-delay-ms":
+                guard let ms = Int(value()), (0...30_000).contains(ms) else { fail("--presentation-delay-ms takes 0–30000") }
+                o.presentationDelayMs = ms
+            case "--no-turn-fill": o.turnFill = false
+            case "--background-out": o.backgroundOut = value()
             case "--speakers": o.speakers = value()
             case "--parent-pid": o.parentPID = pid()
             case "-h", "--help":
@@ -184,6 +265,14 @@ struct Options {
             }
             i += 1
         }
+        if o.qualityFirst { o.fluent = true }
+        if o.qwenCloud && (!o.isTap || !o.controlStdin || !o.translationOnly || !["ap-southeast-1", "cn-beijing"].contains(o.cloudRegion)) {
+            fail("Qwen Cloud requires a live tap, --control-stdin, --translation-only, and a supported region")
+        }
+        if o.backgroundOut != nil && !o.background { fail("--background-out requires --background") }
+        if o.captureGap != nil && (o.input == nil || o.clock != "virtual") { fail("--simulate-capture-gap needs --input and --clock virtual") }
+        // Slot playout holds PCM until its slot, which only fluent playout does.
+        if o.presentationDelayMs > 0 && !o.fluent { fail("--presentation-delay-ms requires --fluent") }
         if o.stdin || o.isTap {
             if !clockSet { o.clock = "host" }
             if !paceSet { o.pace = "realtime" }
@@ -193,7 +282,7 @@ struct Options {
         }
         if o.isTap, o.clock != "host" { fail("--tap needs --clock host") }
         guard ["virtual", "host"].contains(o.clock), ["realtime", "asap"].contains(o.pace),
-              ["scripted", "apple"].contains(o.asr), ["dictionary", "apple"].contains(o.mt),
+              ["scripted", "audio"].contains(o.asr), ["dictionary", "context", "hy", "hy-local"].contains(o.mt),
               ["tone", "system", "clone"].contains(o.tts) else { fail("invalid adapter, clock, or pace") }
         guard ["single", "auto"].contains(o.speakers) else { fail("--speakers is single or auto") }
         if o.speakers == "auto", o.voiceRef != nil { fail("--voice-ref fixes one voice; --speakers auto learns one per speaker") }
@@ -202,19 +291,31 @@ struct Options {
               o.seconds.map({ $0.isFinite && $0 > 0 && $0 <= 86_400 }) ?? true,
               o.maxDebtSeconds.map({ $0.isFinite && $0 > 0 && $0 <= 60 }) ?? true,
               o.maxSourceLagSeconds.map({ $0.isFinite && $0 > 0 && $0 <= 120 }) ?? true,
-              o.maxUnitKeys.map({ (4...200).contains($0) }) ?? true
+              o.maxUnitKeys.map({ (4...200).contains($0) }) ?? true,
+              o.maxUnitSeconds.map({ $0.isFinite && $0 >= 0 && $0 <= 60 }) ?? true,
+              o.speakerCarry.map({ $0.isFinite && $0 >= 0 && $0 <= 60 }) ?? true,
+              o.speakerCarryPause.map({ $0.isFinite && $0 >= 0 && $0 <= 60 }) ?? true,
+              o.speakerCarryPiece.map({ $0.isFinite && $0 > 0 && $0 <= 30 }) ?? true
         else { fail("invalid duration, threshold, or profile delay") }
-        if o.tapBundle != nil, o.tapPid != nil { fail("choose --tap-bundle or --tap-pid") }
+        if [o.tapBundle != nil, o.tapPid != nil, o.tapGlobal].filter({ $0 }).count > 1 {
+            fail("choose one of --tap-global, --tap-bundle or --tap-pid")
+        }
         if o.captionsOnly, o.translationOnly { fail("--captions-only and --translation-only are mutually exclusive") }
         if o.controlStdin, o.stdin { fail("--control-stdin cannot share stdin with audio") }
         if o.captionsOnly, o.controlStdin || o.playbackMode == .original {
             fail("playback selection requires the audio mixer, not --captions-only")
         }
-        if o.tts != "clone", o.voiceRef != nil || o.voiceRefText != nil || o.clonePython != nil || o.cloneWorker != nil || o.cloneFake || o.cloneModel != .qwen || o.voiceMemory != nil {
+        if o.tts != "clone", o.voiceRef != nil || o.voiceRefText != nil || o.clonePython != nil || o.cloneWorker != nil || o.referenceTranscriber != nil || o.cloneFake || o.cloneModel != .qwen || o.voiceMemory != nil {
             fail("--voice-ref and --clone-* options need --tts clone")
         }
+        if o.dualClone && (o.tts != "clone" || o.cloneModel != .qwen || !o.fluent || o.clock != "host") {
+            fail("--dual-clone requires --tts clone --clone-model qwen --fluent --clock host")
+        }
         if o.voiceRefText != nil, o.voiceRef == nil { fail("--voice-ref-text needs --voice-ref") }
-        if o.cloneModel != .qwen, o.cloneMode == .xvector { fail("--clone-mode xvector requires --clone-model qwen") }
+        if o.asr == "audio" && (!o.translatesAudio || (o.tts == "clone" && o.cloneMode != .xvector) || o.voiceMemory != nil) {
+            fail("--asr audio requires --mt hy or hy-local, audio-only reference conditioning for clone, and no voice memory")
+        }
+        if o.mt != "hy-local", o.hyWorker != nil || o.hyModel != nil { fail("--hy-worker and --hy-model need --mt hy-local") }
         if o.voiceRef != nil, o.cloneMode == .icl, o.voiceRefText == nil {
             fail("--clone-mode icl needs --voice-ref-text with the reference's exact transcript (or use --clone-mode xvector)")
         }
@@ -230,22 +331,40 @@ struct Options {
 }
 
 let usage = """
-    usage: a2a-pipeline (--input clip.wav | --stdin [--rate 48000] | --tap-bundle ID | --tap-pid N [--seconds S])
+    usage: a2a-pipeline (--input clip.wav | --stdin [--rate 48000] | --tap-global | --tap-bundle ID | --tap-pid N [--seconds S])
                         [--clock virtual|host] [--pace realtime|asap] [--source-out s.wav] [--translated-out t.wav]
                         [--max-debt-seconds D] [--max-source-lag-seconds L] [--max-unit-keys N]
-                        [--asr scripted|apple --asr-script x.json] [--mt dictionary|apple --mt-dictionary x.json]
+                        [--max-unit-seconds S (source seconds before a unit closes at its last safe boundary; 0 waits for finalization)]
+                        [--no-word-cuts (let a cut fall inside a word; default keeps cuts off words via the system segmenter)]
+                        [--speaker-carry S (seconds an unlabeled piece may inherit the previous speaker inside one uninterrupted turn; 0 off)]
+                        [--speaker-carry-pause S (…and how close after a pause a brief unlabeled piece may inherit them; default 3)]
+                        [--speaker-carry-piece S (…and the longest piece that may inherit across a pause; default 1)]
+                        [--no-shorten (drop an over-long target instead of cutting it to its source time)]
+                        [--no-filler-silence (count empty or filler answers as failed translations)]
+                        [--asr scripted|audio --asr-script x.json] [--mt dictionary|hy|hy-local --mt-dictionary x.json]
                         [--tts tone|system|clone] [--profile-ready-ms N] --trace out.jsonl [--out out.wav] [--stems s.wav]
+                        [--mt context --context-python PYTHON --context-worker FILE [--context-series LOCAL_JSON]]
+                        [--mt hy --hy-server http://HOST:8082 (sends source audio to the server)]
+                        [--mt hy-local [--hy-worker PATH] [--hy-model GGUF] (Hy-SimulMT on this Mac; research-only model)]
+                        [--no-hy-stream (hy-local: send each span only once it closes, instead of while it is spoken)]
                         [--direction zh-en|en-zh (default zh-en)]
-                        [--clone-model qwen|omnivoice|chatterbox] [--clone-mode icl|xvector]
+                        [--clone-model qwen|audio8|omnivoice|chatterbox] [--clone-mode icl|xvector]
                         [--voice-ref ref.wav [--voice-ref-text ref.txt]]
                         [--voice-memory DIR (opt-in private reference store; matched by voice)]
                         [--clone-python PATH --clone-worker PATH | --clone-fake]
+                        [--reference-transcriber PATH (local transcript for Audio8/OmniVoice)]
+                        [--dual-clone (experimental two-worker Qwen prefetch)]
                         [--session ID] [--research-text] [--tail-seconds S] [--vad-threshold-db DB]
                         [--captions-only | --translation-only] [--events-stdout (in-memory captions and state JSONL)]
                         [--playback original|translated] [--control-stdin (one playback mode per line)]
                         [--fluent (streaming clauses, adaptive speech pace; catch-up skips unheard phrases, never cuts one)]
+                        [--presentation-delay-ms D (with --fluent: phrases start at source start + D to match a delayed picture)]
+                        [--no-turn-fill (with a picture delay: never slow a short line to end with its actor)]
+                        [--adaptive-prebuffer (experimental throughput-based streaming reserve)]
+                        [--quality-first (complete phrases, 20-second debt/lag budget; continuously processes live audio)]
+                        [--background (experimental system sound isolation for music/effects) [--background-out FILE]]
                         [--speakers single|auto (dialogue: one voice per detected speaker)]
-                        [--glossary terms.json (Apple MT only)] [--pronounce words.json (spoken text only)]
+                        [--glossary terms.json (context MT)] [--pronounce words.json (spoken text only)]
                         [--rendered-out post-gain-device-output.wav]
     """
 
@@ -395,19 +514,25 @@ final class Source: @unchecked Sendable {
         if let seconds { deadline = HostClock.nowNs() + UInt64(seconds * 1e9) }
     }
 
-    /// Live chunks as the capture ring fills. With `untilStop`, returns nil once --seconds
-    /// elapse or SIGINT arrives; the tail reads on so playout finishes over live audio.
-    func nextLive(untilStop: Bool) async -> [Float]? {
+    /// The tail after --seconds ends by the clock too: an idle global mix delivers no frames to count.
+    func startTail(seconds: Double) {
+        deadline = HostClock.nowNs() + UInt64(seconds * 1e9)
+    }
+
+    /// Live chunks as the capture ring fills; an empty chunk after 20 ms without capture. Returns nil once SIGINT arrives or the deadline passes:
+    /// --seconds while live, then the tail's own (`startTail`) as playout finishes over live audio.
+    func nextLive() async -> [Float]? {
         guard let tap else { return nil }
         let channels = Int(tap.channels)
+        let waitStart = HostClock.nowNs()
         while pendingMono.count < chunk {
             if Task.isCancelled || stopRequested.withLock({ $0 }) { return nil }
             if let parentPID, getppid() != parentPID { return nil }
             let current = HostClock.nowNs()
-            if untilStop, current >= deadline { return nil }
+            if current >= deadline { return nil }
             if current - lastHealthCheckNs >= 250_000_000 {
                 lastHealthCheckNs = current
-                if tap.source.members.allSatisfy({ kill($0.process.pid, 0) != 0 && errno == ESRCH }) {
+                if tap.source.processesAllExited() {
                     failure = "source app exited; restart the session after reopening it"
                     return nil
                 }
@@ -419,10 +544,18 @@ final class Source: @unchecked Sendable {
             let n = tap.readCapture(into: &tapBuffer)
             if n == 0 {
                 if current - lastCaptureNs >= 2_000_000_000 {
-                    failure = "capture stalled; the session stopped and released its tap"
-                    return nil
+                    // A global tap gets no callbacks until something on the machine plays: a session started
+                    // before the video is not a stall. Look again in 2 s.
+                    if let processes = try? AudioProcessList.current(), tap.source.mixIsIdle(processes: processes) {
+                        lastCaptureNs = current
+                    } else {
+                        failure = "capture stalled; the session stopped and released its tap"
+                        return nil
+                    }
                 }
                 try? await Task.sleep(nanoseconds: 5_000_000)
+                // An empty chunk: the driver keeps playout and phrase slots moving meanwhile.
+                if HostClock.nowNs() - waitStart >= 20_000_000 { return [] }
                 continue
             }
             lastCaptureNs = current
@@ -502,6 +635,11 @@ final class Driver {
     var sourceWriter: WAVStreamWriter?
     var translatedWriter: WAVStreamWriter?
     var renderedWriter: WAVStreamWriter?
+    var backgroundSeparator: BackgroundSeparator?
+    var backgroundWriter: WAVStreamWriter?
+    var backgroundResampler: StreamingResampler?
+    var backgroundFrames: UInt64 = 0
+    var backgroundFailed = false
     var renderedBuffer: [Float] = []
     var renderedFrames: UInt64 = 0
     var lastConsumed: UInt64 = 0
@@ -513,10 +651,19 @@ final class Driver {
     var unconsumedBase: UInt64 = 0
     let recognizer: StreamingRecognizer
     let translator: IncrementalTranslator
+    let hyTranslator: (any AudioTranslator)?
     let synthesizer: VoiceSynthesizer
     let translatorLatency: LatencyModel
     var vad: EnergyVAD
-    var speechEvidence = SpeechEvidence()
+    var audioSegments = AudioSegmentPolicy()
+    /// The local Hy worker hears each span while it is spoken (direct audio, --mt hy-local), so a
+    /// committed span waits only for its last turn.
+    let hyStreaming: HyLocalTranslator?
+    var audioFeed: AudioStreamFeed
+    /// Spans closed to the worker whose answers it is computing, oldest first.
+    var hyTickets: [(span: SourceSpan, ticket: HySpanTicket)] = []
+    var translationTickets: [UnitID: HySpanTicket] = [:]
+    var deferredAudioReferences: [(span: SourceSpan, at: UInt64)] = []
     let to16k = StreamingResampler(inputRate: canonicalRate, outputRate: 16_000)
     let inbox = Inbox<DriverEvent>()
     var deliveries: [Delivery] = []
@@ -524,8 +671,9 @@ final class Driver {
     var tasks: [UnitID: Task<Void, Never>] = [:]
     var translationTasks: [UnitID: Task<Void, Never>] = [:]
     var translationQueue: [TranslationRequest] = []
+    var translationAudio: [UnitID: [Float]] = [:]
     var synthesisQueue: [SynthesisJob] = []
-    var activeSynthesis: UnitID?
+    var activeSynthesis: [UnitID: Int] = [:]
     var held: [UnitID: [SynthesizedAudio]] = [:]
     var unitResamplers: [UnitID: StreamingResampler] = [:]
     var plays: [UnitID: PlayRecord] = [:]
@@ -538,6 +686,14 @@ final class Driver {
     var now: UInt64 = 0
     var lastTick: UInt64 = 0
     var lastResource: UInt64 = 0
+    /// Virtual time spent without capture (`--simulate-capture-gap`); always 0 on the host clock.
+    var idleNs: UInt64 = 0
+    /// Synthetic silence fed at a pause (`idleStep`); it is not source time on the virtual clock.
+    var syntheticFrames: Int64 = 0
+    var idleSince: UInt64?
+    var pauseFlushed = false
+    /// Silence queued ahead of the separated bed to delay it with the picture (ADR-0012).
+    var backgroundDelayFrames = 0
     var profileReady = false
     /// Clone voice: profiles prepared by the synthesizer, keyed by speaker and version.
     var preparedVoices: [String: PreparedVoice] = [:]
@@ -563,38 +719,89 @@ final class Driver {
     var knownSpeakers: Set<SpeakerID> = []
     var historyStart: Int64 = 0
     var stats: [String: Int] = [:]
+    /// `late_ms` of every scheduled phrase under a picture delay (ADR-0012).
+    var slotLateMs: [Int] = []
+
+    /// Slot timing for the run summary: phrases scheduled, median and worst lateness, and how
+    /// many started within 250 ms of their slot (scheduling time, before the device buffer).
+    func slotSummary() -> [String: Any] {
+        guard !slotLateMs.isEmpty else { return ["scheduled": 0] }
+        let sorted = slotLateMs.sorted()
+        return ["scheduled": sorted.count, "median_late_ms": sorted[sorted.count / 2], "max_late_ms": sorted.last!,
+                "within_250ms": sorted.filter { abs($0) <= 250 }.count]
+    }
     var runtimeFailed = false
     /// Latest gains requested from the mixer (the stop path waits for them to land).
     var gainTarget = BusGains.original
+    var backgroundGainTarget: Float = 0
     /// Spoken respellings applied to the synthesizer's text only (--pronounce).
     var pronunciation = TermMap([:], ignoresCase: true)
 
-    init(options: Options, tap: TapSession? = nil, clone: CloneVoiceSynthesizer? = nil,
+    init(options: Options, tap: TapSession? = nil, clone: VoiceSynthesizer? = nil, hyLocal: HyLocalTranslator? = nil,
          playbackControls: PlaybackControls? = nil) async throws {
         o = options
         if let path = options.voiceMemory { voiceMemory = try VoiceMemoryStore(directory: URL(fileURLWithPath: path)) }
         self.playbackControls = playbackControls
         virtual = options.clock == "virtual"
+        hyStreaming = options.asr == "audio" && options.hyStream && options.clock != "virtual"
+            && hyLocal?.info?.streamsSpans == true ? hyLocal : nil
+        audioFeed = AudioStreamFeed(maxSamples: audioSegments.maxSamples)
         var config = PipelineConfig(session: options.session, direction: options.direction)
+        config.directAudioTranslation = options.asr == "audio"
         config.traceText = options.researchText
         config.emitCaptions = options.eventsStdout
         config.originalAudioEnabled = !options.translationOnly
         config.playbackMode = options.playbackMode
+        config.pinSpeakerProfiles = options.tts == "clone"
+        config.requireSpeakerAttribution = options.tts == "clone"
         if options.fluent {
             config.commit.streamingClauses = true
             config.finishPhraseBeforeCatchUp = true
             config.health.prebufferSeconds = 0.24
         }
+        config.adaptiveStreamingPrebuffer = options.adaptivePrebuffer
+        config.backgroundAudioEnabled = options.background
+        if options.mt == "context" { config.contextPairs = 8 }
+        if options.qualityFirst {
+            config.finishPhraseBeforeCatchUp = true
+            config.completePhrasesBeforePlayback = true
+            config.commit.streamingClauses = false
+            config.health.maxDebtSeconds = 20
+            config.health.maxSourceLagSeconds = 20
+            config.maxPendingUnits = 16
+            // Quality-first buys whole phrases with latency: a unit closes early only once it
+            // would exceed the session's own source-lag budget.
+            config.commit.maxUnitSourceSeconds = config.health.maxSourceLagSeconds
+        }
         if let d = options.maxDebtSeconds { config.health.maxDebtSeconds = d }
         if let l = options.maxSourceLagSeconds { config.health.maxSourceLagSeconds = l }
+        // With a picture delay the lag limit counts from each unit's slot (ADR-0012).
+        config.presentationDelaySeconds = Double(options.presentationDelayMs) / 1_000
+        config.turnFillEnabled = options.turnFill
         if let k = options.maxUnitKeys { config.commit.maxUnitKeys = k }
+        if let s = options.maxUnitSeconds { config.commit.maxUnitSourceSeconds = s }
+        if let c = options.speakerCarry { config.unlabeledSpeakerCarrySeconds = c }
+        if let c = options.speakerCarryPause { config.unlabeledSpeakerCarryAfterPauseSeconds = c }
+        if let c = options.speakerCarryPiece { config.unlabeledSpeakerCarryMaxPieceSeconds = c }
+        config.validator.shortensOverBudgetTargets = options.shorten
+        config.validator.silencesFillers = options.fillerSilence
         if let path = options.glossary { config.glossary = try loadTerms(path) }
         if let path = options.pronounce { pronunciation = TermMap(try loadTerms(path), ignoresCase: true) }
         if options.speakers == "auto" {
             config.multiSpeaker = true
             tracker = VoiceprintSpeakerTracker()
         }
-        pipeline = SessionPipeline(config: config)
+        // Mandarin recognition hands back one key per character, so only a word segmenter
+        // can keep a clause cut out of the middle of a word (see WordSegmenter).
+        let segmenter: (any WordSegmenter)? = options.wordCuts && options.direction.source == .mandarin
+            ? NaturalLanguageWordSegmenter(language: options.direction.source.translationIdentifier)
+            : nil
+        // A target shortened to its spoken budget obeys the same rule on the other side:
+        // English → Mandarin must not cut a Han word in half either.
+        let targetSegmenter: (any WordSegmenter)? = options.wordCuts && options.direction.target == .mandarin
+            ? NaturalLanguageWordSegmenter(language: options.direction.target.translationIdentifier)
+            : nil
+        pipeline = SessionPipeline(config: config, wordSegmenter: segmenter, targetWordSegmenter: targetSegmenter)
         trace = try TraceWriter(url: URL(fileURLWithPath: options.trace))
         vad = EnergyVAD(thresholdDB: options.vadThresholdDB)
         self.tap = tap
@@ -620,24 +827,33 @@ final class Driver {
         }
 
         switch options.asr {
+        case "audio": recognizer = AudioOnlyRecognizer()
         case "scripted":
             guard let path = options.asrScript else { fail("--asr scripted needs --asr-script") }
             recognizer = ScriptedRecognizer(script: try ASRScript.load(URL(fileURLWithPath: path)))
-        case "apple":
-            recognizer = try await AppleSpeechRecognizer(locale: Locale(identifier: options.direction.source.speechLocaleIdentifier))
         default: fail("unknown --asr \(options.asr)")
         }
+        hyTranslator = options.mt == "hy" ? try HySimulTranslator(server: URL(string: options.hyServer) ?? URL(fileURLWithPath: "/"), direction: options.direction.rawValue) : hyLocal
         switch options.mt {
         case "dictionary":
             let d = try options.mtDictionary.map { try DictionaryTranslator.load(URL(fileURLWithPath: $0)) }
                 ?? DictionaryTranslator(table: [:])
             translator = d
             translatorLatency = d.latency
-        case "apple":
-            let source = Locale.Language(identifier: options.direction.source.translationIdentifier)
-            let target = Locale.Language(identifier: options.direction.target.translationIdentifier)
-            try await AppleTranslator.checkInstalled(source: source, target: target)
-            translator = AppleTranslator(source: source, target: target)
+        case "hy", "hy-local":
+            guard options.clock != "virtual" else { fail("--mt \(options.mt) requires a real clock") }
+            translator = DictionaryTranslator(table: [:])
+            translatorLatency = .init()
+        case "context":
+            guard options.direction == .chineseToEnglish, let python = options.contextPython,
+                  let worker = options.contextWorker else {
+                fail("--mt context requires zh-en, --context-python and --context-worker")
+            }
+            let arguments = options.contextSeries.map { ["--series", $0] } ?? []
+            let local = try ContextualTranslator(python: URL(fileURLWithPath: python),
+                worker: URL(fileURLWithPath: worker), arguments: arguments)
+            try await local.waitUntilReady()
+            translator = local
             translatorLatency = .init()
         default: fail("unknown --mt \(options.mt)")
         }
@@ -657,6 +873,28 @@ final class Driver {
         if options.stems != nil { stemWriter = try WAVStreamWriter(url: URL(fileURLWithPath: options.stems!), sampleRate: canonicalRate, channels: 2) }
         if let path = options.sourceOut { sourceWriter = try WAVStreamWriter(url: URL(fileURLWithPath: path), sampleRate: canonicalRate, channels: 1) }
         if let path = options.translatedOut { translatedWriter = try WAVStreamWriter(url: URL(fileURLWithPath: path), sampleRate: outRate, channels: 1) }
+        if options.background {
+            let delaySeconds = Double(options.presentationDelayMs) / 1_000
+            guard a2a_engine_enable_background(engine, UInt32(Double(outRate) * (3 + delaySeconds))) else {
+                throw AdapterError.unsupported("background bus allocation failed")
+            }
+            let separator = try BackgroundSeparator()
+            backgroundSeparator = separator
+            if delaySeconds > 0, let ring = a2a_engine_background_ring(engine) {
+                // Picture delay: the bed is a FIFO drained at the device rate the tap fills it at,
+                // so D seconds of silence queued before callbacks start keep it D behind the
+                // capture for the session. The separator already lags its input by its own latency.
+                let frames = Int((max(0, delaySeconds - separator.latencySeconds) * Double(outRate)).rounded())
+                let silence = [Float](repeating: 0, count: frames)
+                let written = silence.withUnsafeBufferPointer { a2a_ring_write(ring, $0.baseAddress!, UInt32(frames)) }
+                guard Int(written) == frames else { throw AdapterError.unsupported("background delay allocation failed") }
+                backgroundDelayFrames = frames
+            }
+            backgroundResampler = StreamingResampler(inputRate: canonicalRate, outputRate: outRate)
+            if let path = options.backgroundOut {
+                backgroundWriter = try WAVStreamWriter(url: URL(fileURLWithPath: path), sampleRate: canonicalRate, channels: 1)
+            }
+        }
         if let path = options.renderedOut {
             renderedWriter = try WAVStreamWriter(url: URL(fileURLWithPath: path), sampleRate: outRate, channels: outChannels)
             renderedBuffer = [Float](repeating: 0, count: 4_096 * outChannels)
@@ -695,6 +933,7 @@ final class Driver {
 
     /// Source audio is kept while some speaker's reference may still be cut from it.
     var keepsHistory: Bool {
+        if o.translatesAudio { return true }
         guard acquiresReference else { return false }
         return pipeline.config.multiSpeaker || referencePolicies[pipeline.config.defaultSpeaker]?.isComplete != true
     }
@@ -705,17 +944,22 @@ final class Driver {
         let multi = pipeline.config.multiSpeaker
         guard acquiresReference, h.isFinal,
               multi || referencePolicies[pipeline.config.defaultSpeaker]?.isComplete != true else { return }
-        guard let span = ReferencePolicy(speaker: pipeline.config.defaultSpeaker).speechSpan(of: h) else {
+        let policy = ReferencePolicy(speaker: pipeline.config.defaultSpeaker)
+        let candidates = policy.referenceCandidates(of: h)
+        guard !candidates.isEmpty else {
             stats["reference_rejected_no_timing", default: 0] += 1
             return
         }
-        if multi {
-            // The tracker labels speech when a segment ends; wait until it covers the utterance.
-            deferredReferences.append((h, span, now))
-            offerDeferredReferences()
-        } else {
-            offerReference(h, span: span, speaker: pipeline.config.defaultSpeaker)
+        for candidate in candidates {
+            guard let span = policy.speechSpan(of: candidate) else { continue }
+            if multi {
+                // Each cut must independently match a single tracked speaker.
+                deferredReferences.append((candidate, span, now))
+            } else {
+                offerReference(candidate, span: span, speaker: pipeline.config.defaultSpeaker)
+            }
         }
+        if multi { offerDeferredReferences() }
     }
 
     /// Multi-speaker: a waiting utterance joins a reference only when one speaker covers it,
@@ -741,14 +985,18 @@ final class Driver {
     }
 
     func offerReference(_ h: ASRHypothesis, span: SourceSpan, speaker: SpeakerID) {
+        offerReferenceText(h.text, span: span, speaker: speaker)
+    }
+
+    func offerReferenceText(_ text: String, span: SourceSpan, speaker: SpeakerID) {
         guard !memoryPreparing.contains(speaker), !memoryReused.contains(speaker) else { return }
-        var policy = referencePolicies[speaker] ?? ReferencePolicy(speaker: speaker)
+        var policy = referencePolicies[speaker] ?? liveReferencePolicy(for: speaker)
         guard !policy.isComplete else { return }
         guard let pcm = historySlice(span) else {
             stats["reference_rejected_expired", default: 0] += 1
             return
         }
-        let result = policy.offer(span: span, text: h.text, levelDB: Signal.dbfs(Signal.rms(pcm)),
+        let result = policy.offer(span: span, text: text, levelDB: Signal.dbfs(Signal.rms(pcm)),
                                   clippedFraction: clippedFraction(pcm))
         referencePolicies[speaker] = policy
         publishVoiceProgress(speaker, state: "collecting", seconds: policy.acceptedSeconds)
@@ -765,6 +1013,30 @@ final class Driver {
                 prepareReference(plan)
             }
         }
+    }
+
+    func liveReferencePolicy(for speaker: SpeakerID) -> ReferencePolicy {
+        var config = ReferencePolicyConfig()
+        config.allowUpgrade = !pipeline.config.pinSpeakerProfiles
+        config.allowEmptyText = o.asr == "audio" && o.cloneMode == .xvector
+        return ReferencePolicy(speaker: speaker, config: config)
+    }
+
+    /// Only clean, predominantly single-speaker spans become audio-only references.
+    func offerAudioReferences() {
+        var waiting: [(span: SourceSpan, at: UInt64)] = []
+        for item in deferredAudioReferences {
+            if !pipeline.config.multiSpeaker {
+                offerReferenceText("", span: item.span, speaker: pipeline.config.defaultSpeaker)
+            } else if let coverage = pipeline.speakerCoverage(of: item.span), coverage.labeled >= 0.7 {
+                if coverage.share >= 0.9 * coverage.labeled {
+                    offerReferenceText("", span: item.span, speaker: coverage.speaker)
+                } else { stats["reference_rejected_mixed_speakers", default: 0] += 1 }
+            } else if now - item.at <= 3_000_000_000 {
+                waiting.append(item)
+            } else { stats["reference_rejected_unlabeled", default: 0] += 1 }
+        }
+        deferredAudioReferences = waiting
     }
 
     /// Multi-speaker: a speaker's first label prepares their voice. Tone and system voices are
@@ -866,6 +1138,27 @@ final class Driver {
         }
     }
 
+    /// Streams the span being spoken to the local Hy worker and closes spans as the segmenter does.
+    func feedHy(_ hy: HyLocalTranslator, closed: [SourceSpan]) {
+        for action in audioFeed.update(closed: closed, openStart: audioSegments.openStart, voicedEnd: vad.voicedEnd) {
+            switch action {
+            case .append(let span):
+                guard let pcm = historySlice(span), pcm.count == Int(span.end - span.start) else {
+                    // Not expected (history holds 30 s): withdraw the span; its request sends it whole.
+                    hy.discard()
+                    audioFeed = AudioStreamFeed(maxSamples: audioSegments.maxSamples)
+                    return
+                }
+                hy.stream(pcm)
+            case .close(let span):
+                if hyTickets.count >= 16 { hyTickets.removeFirst() }
+                hyTickets.append((span, hy.close(spanSamples: Int(span.end - span.start))))
+            case .discard:
+                hy.discard()
+            }
+        }
+    }
+
     func historySlice(_ span: SourceSpan) -> [Float]? {
         guard span.start >= historyStart else { return nil }
         let lo = Int(span.start - historyStart)
@@ -884,7 +1177,7 @@ final class Driver {
     }
 
     func clock() -> UInt64 {
-        virtual ? t0 + UInt64(srcFrames) * 1_000_000_000 / UInt64(canonicalRate) : HostClock.nowNs()
+        virtual ? t0 + UInt64(srcFrames - syntheticFrames) * 1_000_000_000 / UInt64(canonicalRate) + idleNs : HostClock.nowNs()
     }
 
     // MARK: Reducer plumbing
@@ -898,6 +1191,16 @@ final class Driver {
             switch effect {
             case .trace(let e):
                 trace.emit(e)
+                // Picture delay: how far from its slot each phrase was scheduled (positive = late).
+                if e.kind == .playScheduled, case .int(let late)? = e.value("late_ms") { slotLateMs.append(Int(late)) }
+                // Run-summary counters: how each line left the session (recovery report).
+                if e.kind == .sourceDisposition, e.value("disposition") == .string("silence") {
+                    stats["silence_units", default: 0] += 1
+                }
+                if e.kind == .commitTarget {
+                    if e.value("shortened") == .bool(true) { stats["shortened_targets", default: 0] += 1 }
+                    if e.value("speaker_carried") == .bool(true) { stats["speaker_carried_units", default: 0] += 1 }
+                }
                 if o.eventsStdout, [.stateChange, .error, .queueDepth, .fallbackEnter, .fallbackExit, .gainRamp].contains(e.kind) {
                     FileHandle.standardOutput.write(Data((e.jsonLine() + "\n").utf8))
                 }
@@ -910,16 +1213,19 @@ final class Driver {
                 }
             case .requestFinalize: recognizer.requestFinalize()
             case .translate(let req): startTranslation(req)
-            case .synthesize(let job): startSynthesis(job)
+            case .synthesize(let job):
+                if virtual { startSynthesis(job) } else { synthesisQueue.append(job) }
             case .cancelTranslation(let unit):
                 translationTasks.removeValue(forKey: unit)?.cancel()
                 translationQueue.removeAll { $0.unitID == unit }
+                translationAudio.removeValue(forKey: unit)
+                translationTickets.removeValue(forKey: unit)
                 deliveries.removeAll { if case .input(.translation(let id, _)) = $0.event { id == unit } else { false } }
             case .cancelSynthesis(let unit):
                 tasks[unit]?.cancel()
                 tasks[unit] = nil
                 synthesisQueue.removeAll { $0.unit == unit }
-                if activeSynthesis == unit { activeSynthesis = nil }
+                activeSynthesis.removeValue(forKey: unit)
                 unitResamplers[unit] = nil
                 deliveries.removeAll { d in
                     switch d.event {
@@ -940,9 +1246,13 @@ final class Driver {
                 held[unit] = nil
                 plays[unit] = nil
             case .dropPCM: stats["pcm_dropped", default: 0] += 1
+            case .enqueueProviderPCM: break // Used only by the provider streaming driver.
             case .rampGains(let g, let ms):
                 gainTarget = g
                 a2a_engine_set_gains(engine, g.original, g.translated, UInt32(ms * outRate / 1_000))
+            case .backgroundGain(let gain, let ms):
+                backgroundGainTarget = backgroundFailed ? 0 : gain
+                a2a_engine_set_background_gain(engine, backgroundGainTarget, UInt32(ms * outRate / 1_000))
             case .flushTranslatedBus:
                 a2a_engine_flush_translated(engine)
                 plays.removeAll()
@@ -956,7 +1266,7 @@ final class Driver {
             }
         }
         launchNextTranslation()
-        if activeSynthesis == nil, !synthesisQueue.isEmpty {
+        if canStartSynthesis, !synthesisQueue.isEmpty {
             startSynthesis(synthesisQueue.removeFirst())
         }
     }
@@ -968,6 +1278,28 @@ final class Driver {
 
     func startTranslation(_ req: TranslationRequest) {
         let translator = self.translator
+        if hyTranslator != nil {
+            if let span = req.sourceSpan, let i = hyTickets.firstIndex(where: { $0.span == span }) {
+                // Spans are requested in order: closed spans before this one were never requested.
+                translationTickets[req.unitID] = hyTickets[i].ticket
+                hyTickets.removeFirst(i + 1)
+                translationQueue.append(req)
+                launchNextTranslation()
+                return
+            }
+            if hyStreaming != nil {
+                // Sending it whole now would interleave with the open span's streamed audio in the
+                // worker and shift every later answer by one span.
+                inbox.post(.input(.translation(req.unitID, .failure("Hy-SimulMT span was not streamed"))))
+                return
+            }
+            guard let span = req.sourceSpan, span.start >= historyStart,
+                  span.end <= historyStart + Int64(history.count), let audio = historySlice(span) else {
+                inbox.post(.input(.translation(req.unitID, .failure("Hy-SimulMT source audio unavailable"))))
+                return
+            }
+            translationAudio[req.unitID] = audio
+        }
         if virtual {
             let latency = translatorLatency.nanoseconds(units: req.uncommittedSource.count)
             let unit = req.unitID
@@ -992,6 +1324,10 @@ final class Driver {
         guard !virtual, translationTasks.isEmpty, !translationQueue.isEmpty else { return }
         let req = translationQueue.removeFirst()
         let translator = self.translator
+        let hyTranslator = self.hyTranslator
+        let audio = translationAudio.removeValue(forKey: req.unitID)
+        let ticket = translationTickets.removeValue(forKey: req.unitID)
+        let hyStreaming = self.hyStreaming
         let inbox = self.inbox
         // Fixture adapters model compute time; on the host clock that time is slept, so
         // paced and offline runs see the same latency model.
@@ -999,7 +1335,11 @@ final class Driver {
         translationTasks[req.unitID] = Task.detached {
             let started = HostClock.nowNs()
             let outcome: TranslationOutcome
-            do { outcome = .success(try await translator.translate(req)) } catch { outcome = .failure("\(error)") }
+            do {
+                if let ticket, let hyStreaming { outcome = .success(try await hyStreaming.answer(ticket, unit: req.unitID)) }
+                else if let hyTranslator, let audio { outcome = .success(try await hyTranslator.translate(unit: req.unitID, samples: audio)) }
+                else { outcome = .success(try await translator.translate(req)) }
+            } catch { outcome = .failure("\(error)") }
             let spent = HostClock.nowNs() - started
             if modeled > spent { try? await Task.sleep(nanoseconds: modeled - spent) }
             if Task.isCancelled { return }
@@ -1007,10 +1347,25 @@ final class Driver {
         }
     }
 
+    /// For dual-worker mode, the back slot starts only once the front is playing;
+    /// this preserves order and keeps at most one future phrase buffered.
+    var canStartSynthesis: Bool {
+        if virtual { return true }
+        let capacity = o.dualClone ? 2 : 1
+        guard activeSynthesis.count < capacity else { return false }
+        if o.dualClone {
+            guard plays.count < 2 else { return false }
+            if !plays.isEmpty && !plays.values.contains(where: { $0.started }) { return false }
+        }
+        return true
+    }
+
     func startSynthesis(_ job: SynthesisJob) {
+        var lane = 0
         if !virtual {
-            if activeSynthesis != nil { synthesisQueue.append(job); return }
-            activeSynthesis = job.unit
+            if !canStartSynthesis { synthesisQueue.append(job); return }
+            lane = (0..<(o.dualClone ? 2 : 1)).first { !activeSynthesis.values.contains($0) }!
+            activeSynthesis[job.unit] = lane
         }
         let synthesizer = self.synthesizer
         let voice = preparedVoices["\(job.speaker)/\(job.profileVersion)"]
@@ -1041,10 +1396,19 @@ final class Driver {
         let inbox = self.inbox
         let tone = synthesizer as? ToneSynthesizer
         let spoken = pronunciation.apply(job.text)
+        let selectedLane = lane
+        let fill = job.allowFill
         tasks[job.unit] = Task.detached {
             do {
                 if let tone { try await Task.sleep(nanoseconds: tone.firstChunk.nanoseconds(units: 0)) }
-                for try await c in synthesizer.synthesize(unit: job.unit, text: spoken, voice: voice, targetSeconds: job.targetSeconds) {
+                let stream = if let dual = synthesizer as? DualCloneVoiceSynthesizer {
+                    dual.synthesize(unit: job.unit, text: spoken, voice: voice, targetSeconds: job.targetSeconds,
+                                    allowFill: fill, lane: selectedLane)
+                } else {
+                    synthesizer.synthesize(unit: job.unit, text: spoken, voice: voice, targetSeconds: job.targetSeconds,
+                                           allowFill: fill)
+                }
+                for try await c in stream {
                     if Task.isCancelled { return }
                     inbox.post(.chunk(job, c))
                     if let tone {
@@ -1076,12 +1440,21 @@ final class Driver {
             currentChunk = nil
         case .finished(let job):
             tasks[job.unit] = nil
-            if activeSynthesis == job.unit { activeSynthesis = nil }
-            if let clone = synthesizer as? CloneVoiceSynthesizer, let stats = clone.takeStats(for: job.unit) {
+            activeSynthesis.removeValue(forKey: job.unit)
+            let cloneStats = (synthesizer as? CloneVoiceSynthesizer)?.takeStats(for: job.unit)
+                ?? (synthesizer as? DualCloneVoiceSynthesizer)?.takeStats(for: job.unit)
+            if cloneStats?.truncated == true { stats["tts_truncated_units", default: 0] += 1 }
+            if let retries = cloneStats?.retries, retries > 0 { stats["tts_silent_retries", default: 0] += retries }
+            if let done = cloneStats {
                 let ms = { (seconds: Double) in Int((seconds * 1000).rounded()) }
-                var fields: [TraceEvent.Field] = [.unit(job.unit), .double("pace", stats.pace),
-                                                  .int("native_ms", ms(stats.nativeSeconds)), .int("audio_ms", ms(stats.audioSeconds)),
-                                                  .int("quiet_removed_ms", ms(stats.quietRemovedSeconds))]
+                var fields: [TraceEvent.Field] = [.unit(job.unit), .double("pace", done.pace),
+                                                  .int("native_ms", ms(done.nativeSeconds)), .int("audio_ms", ms(done.audioSeconds)),
+                                                  .int("quiet_removed_ms", ms(done.quietRemovedSeconds))]
+                if done.budgetSeconds > 0 { fields.append(.int("budget_ms", ms(done.budgetSeconds))) }
+                // The character-count cap stopped generation: this line lost its tail.
+                if done.truncated { fields.append(.bool("truncated", true)) }
+                // A silent first take was discarded and generated again with another seed.
+                if done.retries > 0 { fields.append(.int("retries", done.retries)) }
                 if let target = job.targetSeconds { fields.append(.int("target_ms", ms(target))) }
                 if !pronunciation.isEmpty { fields.append(.bool("respelled", pronunciation.apply(job.text) != job.text)) }
                 trace.emit(TraceEvent(tNs: now, session: o.session, epoch: pipeline.gate.epoch, gen: pipeline.gate.generation,
@@ -1097,7 +1470,7 @@ final class Driver {
             send(.synthesisFinished(job.unit, generation: job.generation))
         case .failed(let job, let message):
             tasks[job.unit] = nil
-            if activeSynthesis == job.unit { activeSynthesis = nil }
+            activeSynthesis.removeValue(forKey: job.unit)
             send(.synthesisFailed(job.unit, message))
         case .prepared(let voice, let seconds, let prepareNs):
             preparingReference = false
@@ -1134,7 +1507,7 @@ final class Driver {
         case .prepareFailed(let speaker, let version, let message):
             preparingReference = false
             if version == 1 {
-                referencePolicies[speaker] = ReferencePolicy(speaker: speaker)
+                referencePolicies[speaker] = liveReferencePolicy(for: speaker)
                 referenceAudio[speaker] = nil
                 pendingReferences.removeAll { $0.speaker == speaker }
             }
@@ -1304,11 +1677,45 @@ final class Driver {
             && plays.isEmpty && held.isEmpty
     }
 
-    func step(_ chunk: [Float]?, frames: Int) {
+    /// `synthetic`: silence that is not source time (a pause flush). It stays out of the separated
+    /// bed, whose FIFO depth is the picture delay, and renders no output span of its own.
+    func step(_ chunk: [Float]?, frames: Int, synthetic: Bool = false) {
         now = clock()
+        if chunk != nil {
+            idleSince = nil
+            pauseFlushed = false
+        }
         if let mode = playbackControls?.takeLatest() { send(.playbackMode(mode)) }
         let start = srcFrames
         let samples = chunk ?? [Float](repeating: 0, count: frames)
+        if !synthetic, let separator = backgroundSeparator, !backgroundFailed {
+            do {
+                let bed = try separator.process(samples)
+                backgroundWriter?.append(bed)
+                let pcm = backgroundResampler?.process(bed) ?? []
+                if backgroundDelayFrames > 0, let ring = a2a_engine_background_ring(engine) {
+                    // The bed normally sits D (less a few chunks of processing) ahead of the mixer.
+                    // A pause the device rendered through without capture drained it; refill the
+                    // gap with silence so music and effects stay with the delayed picture.
+                    let readable = Int(a2a_ring_readable(ring))
+                    if readable < backgroundDelayFrames - outRate / 4 {
+                        let silence = [Float](repeating: 0, count: backgroundDelayFrames - outRate / 25 - readable)
+                        _ = silence.withUnsafeBufferPointer { a2a_ring_write(ring, $0.baseAddress!, UInt32(silence.count)) }
+                    }
+                }
+                if !pcm.isEmpty, let ring = a2a_engine_background_ring(engine) {
+                    let count = pcm.withUnsafeBufferPointer { a2a_ring_write(ring, $0.baseAddress!, UInt32(pcm.count)) }
+                    backgroundFrames += UInt64(count)
+                    if Int(count) != pcm.count { throw AdapterError.unsupported("background bus overflow") }
+                }
+            } catch {
+                // Separation failure mutes only this bus; never substitute original audio.
+                backgroundFailed = true
+                backgroundGainTarget = 0
+                a2a_engine_set_background_gain(engine, 0, UInt32(outRate / 100))
+                log("background separation failed; music/effects muted")
+            }
+        }
         srcFrames += Int64(frames)
         let span = SourceSpan(start: start, end: srcFrames)
         if chunk != nil { send(.captured(span: span)) }
@@ -1342,10 +1749,8 @@ final class Driver {
         }
         let lowRate = to16k.process(samples)
         let frame16 = AudioFrame16k(span: span, samples: lowRate)
-        speechEvidence.advance(to: span.end)
         let vadEvents = vad.process(frame16)
         for event in vadEvents {
-            speechEvidence.process(event)
             send(.vad(event))
         }
         // Labels reach the reducer before any commit they cover.
@@ -1353,20 +1758,24 @@ final class Driver {
             send(.speaker(event))
             noteSpeaker(event)
         }
+        if o.asr == "audio" {
+            let segments = audioSegments.process(events: vadEvents, frontier: span.end)
+            // Before the reducer commits them, so each closed span's answer is already under way.
+            if let hyStreaming { feedHy(hyStreaming, closed: segments) }
+            for segment in segments {
+                send(.audioSegment(segment))
+                if acquiresReference { deferredAudioReferences.append((segment, now)) }
+            }
+            if !deferredAudioReferences.isEmpty { offerAudioReferences() }
+        }
         recognizer.accept(frame16)
         for h in recognizer.drainHypotheses() {
-            if o.asr != "apple" || speechEvidence.accepts(h) {
-                send(.hypothesis(h))
-                acquireReference(h)
-            } else { stats["silence_hypotheses_rejected", default: 0] += 1 }
+            send(.hypothesis(h))
+            acquireReference(h)
         }
         if !deferredReferences.isEmpty { offerDeferredReferences() }
-        if let error = (recognizer as? AppleSpeechRecognizer)?.lastError, !runtimeFailed {
-            log(o.researchText ? "recognition stopped: \(error)" : "recognition stopped")
-            runtimeFailed = true
-            send(.workerHealthy(false))
-        }
-        if let error = (synthesizer as? CloneVoiceSynthesizer)?.failure, !runtimeFailed {
+        if let error = (synthesizer as? CloneVoiceSynthesizer)?.failure
+            ?? (synthesizer as? DualCloneVoiceSynthesizer)?.failure, !runtimeFailed {
             log(o.researchText ? "voice worker stopped: \(error)" : "voice worker stopped")
             runtimeFailed = true
             send(.workerHealthy(false))
@@ -1379,12 +1788,55 @@ final class Driver {
             deliver(first.event)
         }
 
-        render(chunk == nil ? nil : samples, frames: frames)
+        render(chunk == nil ? nil : samples, frames: synthetic ? 0 : frames)
 
         if now >= lastTick + 100_000_000 {
             lastTick = now
             let backlog = Double(a2a_ring_readable(a2a_engine_translated_ring(engine))) / Double(outRate)
             send(.translatedBacklog(seconds: backlog))
+            send(.tick)
+        }
+        if now >= lastResource + 1_000_000_000 {
+            lastResource = now
+            emitResource()
+        }
+        trace.flush()
+    }
+
+    /// A period without capture: the global tap gets no callbacks while nothing plays, for
+    /// example a paused video. Model results, playout tracking, ticks and phrase slots still
+    /// advance by the clock (a delayed picture keeps showing the last D seconds meanwhile);
+    /// nothing touches the source timeline, VAD, tracker or separator.
+    func idleStep(frames: Int) {
+        now = clock()
+        // A paused tap delivers no frames, not silence, so the phrase spoken just before the
+        // pause would stay open until playback resumes and miss its slot. Once per pause, 0.6 s
+        // of silence closes it through the usual VAD and segment rules. It gets no capture
+        // anchor (slots stay on captured time) and no separated bed.
+        let since = idleSince ?? now
+        idleSince = since
+        if !pauseFlushed, now - since >= 300_000_000 {
+            pauseFlushed = true
+            let flush = canonicalRate * 3 / 5
+            step(nil, frames: flush, synthetic: true)
+            syntheticFrames += Int64(flush)
+            idleSince = since
+            pauseFlushed = true
+            return
+        }
+        if let mode = playbackControls?.takeLatest() { send(.playbackMode(mode)) }
+        for e in inbox.drain() { deliver(e) }
+        deliveries.sort { ($0.at, $0.seq) < ($1.at, $1.seq) }
+        while let first = deliveries.first, first.at <= now {
+            deliveries.removeFirst()
+            deliver(first.event)
+        }
+        // The device renders on its own; a file replay renders the same span of output.
+        render(nil, frames: tap == nil ? frames : 0)
+        // Every input re-checks slots, so due phrases start within one idle step.
+        send(.translatedBacklog(seconds: Double(a2a_ring_readable(a2a_engine_translated_ring(engine))) / Double(outRate)))
+        if now >= lastTick + 100_000_000 {
+            lastTick = now
             send(.tick)
         }
         if now >= lastResource + 1_000_000_000 {
@@ -1423,21 +1875,30 @@ final class Driver {
         var tail = 0
         if tap != nil {
             source.startLive(seconds: o.seconds)
-            while let chunk = await source.nextLive(untilStop: true) {
-                autoreleasepool { step(chunk, frames: chunk.count) }
+            while let chunk = await source.nextLive() {
+                autoreleasepool { chunk.isEmpty ? idleStep(frames: 0) : step(chunk, frames: chunk.count) }
                 if runtimeFailed { break }
             }
             log("stopping: finishing in-flight units over live audio (up to \(o.tailSeconds) s)")
             recognizer.requestFinalize()
-            while !runtimeFailed, source.failure == nil, tail < tailFrames, let chunk = await source.nextLive(untilStop: false) {
-                autoreleasepool { step(chunk, frames: chunk.count) }
+            source.startTail(seconds: o.tailSeconds)
+            while !runtimeFailed, source.failure == nil, tail < tailFrames, let chunk = await source.nextLive() {
+                autoreleasepool { chunk.isEmpty ? idleStep(frames: 0) : step(chunk, frames: chunk.count) }
                 tail += chunk.count
                 if tail >= canonicalRate, idle { break }
             }
         } else {
             let realtimeFile = !virtual && source.totalFrames != nil && o.pace == "realtime"
             let wallStart = HostClock.nowNs()
+            var gap = o.captureGap
             while let chunk = await source.next() {
+                if let g = gap, Double(srcFrames) / Double(canonicalRate) >= g.at {
+                    gap = nil
+                    for _ in 0..<Int((g.seconds * 50).rounded()) {
+                        idleNs += 20_000_000
+                        autoreleasepool { idleStep(frames: canonicalRate / 50) }
+                    }
+                }
                 autoreleasepool { step(chunk, frames: chunk.count) }
                 if runtimeFailed { break }
                 if realtimeFile { pace(wallStart) }
@@ -1459,6 +1920,8 @@ final class Driver {
         }
         send(.stop)
         (synthesizer as? CloneVoiceSynthesizer)?.shutdown()
+        (synthesizer as? DualCloneVoiceSynthesizer)?.shutdown()
+        (translator as? ContextualTranslator)?.shutdown()
         if tap != nil { settleGains(timeoutMs: pipeline.config.health.rampMs + 50) }
         // Freeze the producer before the final monitor drain so every rendered frame
         // has exactly one sample in the diagnostic file, with no callback race at close.
@@ -1469,6 +1932,7 @@ final class Driver {
         try? outWriter?.close()
         try? stemWriter?.close()
         try? sourceWriter?.close()
+        try? backgroundWriter?.close()
         try? translatedWriter?.close()
         try? renderedWriter?.close()
         summary()
@@ -1481,6 +1945,7 @@ final class Driver {
         func settled() -> Bool {
             abs(a2a_engine_current_original_gain(engine) - gainTarget.original) < 1e-3
                 && abs(a2a_engine_current_translated_gain(engine) - gainTarget.translated) < 1e-3
+                && abs(a2a_engine_current_background_gain(engine) - backgroundGainTarget) < 1e-3
         }
         while !settled(), HostClock.nowNs() < deadline { usleep(2_000) }
     }
@@ -1505,6 +1970,12 @@ final class Driver {
             "translation_only": o.translationOnly, "output_sample_rate": outRate,
             "playback": pipeline.playbackMode.rawValue,
             "fluent": o.fluent,
+            "presentation_delay_ms": o.presentationDelayMs,
+            "turn_fill": o.turnFill,
+            "slot": slotSummary(),
+            "adaptive_prebuffer": o.adaptivePrebuffer,
+            "quality_first": o.qualityFirst,
+            "background": ["enabled": o.background, "failed": backgroundFailed, "frames": backgroundFrames] as [String: Any],
             "rendered_frames_recorded": renderedFrames,
             "rendered_capture_overflow_frames": a2a_engine_rendered_ring(engine).map(a2a_ring_overflow_frames) ?? 0,
             "silence_hypotheses_rejected": stats["silence_hypotheses_rejected", default: 0],
@@ -1512,22 +1983,38 @@ final class Driver {
             "max_debt_seconds": pipeline.config.health.maxDebtSeconds,
             "max_source_lag_seconds": pipeline.config.health.maxSourceLagSeconds,
             "max_unit_keys": pipeline.config.commit.maxUnitKeys,
+            "max_unit_seconds": pipeline.config.commit.maxUnitSourceSeconds,
+            "word_cuts": options.wordCuts,
+            "speaker_carry_seconds": pipeline.config.unlabeledSpeakerCarrySeconds,
+            "speaker_carry_after_pause_seconds": pipeline.config.unlabeledSpeakerCarryAfterPauseSeconds,
+            "speaker_carry_max_piece_seconds": pipeline.config.unlabeledSpeakerCarryMaxPieceSeconds,
+            "speaker_carried_units": stats["speaker_carried_units", default: 0],
+            "shorten_targets": pipeline.config.validator.shortensOverBudgetTargets,
+            "shortened_targets": stats["shortened_targets", default: 0],
+            "filler_silence": pipeline.config.validator.silencesFillers,
+            "silence_units": stats["silence_units", default: 0],
+            "tts_truncated_units": stats["tts_truncated_units", default: 0],
+            "tts_silent_retries": stats["tts_silent_retries", default: 0],
             "speakers": ["mode": o.speakers, "detected": tracker == nil ? 1 : knownSpeakers.count] as [String: Any],
         ]
         if tracker != nil, o.tts != "clone" { s["voices"] = profileLog }
-        if let clone = synthesizer as? CloneVoiceSynthesizer {
-            s["clone"] = ["model": clone.info?.model ?? "", "selected_model": o.cloneModel.rawValue,
-                          "audio_output_streaming": clone.capabilities.audioOutputStreaming,
-                          "conditioning": clone.conditioning.rawValue,
+        if o.tts == "clone" {
+            let info = (synthesizer as? CloneVoiceSynthesizer)?.info ?? (synthesizer as? DualCloneVoiceSynthesizer)?.info
+            s["clone"] = ["model": info?.model ?? "", "selected_model": o.cloneModel.rawValue,
+                          "audio_output_streaming": synthesizer.capabilities.audioOutputStreaming,
+                          "conditioning": o.cloneMode.rawValue, "workers": o.dualClone ? 2 : 1,
+                          "session_voice_locked": pipeline.config.pinSpeakerProfiles,
+                          "speaker_attribution_required": pipeline.config.requireSpeakerAttribution && pipeline.config.multiSpeaker,
                           "reference": o.voiceRef == nil ? "acquired" : "fixed", "profiles": profileLog,
-                          "load_seconds": clone.info?.loadSeconds ?? 0, "warmup_seconds": clone.info?.warmupSeconds ?? 0,
+                          "load_seconds": info?.loadSeconds ?? 0, "warmup_seconds": info?.warmupSeconds ?? 0,
                           "reference_stats": stats.filter { $0.key.hasPrefix("reference_") }] as [String: Any]
         }
         if let tap {
             let c = tap.counters
             s["mode"] = "tap"
             s["output_frames"] = c.outputFrames
-            s["tap"] = ["bundle_id": tap.source.bundleID, "pids": tap.source.members.map { Int($0.process.pid) },
+            s["tap"] = ["bundle_id": tap.source.bundleID, "global": tap.source.global,
+                        "pids": tap.source.members.map { Int($0.process.pid) },
                         "muted": tap.tapIsMuted, "device_rate": tap.sampleRate, "callbacks": c.callbacks,
                         "captured_frames": c.capturedFrames, "capture_overflow_frames": c.captureOverflowFrames,
                         "output_frames": c.outputFrames, "record_drops": c.recordDrops,
@@ -1558,18 +2045,43 @@ func startCloneWorker(_ o: Options) async -> CloneVoiceSynthesizer {
     }
 }
 
-/// The clone worker command: explicit paths, or the research environment in the repository
-/// that contains this executable (development builds and the local app bundle).
-func cloneWorkerCommand(_ o: Options) -> (URL, [String]) {
-    func repositoryRoot() -> URL? {
-        var dir = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))
-            .resolvingSymlinksInPath().deletingLastPathComponent()
-        while dir.path != "/" {
-            if FileManager.default.fileExists(atPath: dir.appendingPathComponent("research/tts_worker.py").path) { return dir }
-            dir = dir.deletingLastPathComponent()
-        }
-        return nil
+/// The repository that contains this executable (development builds and the local app bundle).
+func repositoryRoot() -> URL? {
+    var dir = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))
+        .resolvingSymlinksInPath().deletingLastPathComponent()
+    while dir.path != "/" {
+        if FileManager.default.fileExists(atPath: dir.appendingPathComponent("research/tts_worker.py").path) { return dir }
+        dir = dir.deletingLastPathComponent()
     }
+    return nil
+}
+
+/// Speech translation straight from source audio, by a Hy-SimulMT server or the worker on this Mac.
+protocol AudioTranslator: Sendable {
+    func translate(unit: UnitID, samples: [Float]) async throws -> TranslationCandidate
+}
+extension HySimulTranslator: AudioTranslator {}
+extension HyLocalTranslator: AudioTranslator {}
+
+/// Starts Hy-SimulMT on this Mac: explicit paths, or the worker and model in the repository.
+/// Loading takes a few seconds with the GGUF in the page cache.
+func startHyWorker(_ o: Options) -> Task<HyLocalTranslator, Error> {
+    let root = o.hyWorker == nil || o.hyModel == nil ? repositoryRoot() : nil
+    guard let worker = o.hyWorker.map(URL.init(fileURLWithPath:)) ?? root.map(HyLocalSetup.worker(root:)),
+          FileManager.default.isExecutableFile(atPath: worker.path) else {
+        fail("Hy-SimulMT worker failed: no worker; build it with scripts/build_hy_local.sh or pass --hy-worker")
+    }
+    guard let model = o.hyModel.map(URL.init(fileURLWithPath:)) ?? root.flatMap(HyLocalSetup.model(root:)) else {
+        fail("Hy-SimulMT worker failed: no model; fetch hy-simulmt-30b-a3b-q4km-gguf or pass --hy-model")
+    }
+    let direction = o.direction.rawValue
+    log("starting Hy-SimulMT worker (\(model.lastPathComponent))")
+    return Task.detached { try await HyLocalTranslator(worker: worker, model: model, direction: direction) }
+}
+
+/// The clone worker command: explicit paths, or the research environment in the repository
+/// that contains this executable.
+func cloneWorkerCommand(_ o: Options) -> (URL, [String]) {
     let root = (o.cloneWorker == nil || (o.clonePython == nil && !o.cloneFake)) ? repositoryRoot() : nil
     guard let worker = o.cloneWorker ?? root?.appendingPathComponent("research/tts_worker.py").path else {
         fail("cannot find research/tts_worker.py; pass --clone-worker")
@@ -1579,6 +2091,9 @@ func cloneWorkerCommand(_ o: Options) -> (URL, [String]) {
         fail("no Python for the voice worker; run `uv sync --project research --locked` or pass --clone-python")
     }
     var arguments = [worker, "--model", o.cloneModel.rawValue]
+    if let transcriber = o.referenceTranscriber {
+        arguments += ["--reference-transcriber", transcriber, "--reference-locale", o.direction.source.speechLocaleIdentifier]
+    }
     if o.cloneFake { arguments.append("--fake") }
     if o.fluent, o.cloneModel == .qwen { arguments += ["--temperature", "0.6"] }
     if o.researchText { arguments.append("--research-text") }
@@ -1598,6 +2113,8 @@ func openTap(_ o: Options, timeout: Double = 20) throws -> TapSession {
             let processes = try AudioProcessList.current()
             let source = if let pid = o.tapPid {
                 try SourceResolver.resolve(pid: pid, processes: processes)
+            } else if o.tapGlobal {
+                SourceResolver.systemAudio(processes: processes)
             } else {
                 try SourceResolver.resolve(bundleID: o.tapBundle ?? "", processes: processes)
             }
@@ -1605,13 +2122,18 @@ func openTap(_ o: Options, timeout: Double = 20) throws -> TapSession {
             options.mute = o.captionsOnly ? .unmuted : (o.translationOnly ? .muted : .mutedWhenTapped)
             options.renderOutput = !o.captionsOnly
             options.translatedRingSeconds = translatedRingSeconds
-            // The live original bus is never delayed, and only --rendered-out reads the monitor.
-            options.maxDelayMs = 0
+            // The original bus is delayed only to follow a delayed picture (ADR-0012); only
+            // --rendered-out reads the monitor.
+            options.maxDelayMs = o.presentationDelayMs > 0 ? o.presentationDelayMs + 1_000 : 0
+            options.delayMs = o.presentationDelayMs
             options.renderedRingSeconds = o.renderedOut == nil ? 0 : 4
             options.name = "A2A Live"
             let session = try TapSession(source: source, options: options)
-            log("tapping \(source.bundleID) pids \(source.members.map { $0.process.pid }) at \(Int(session.sampleRate)) Hz, "
-                + "output \(session.outputDevice.name)")
+            log(source.global
+                ? "tapping the whole output mix at \(Int(session.sampleRate)) Hz, output \(session.outputDevice.name), "
+                    + "excluding our own pids \(source.excluded.map { $0.process.pid })"
+                : "tapping \(source.bundleID) pids \(source.members.map { $0.process.pid }) at \(Int(session.sampleRate)) Hz, "
+                    + "output \(session.outputDevice.name)")
             return session
         } catch where Date() < deadline {
             usleep(200_000)
@@ -1620,9 +2142,37 @@ func openTap(_ o: Options, timeout: Double = 20) throws -> TapSession {
 }
 
 let options = Options.parse(CommandLine.arguments)
+// The cloud key is sent once over the private control pipe, never in arguments,
+// environment, trace, or a file. Read it before starting the control reader.
+let cloudKey = options.qwenCloud ? readCloudKey() : nil
 let playbackControls = options.controlStdin ? PlaybackControls() : nil
-let clone = options.tts == "clone" ? await startCloneWorker(options) : nil
+// Hy-SimulMT on this Mac loads while the voice workers do. Both are ready before any tap
+// exists, so a failed load never leaves the source muted, and no span waits on a load.
+let hyLoad = options.mt == "hy-local" ? startHyWorker(options) : nil
+let clone: VoiceSynthesizer?
+if options.tts == "clone" {
+    let first = await startCloneWorker(options)
+    if options.dualClone {
+        let second = await startCloneWorker(options)
+        clone = DualCloneVoiceSynthesizer(first, second)
+    } else { clone = first }
+} else { clone = nil }
+let hyLocal: HyLocalTranslator?
+if let hyLoad {
+    do {
+        let hy = try await hyLoad.value
+        if let info = hy.info {
+            log("Hy-SimulMT worker ready: \(info.model), load \(String(format: "%.1f", info.loadSeconds)) s, "
+                + "warm-up \(String(format: "%.1f", info.warmupSeconds)) s"
+                + (info.streamsSpans || options.asr != "audio" ? "" : " (older worker: spans are sent once they close; rebuild with scripts/build_hy_local.sh)"))
+        }
+        hyLocal = hy
+    } catch {
+        fail("Hy-SimulMT worker failed: \(error)")
+    }
+} else { hyLocal = nil }
 do {
+    let cloud = try await (options.qwenCloud ? QwenCloudStream.connect(key: cloudKey ?? "", region: options.cloudRegion, direction: options.direction) : nil)
     let tap = options.isTap ? try openTap(options) : nil
     tapToRelease = tap
     let source = try Source(options: options, tap: tap)
@@ -1643,7 +2193,13 @@ do {
             signalSources.append(source)
         }
     }
-    let driver = try await Driver(options: options, tap: tap, clone: clone, playbackControls: playbackControls)
+    if let cloud, let tap {
+        defer { signalSources.forEach { $0.cancel() }; tap.teardown() }
+        try await cloud.run(tap: tap, source: source, controls: playbackControls, initialMode: options.playbackMode, direction: options.direction, tracePath: options.trace)
+        tap.teardown()
+        exit(0)
+    }
+    let driver = try await Driver(options: options, tap: tap, clone: clone, hyLocal: hyLocal, playbackControls: playbackControls)
     if let tap {
         defer { signalSources.forEach { $0.cancel() }; tap.teardown() }
         if source.stopRequested.withLock({ $0 }) {

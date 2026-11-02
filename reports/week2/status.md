@@ -1,5 +1,222 @@
 **Implementation status — 25 October 2026**
 
+2 November. Each line now takes its actor's time. A2A paced translated speech in one direction:
+a long take was sped up to 1.3×, a short one was played short and the rest of the actor's turn went
+by with nothing on the bus. dub-anything re-times every line to end where the actor stops and its
+listeners put that rhythm above the acting; we had neither the fix nor the number. With a picture
+delay each phrase already plays in its own slot, so a line that ends on its actor's last sound
+costs nothing — the phrase after it waits for its slot anyway. The reducer grants the permission
+(slots, real token timing, and the unit not yet late for its slot); the worker chooses the number
+(`estimated / target` clamped to [0.85, 1.3], a deficit under 0.25 s left alone), and
+`StreamingWSOLA` now stretches as well as compresses. `tts.request` carries `fill`,
+`tts.done.pace` can be below 1, and `a2a-pipeline --no-turn-fill` is the A/B control. The harness
+reports the reference's own vocabulary: `turn_dead_air_s`, `turn_overrun_s`, and a signed
+`turn_gap_s` per unit. On the deterministic 90 s replay (fake tone voice, three runs differing only
+in pacing): dead-air median 1.47 → 1.38 s, total 43.26 → 41.04 s, and 3 of 33 turns now land
+within 0.25 s of their actor against 0, with the same 33 lines in every run. The floor binds
+immediately at these take lengths, which is the point: a take's length is set by its **words**, so
+what is left is a length-controlled translation, not more stretching. No listener has heard the
+stretched takes. [ADR-0013](../../docs/adr/0013-turn-timing-fill.md),
+[the parity program](dub-parity.md) — the lever-by-lever comparison with dub-anything, including
+the two things we still do not do that its listeners notice most: per-line delivery conditioning
+and text written to the time available. Checks: `scripts/check.sh` ok (267 Swift tests, 123 harness
+tests).
+
+1 November, night. "Multiple speakers mostly get the first speaker's voice" is the speaker tracker, not voice
+routing. It fails three ways in the app's own traces, and this entry fixes one of them, so the fix is partial.
+
+What is fixed: the tracker kept at most 4 speakers and never gave a slot back.
+- On real video, music and effects took slots in the first minute. One session created S1–S4 within 30 s, and
+  nobody after them could be new; in another, two singletons held two slots.
+- A speaker heard in fewer than 4 segments, and silent for 30 s, now gives its slot to the next new voice.
+- IDs are never reused, because a freed ID may still name a pinned cloned voice (ADR-0009).
+
+Results, against CAM++ actor groups on two drama episodes:
+- On six 180 s slices, the voice changes at 0.57 of actor turns instead of 0.48, while the same-actor consistency
+  holds at 0.81 against 0.82.
+- On whole episodes, separation rose from 0.08 to 0.36 on ep08 and stayed flat on ep09 (0.43 to 0.44).
+- In one app-configuration replay:
+  - 7 voices played instead of 3;
+  - the voice changed at 4 of 5 actor turns instead of 2;
+  - one actor moved once, mid-scene, from a voice probably learned from another actor's line to his own;
+  - 2 lines were skipped waiting for a new voice;
+  - the first-chunk maximum worsened, from 1.6 s to 3.0 s, unexplained.
+- The calibration set is unchanged: the narrator stays one speaker, and the female/male dialogues get the same
+  labels.
+
+Not fixed, and the more common case:
+- the DSP features merge actors (one session stayed S1 for 184 s with 33 VAD stretches);
+- the energy VAD stays open under music.
+
+Measured and not adopted:
+- more slots, which cost consistency;
+- isolated vocals for the tracker;
+- updating a speaker only on close matches;
+- Qwen3-TTS's speaker encoder, at f 0.47–0.68 against 0.51–0.60 for tuned DSP.
+
+[Speaker slots, and what they do not fix](speaker-slots.md).
+
+1 November, evening. The whole-pipeline onset (3.52–3.54 s median on the paced dialogue replay) breaks down
+as follows:
+- 2.17 s of span (maximum 3 s);
+- 300 ms of VAD hangover on speech-end spans;
+- 331 ms of Hy after commit;
+- 260–281 ms to the first TTS chunk;
+- about 100 ms waiting for the second chunk.
+
+Three ideas that would not change what is said were measured, and none is adopted:
+- **Playback on the first chunk:** it never fired under the 0.24 s reserve. Without the reserve, 9% of 245
+  recorded streams would start with a gap. Reverted.
+- **Holding Hy back while TTS starts:** TTS was just as slow with Hy idle. Not built.
+- **Hy's tail turn during the hangover:** the drama fixture has 0.59 false pauses per real speech end at
+  140 ms, against a 160 ms ceiling on speech-end spans only. Deferred.
+
+What is left are product calls, both of which change the units:
+- the 3 s maximum span;
+- the 300 ms hangover.
+
+Using the new global tap also found a bug: with nothing playing, the tap gets no IO callbacks at all. A
+session started before the video therefore failed as "capture stalled". It is fixed with
+`ResolvedSource.mixIsIdle`, and the `--seconds` tail now ends by the clock. `TapSession` also refuses a global
+tap with an empty exclusion list. Checks: `scripts/check.sh` ok (252 Swift tests, 97 harness tests).
+[Where the 3.5 s goes](pipeline-latency.md).
+
+1 November, later yet: the app has no source list. It taps the machine's whole output mix —
+`CATapDescription(stereoGlobalTapButExcludeProcesses:)`, `--tap-global` on the pipeline, `--global` on
+`a2a-tapctl` — so whatever is playing gets translated, including an app started after us, and starting a
+session needs no choice. Choosing was also unanswerable: macOS tells a third-party process only that a client
+has an active output unit (`isRunningOutput` stayed true for WebKit with nothing playing and for `ffplay` 8 s
+after its clip ended). The failure mode of a global tap is answering your own translation, so the new
+`a2a-loopprobe` plays a 12.5 kHz tone into our own output bus and then through `afplay`: the control lands
+35 dB above the floor, ours sits 3 dB below it — `ok: our own output stays out of the global mix`
+(`raw/global-loopprobe.json`). Saved voices now share one `System audio` store, separated by voiceprint. Not
+closed: the mute behaviour of a global tap needs a listening pass (`.muted` now means every other process),
+and consent now covers everything the machine records. `--tap-bundle`/`--tap-pid` remain for the A1/A3 and
+harness tests. First bug, from using it: every session failed at once with "source app exited", because the
+driver's health check read `members.allSatisfy { … }` and a global source names no members — vacuously true.
+Now `ResolvedSource.processesAllExited()`, answered "not gone" for a global or empty list, with a test on all
+four cases; for the whole mix the real signals are a 2 s capture stall and an output-device change, and
+silence is neither. [The system's output is the source](system-audio-source.md).
+
+1 November, later still: a Hy-SimulMT turn is now one batch instead of three. `mtmd`'s helper evaluated the
+text before the audio, the audio and the assistant header as three separate passes, and each pass re-reads
+this 30B MoE's active weights, so the turn's prompt now goes to `llama_process` once as a mixed
+token/embedding batch (identical positions, mask and logits point; falls back to the helper for M-RoPE,
+non-causal or over-`n_batch` turns). Idle that is 5–7% off the span and 12–52 ms off the wait after commit;
+with a Qwen3-TTS worker generating in another process — the sharing the live app really runs in — it is 9%
+off the span (1270 → 1161 ms median) and 155 ms off the worst span. Content is unchanged: 10 of 10 spans
+identical on one region, 7 of 10 on another where three spans picked a different near-equal token
+("customers"/"guests", "yet dared"/"yet she dared") — merging three passes into one changes the reduction
+order, so greedy sampling can flip a near tie; `--no-merge-prompt` restores the old tokens exactly, and the
+dev-set metric pass is still owed before this is called quality-neutral. Measured and
+rejected with their numbers: `--kv q8_0` (slower *and* different text), `--no-kv-unified`, `--flash-attn`,
+`--mlock`, extra tower and CPU threads, and going straight to ST at flush (7 of 10 spans close on a turn
+that answers text, which ST would then deliver later). New dev tools: `scripts/bench_hy_local.sh` (old vs new,
+idle and under TTS load, hash on every line) and `research/tts_bench.py` (clone-TTS prepare 10–13 ms, first
+chunk 202–216 ms, RTF 0.34–0.44; its profile keeps the pinned-loop `mx.compile` question answerable).
+[One batch per turn](inference-latency.md).
+
+1 November, later: local Hy-SimulMT now hears each span while it is spoken, so a committed span
+waits only for its last turn. Both task prompts also stay resident in the KV cache, which removes
+about 200 ms of prompt prefill from every new conversation and every ST fallback. On a paced replay
+in the live app configuration (synthetic two-speaker dialogue, dual Qwen clone), median Hy time
+after commit went from 857 to 340 ms. Median, p90 and maximum onset went from 4.23 / 4.70 / 4.91 s
+to 3.50 / 3.74 / 3.84 s, and one more unit played (24 of 28), with underruns unchanged. Streamed
+and whole spans give identical text: the worker's 48 kHz resampler is now exact under streaming
+(`hy-worker --self-test`). Resident prompts flipped 2 of 25 spans at a near-tie in one fixture.
+New: `--no-hy-stream`, worker protocol 2 (`discard`, `flush_ms`), `hy-worker --stream-ms N`, and
+`mt.result` `worker_ms`/`worker_turns`/`worker_st`. Checks passed: 244 Swift tests executed, 97
+harness tests, manifest and SDK gates, app build and synthetic smoke. One live tap of the same clip
+gave 318 ms median Hy and 3.58 s median onset, with no capture overflow or underruns.
+[Streaming source audio into Hy-SimulMT](hy-streaming-input.md).
+
+1 November update: the three failure modes behind the lines lost in the last live sessions are
+fixed. Unlabeled speech now inherits the speaker it continues — with no pause since the last label,
+or as a brief reply just after one — which on three 3-minute drama excerpts voices 35 of the 44
+pieces the tracker left unlabeled (78% → 95% of committed pieces) with 0 identity conflicts against
+the tracker's own labels; the review's no-pause rule alone recovered 9. The cloned voice is capped by
+the characters it has to speak (pace floor 3.2 Han / 11 English characters per second instead of
+1.6× slack on an estimate), and a line that hits the cap reports `truncated`. An over-long
+translation is now cut to the time its source audio took — clause boundary, then word boundary,
+never on a dangling function word, never splitting a Han word when the system segmenter is available
+— and an empty or filler answer to music or a pause is `silence`, not a failed translation: no error,
+no fallback, no context entry. New knobs: `--speaker-carry`, `--speaker-carry-pause`,
+`--speaker-carry-piece`, `--no-shorten`, `--no-filler-silence`; new trace fields `speaker_carried`,
+`shortened`/`mt_chars`, `mt.result.silence`, `tts.done.truncated`, and the `silence` source
+disposition. Checks passed: 230 Swift tests executed, 97 harness tests, manifest and SDK gates. The live A/B
+still needs the Hy-SimulMT server: the configured address now answers as a different service with no
+`v1/audio/translations` route, and the adapter now reports that as an HTTP status instead of a
+vague invalid-response error. [Recovering the lines three live sessions lost](live-session-recovery.md).
+
+31 October update: the commit policy now closes a stable, un-finalized unit at its last safe
+clause boundary once that unit covers more than 4 s of source speech (`length_clause`,
+`--max-unit-seconds`), and late recognizer punctuation no longer shifts the frontier and speaks
+committed words a second time. On a new synthetic long-utterance fixture (`synth
+--utterance-sentences`) the plan's default budgets went from 9 played units and 0.730 coverage
+to 12 and 0.907, skipped-by-catch-up from 5 to 2, and maximum onset lag from 6.14 s to 4.88 s;
+in the app configuration median onset lag went from 5.21 s to 3.51 s. The short-sentence fixture
+is unchanged. Replaying the reviewed scene's recorded recognizer stream (404 real partials and
+finals) through the policy moved plan-default coverage from 0.722 to 0.916 and p90 onset lag from
+9.80 s to 8.94 s, and in the app configuration from 0.905 to 0.979 and 11.94 s to 8.16 s, with
+nothing spoken twice. That replay also caught cuts landing inside Mandarin words; a host-injected
+`WordSegmenter` (Apple `NLTokenizer`) now keeps them out — 2 of 33 unit boundaries inside a word,
+then 0. What remains unmeasured is translation adequacy for the shorter fragments and cloned-voice
+quality. [Length-clause commits](length-clause-commits.md).
+
+Latest local update: cloned sessions now pin each speaker's first prepared reference,
+isolate conditioning caches, and reset Qwen sampling per voice (ADR-0009). Matched
+A/B/A/B model samples reproduced exactly when an actor returned. An actual live tap
+kept S1 and S2 on version 1 throughout, completed 11/13 phrases (91.1% by committed
+source duration), and had no underruns, PCM drops or capture overflow. Median/max
+rendered onset delay was 5.61/9.75 s with separated background. One phrase was skipped
+for catch-up and an unlabeled shout was skipped instead of borrowing a voice. Three
+annotated actors still map to two tracker identities; full actor consistency is not
+solved. See [voice consistency](../../research/live_dub_lab/VOICE-CONSISTENCY.md).
+Checks passed: 190 Swift tests executed, 86 harness tests, eight lab tests, SDK/manifest
+gates, optimized app build and synthetic startup smoke. Two Apple runtime tests remain
+explicitly skipped; the real model/tap runs above are separate interactive evidence.
+
+Earlier soundtrack update: after the user rejected the long delay and missing soundtrack,
+the app defaults to streaming speech with adaptive buffering and 8 s / 8 s debt/lag
+budgets, plus an experimental separated music/effects bus (ADR-0008). The selected
+actual tap run completed 12/13 commits at 4.87 s median / 6.29 s maximum rendered
+onset delay, with no underruns or capture overflow. One phrase was skipped. Local
+Mandarin ASR found no words in the background track, which is not a listener verdict
+on residual voices. See [soundtrack and delay](../../research/live_dub_lab/SOUNDTRACK-AND-DELAY.md).
+Checks passed: 183 Swift tests executed, 83 harness tests, eight lab tests, SDK/manifest
+gates, optimized app build and synthetic startup smoke.
+
+27 October follow-up: the dub-anything review branch is integrated locally, and
+the app exposes optional terminology and pronunciation files. OmniVoice profile
+setup and reference-based pacing were improved, but a 37-second file-paced run
+still played only 7 of 14 committed units at 8.98 s median onset lag. A shorter
+forced-commit experiment reduced maximum lag but also reduced coverage and is not
+the default. Matched samples, scope and verification are in
+[near-realtime-dub-comparison.md](near-realtime-dub-comparison.md).
+
+27 October continued experiments: Qwen now prepares codec/text/speaker conditioning
+without synthesizing a throwaway sentence for every profile. Four matched pairs had
+identical durations and waveform correlation above 0.9999998; direct preparation took
+0.010–0.199 s versus 2.187–3.423 s with the warmup (shared caches, alternating order).
+The clause policy also keeps `只不过` together. Optional `--adaptive-prebuffer` and an
+8-step OmniVoice lab worker were tested under changing GPU contention; neither is an
+app default. Metrics now distinguish started from completed playback, and corrected
+timeline previews retain actual silence and delayed final speech. Details and limits:
+[live lab progress](../../research/live_dub_lab/PROGRESS-2026-10-27.md). Full checks pass:
+176 Swift tests executed, 83 harness tests, five lab tests, SDK/manifest gates, optimized
+app build and synthetic app smoke. Dub-quality live playback remains unachieved.
+
+Quality-first follow-up: the app now defaults to complete-phrase playback with a bounded
+20-second debt/lag budget (ADR-0007). An actual private process tap of the synchronized
+test player completed 13/13 committed units, with no underruns or capture overflow,
+at 16.17 s median onset delay on the selected AirPods output. This establishes live
+capture/playback completeness for one scene, not semantic accuracy or dub quality.
+Contextual local MT was researched with preceding source context and explicit dev-set
+ASR corrections, but its loaded live startup attempt timed out and it remains an
+explicit CLI research option. Details: [quality-first report](../../research/live_dub_lab/QUALITY-FIRST.md).
+Final checks: 180 Swift tests executed, 83 harness tests, eight lab tests, SDK/manifest
+gates, optimized app build and synthetic startup smoke passed.
+
 This page tracks the [implementation plan](../../IMPLEMENTATION_PLAN.md), revision 2.1. A ticket counts as **done** only when its verification command passes on this Mac. **Partial** means the code exists and its deterministic parts are tested, but the DoD needs hardware, permission, weights, or people. **Pending** means not started or blocked. Runtime evidence is in [verifications.md](verifications.md).
 
 The current suites contain 169 deterministic Swift tests and 74 harness tests, plus the manifest and executable SDK-stamp gates. Two Apple model runtime tests are skipped unless `A2A_RUN_APPLE_TESTS=1` is explicitly set. The playback-switch change passes the Swift suite, SDK/manifest checks, and its two rendered-audio/control tests. The quick harness run has 33 passes and six local-server setup errors in this sandbox; native window verification is also blocked here. See [playback-switch.md](playback-switch.md) for exact evidence and limits. Full real-model/capture workflows were not repeated.
@@ -68,4 +285,5 @@ Known gaps found by these runs: in file mode, the recognizer produced a one-word
 1. A3: output-loopback check of a private muted tap after `kill -9` (built-in mic and speakers, or a loopback device), plus supervised device-change, sleep/wake, and permission cases. Takeover stays blocked until it passes. A2: loopback latency (≤60 ms) with wired headphones and a cable.
 2. M4: clause-level commits and TTS pacing so the plan's default 3 s / 4 s thresholds hold on real sentences (the live demo fails 2 of 6 sentences with them today). The VAD evidence guard is now implemented and deterministically tested; it still needs runtime qualification.
 3. T0.2/T0.3: pin speech-swift and the first MLX MT/TTS pair in the manifest (verifier plus evidence), add the selected packages, and build the XPC target for the MLX worker probe (ADR-0002). The SwiftUI app shell now exists; the cloning adapter and worker do not. See model-capabilities.md for the pinned source audit.
-4. T0.4 consent and recording, which has the longest lead time.
+4. Dev-set metrics with and without `hy-worker --no-merge-prompt` (COMET plus onset and underruns) to bless the single-batch turn as quality-neutral, or revert it. See [inference-latency.md](inference-latency.md).
+5. T0.4 consent and recording, which has the longest lead time.

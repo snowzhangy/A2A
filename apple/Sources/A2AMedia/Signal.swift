@@ -15,8 +15,6 @@ public enum Signal {
 
     public static func dbfs(_ rms: Float) -> Float { rms > 0 ? 20 * log10(rms) : -.infinity }
 
-    public static func peak(_ x: [Float]) -> Float { x.reduce(0) { max($0, abs($1)) } }
-
     /// Pearson correlation of equal-length slices.
     public static func correlation(_ a: ArraySlice<Float>, _ b: ArraySlice<Float>) -> Double {
         let n = min(a.count, b.count)
@@ -121,7 +119,9 @@ public enum TestSignal {
         return (0..<n).map { Float(sin(2 * .pi * frequency * Double($0) / Double(sampleRate))) * amplitude }
     }
 
-    /// Short clicks every `interval` seconds for loopback latency measurement.
+    /// Short clicks every `interval` seconds for loopback latency measurement. No caller yet:
+    /// this is the instrument A2 still owes ("physical loopback or click-track latency
+    /// measurement, ≤ 60 ms", reports/week2/status.md and IMPLEMENTATION_PLAN.md §A2).
     public static func clickTrack(sampleRate: Int, seconds: Double, interval: Double, amplitude: Float = 0.8) -> [Float] {
         var out = [Float](repeating: 0, count: Int(Double(sampleRate) * seconds))
         let step = Int(Double(sampleRate) * interval)

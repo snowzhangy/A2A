@@ -62,10 +62,22 @@ public protocol VoiceSynthesizer: Sendable {
     /// v0 sends one complete committed unit; PCM arrives as it is generated.
     func synthesize(unit: UnitID, text: String, voice: PreparedVoice) -> AsyncThrowingStream<SynthesizedAudio, Error>
     func synthesize(unit: UnitID, text: String, voice: PreparedVoice, targetSeconds: Double?) -> AsyncThrowingStream<SynthesizedAudio, Error>
+    /// `targetSeconds` is the source speech this text translates. `allowFill` says the host
+    /// plays each phrase in its own slot (ADR-0013), so a take shorter than that speech may be
+    /// slowed to end with the actor instead of leaving the tail of their turn silent. A host
+    /// that plays as soon as audio is ready must pass false: there a short take is saved
+    /// latency, and slowing it would push every later phrase back.
+    func synthesize(unit: UnitID, text: String, voice: PreparedVoice,
+                    targetSeconds: Double?, allowFill: Bool) -> AsyncThrowingStream<SynthesizedAudio, Error>
 }
 
 extension VoiceSynthesizer {
     public func synthesize(unit: UnitID, text: String, voice: PreparedVoice, targetSeconds: Double?) -> AsyncThrowingStream<SynthesizedAudio, Error> {
         synthesize(unit: unit, text: text, voice: voice)
+    }
+
+    public func synthesize(unit: UnitID, text: String, voice: PreparedVoice,
+                           targetSeconds: Double?, allowFill: Bool) -> AsyncThrowingStream<SynthesizedAudio, Error> {
+        synthesize(unit: unit, text: text, voice: voice, targetSeconds: targetSeconds)
     }
 }

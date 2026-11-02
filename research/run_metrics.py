@@ -26,12 +26,14 @@ def pct(values: list[float], q: float) -> float | None:
 
 
 def summarize(run: str) -> dict:
-    events = [json.loads(line) for line in open(f"{run}/trace.jsonl")]
+    with open(f"{run}/trace.jsonl") as source:
+        events = [json.loads(line) for line in source]
     by = collections.defaultdict(dict)
     for e in events:
         if "unit" in e and e["ev"] in ("commit.source", "tts.request", "tts.first_chunk", "play.start", "play.end"):
             by[e["ev"]][e["unit"]] = e
     commits, play = by["commit.source"], by["play.start"]
+    completed = by["play.end"]
     english = collections.Counter()
     for e in events:
         if e["ev"] in ("tts.first_chunk", "tts.chunk"):
@@ -56,7 +58,9 @@ def summarize(run: str) -> dict:
         "run": run,
         "units": len(commits),
         "played": len(play),
+        "completed": len(completed),
         "coverage_by_source_seconds": round(sum(seconds(commits[u]) for u in play if u in commits) / source_total, 3),
+        "completed_coverage_by_source_seconds": round(sum(seconds(commits[u]) for u in completed if u in commits) / source_total, 3),
         "lag_onset_s": {"median": round(statistics.median(lags), 2) if lags else None, "p90": pct(lags, 0.9),
                         "max": round(max(lags), 2) if lags else None},
         "tts_first_chunk_s": {"median": round(statistics.median(first), 3) if first else None, "max": pct(first, 1.0)},
@@ -69,6 +73,10 @@ def summarize(run: str) -> dict:
         "fallbacks": dict(collections.Counter(e["reason"] for e in events if e["ev"] == "fallback.enter")),
         "pacing": {"units": len(done), "pace_median": round(statistics.median(paces), 3) if paces else None,
                    "at_cap": sum(p >= 1.299 for p in paces),
+                   # A take slower than the model's own pace was filled out to the actor's end.
+                   "filled": sum(p <= 0.999 for p in paces),
+                   "fill_median": round(statistics.median([p for p in paces if p <= 0.999]), 3)
+                   if any(p <= 0.999 for p in paces) else None,
                    "native_over_target_median": round(statistics.median(native_over_target), 2) if native_over_target else None,
                    "native_over_target_p90": pct(native_over_target, 0.9)},
     }

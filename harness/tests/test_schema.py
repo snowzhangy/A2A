@@ -37,6 +37,18 @@ def test_plan_examples_validate():
     assert report.ok, report.errors
 
 
+def test_target_can_wait_for_a_speaker_without_claiming_the_previous_actor():
+    event = dict(v=0, t_ns=1, session="s", epoch=1, gen=1, ev="commit.target",
+                 unit="u1", span=[0, 48_000], speaker_pending=True)
+    assert trace.validate([event]).ok
+    event["speaker_pending"] = False
+    assert not trace.validate([event]).ok
+    del event["speaker_pending"]
+    assert not trace.validate([event]).ok
+    event["spk"] = "S1"
+    assert trace.validate([event]).ok
+
+
 @pytest.mark.parametrize("path", GOLDEN, ids=[p.stem for p in GOLDEN])
 def test_swift_golden_traces_validate(path):
     assert GOLDEN, "no golden traces found"

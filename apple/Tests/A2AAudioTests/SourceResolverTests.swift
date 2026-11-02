@@ -67,6 +67,58 @@ private func proc(_ id: AudioObjectID, pid: pid_t, bundle: String, path: String,
         let list = try AudioProcessList.current()
         #expect(list.allSatisfy { $0.pid > 0 })
     }
+
+    @Test func systemAudioHearsEverythingButOurOwnOutput() {
+        let selfApp = proc(14, pid: 400, bundle: "dev.a2a.app", path: "/Applications/A2A.app/Contents/MacOS/A2A")
+        let selfHelper = proc(15, pid: 401, bundle: "dev.a2a.pipeline",
+                              path: "/Applications/A2A.app/Contents/Helpers/a2a-pipeline")
+        let source = SourceResolver.systemAudio(processes: [zoom, zoomHelper, other, me, selfApp, selfHelper],
+                                                selfPID: 400, selfBundleRoot: "/Applications/A2A.app")
+        #expect(source.global)
+        // A global tap names nothing it includes — that is the point: no app has to be chosen.
+        #expect(source.objectIDs.isEmpty)
+        #expect(Set(source.excluded.map { $0.process.pid }) == [400, 401])
+    }
+
+    @Test func globalTapDescriptionCarriesTheExclusionList() {
+        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [401])
+        #expect(description.isMixdown && !description.isMono)
+        #expect((description.processes as? [Any])?.count == 1)  // the processes it leaves out
+    }
+
+    @Test func onlyANamedSourceCanExit() {
+        let dead: (pid_t) -> Bool = { _ in true }
+        let alive: (pid_t) -> Bool = { _ in false }
+        let app = try! SourceResolver.resolve(bundleID: "us.zoom.xos", processes: [zoom, other], selfPID: 300)
+        #expect(app.processesAllExited(liveness: dead))
+        #expect(!app.processesAllExited(liveness: alive))
+        // The whole mix names no process, so it is never "gone": whoever plays may come and go.
+        let mix = SourceResolver.systemAudio(processes: [zoom, other], selfPID: 300, selfBundleRoot: nil)
+        #expect(!mix.processesAllExited(liveness: dead))
+    }
+
+    @Test func onlyAGlobalTapWithNothingPlayingIsIdle() {
+        // A global tap has no callbacks until something plays: a quiet machine is not a stalled capture.
+        let quiet = proc(16, pid: 500, bundle: "com.apple.Music", path: "/System/Applications/Music.app/Contents/MacOS/Music",
+                         output: false)
+        let selfHelper = proc(15, pid: 401, bundle: "dev.a2a.pipeline",
+                              path: "/Applications/A2A.app/Contents/Helpers/a2a-pipeline")
+        let mix = SourceResolver.systemAudio(processes: [quiet], selfPID: 400, selfBundleRoot: "/Applications/A2A.app")
+        #expect(mix.mixIsIdle(processes: [quiet], selfPID: 400, selfBundleRoot: "/Applications/A2A.app"))
+        // Our own output does not count: the tap leaves it out, so it can never deliver frames.
+        #expect(mix.mixIsIdle(processes: [quiet, selfHelper], selfPID: 400, selfBundleRoot: "/Applications/A2A.app"))
+        // Someone else playing with no frames arriving is a stall.
+        #expect(!mix.mixIsIdle(processes: [quiet, other], selfPID: 400, selfBundleRoot: "/Applications/A2A.app"))
+        // A process tap is never idle in this sense.
+        let app = try! SourceResolver.resolve(bundleID: "us.zoom.xos", processes: [zoom, other], selfPID: 300)
+        #expect(!app.mixIsIdle(processes: [], selfPID: 300, selfBundleRoot: nil))
+    }
+
+    @Test func ownAppRootWalksUpFromTheHelper() {
+        // The app's helper runs from Contents/Helpers, where Bundle.main is not the app bundle itself.
+        #expect(SourceResolver.ownAppRoot("/Applications/A2A.app/Contents/Helpers/a2a-pipeline") == "/Applications/A2A.app")
+        #expect(SourceResolver.ownAppRoot("/Users/me/bin/a2a-pipeline") == nil)
+    }
 }
 
 @Suite struct IOProcAdapterTests {

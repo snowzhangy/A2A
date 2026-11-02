@@ -3,6 +3,7 @@
 import A2ACore
 import A2AMedia
 import A2AModels
+import A2ALegacyModels
 import Foundation
 
 func fail(_ message: String) -> Never {
@@ -10,7 +11,7 @@ func fail(_ message: String) -> Never {
     exit(2)
 }
 let args = CommandLine.arguments
-guard args.count > 1 else { fail("pass asr, mt, tts, resample, or speakers with --input FILE --out DIR") }
+guard args.count > 1 else { fail("pass asr, mt, tts, resample, speakers, or background with --input FILE --out DIR") }
 let stage = args[1]
 func value(_ flag: String) -> String? {
     args.firstIndex(of: flag).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
@@ -41,6 +42,18 @@ func elapsedMs(_ begin: ContinuousClock.Instant) -> Double {
 
 do {
     switch stage {
+    case "background":
+        let wav = try WAV.read(inputURL)
+        let samples = StreamingResampler.resample(wav.mono(), from: wav.sampleRate, to: 48_000)
+        let separator = try BackgroundSeparator()
+        let writer = try WAVStreamWriter(url: outURL.appendingPathComponent("background.wav"), sampleRate: 48_000, channels: 1)
+        for offset in stride(from: 0, to: samples.count, by: 960) {
+            writer.append(try separator.process(Array(samples[offset..<min(samples.count, offset + 960)])))
+        }
+        try writer.close()
+        try writeJSON(["stage": stage, "frames": samples.count, "sample_rate": 48_000,
+                       "elapsed_ms": elapsedMs(started), "scope": "causal 20ms blocks; no device playback"])
+        print("{\"stage\":\"background\",\"frames\":\(samples.count)}")
     case "asr":
         let chunkMs = Int(value("--chunk-ms") ?? "20") ?? 20
         guard (10...100).contains(chunkMs) else { fail("--chunk-ms must be 10...100") }
@@ -174,22 +187,78 @@ do {
         if let v = value("--confirmed-distance").flatMap(Double.init) { config.confirmedDistance = v }
         if let v = value("--min-new-frames").flatMap(Int.init) { config.minNewSpeakerFrames = v }
         if let v = value("--candidate-seconds").flatMap(Double.init) { config.candidateSamples = Int64(v * 48_000) }
+        if let v = value("--max-speakers").flatMap(Int.init) { config.maxSpeakers = v }
+        if let v = value("--stale-segments").flatMap(Int.init) { config.staleSegments = v }
         var tracker = VoiceprintSpeakerTracker(config: config)
+        // Attribution as the reducer sees it: the direct-audio pieces a live session commits,
+        // and which of them get a voice at all. `carry` counts the pieces fix 1 recovers —
+        // unlabeled pieces inside a stretch the tracker already labeled (no pause since).
+        var segments = AudioSegmentPolicy()
+        let carrySeconds = value("--speaker-carry").flatMap(Double.init) ?? 6
+        let carryAfterPause = value("--speaker-carry-after-pause").flatMap(Double.init) ?? 3
+        let carryMaxPiece = value("--speaker-carry-max-piece").flatMap(Double.init) ?? 1
+        var lastLabelEnd: Int64?
+        var lastLabelSpeaker: SpeakerID?
+        var lastPause: Int64?
+        var pieceRows: [[String: Any]] = []
         var rows: [[String: Any]] = []
+        var labelSpans: [(speaker: SpeakerID, start: Int64, end: Int64)] = []
+        // Identity check: for a piece the tracker did label, would the carry have named a
+        // different actor? Each conflict is a line the carry could voice with the wrong voice.
+        var carryConflicts = 0
         let wall = ContinuousClock.now
         for offset in stride(from: 0, to: samples.count, by: 960) {
             let end = min(offset + 960, samples.count)
             let frame = AudioFrame16k(span: SourceSpan(start: Int64(offset), end: Int64(end)),
                                       samples: resampler.process(Array(samples[offset..<end])))
-            for event in tracker.process(frame, vad: vad.process(frame)) {
+            let vadEvents = vad.process(frame)
+            for event in vadEvents {
+                if case .speechEnd(let s) = event { lastPause = max(lastPause ?? 0, s) }
+            }
+            for event in tracker.process(frame, vad: vadEvents) {
                 guard case .assign(let speaker, let span) = event else { continue }
+                if lastLabelEnd == nil || span.end >= lastLabelEnd! { (lastLabelSpeaker, lastLabelEnd) = (speaker, span.end) }
+                labelSpans.append((speaker, span.start, span.end))
                 rows.append(["speaker": speaker.rawValue, "start_s": Double(span.start) / 48_000, "end_s": Double(span.end) / 48_000])
+            }
+            for piece in segments.process(events: vadEvents, frontier: frame.span.end) {
+                let covered = labelSpans.reduce(Int64(0)) { total, label in
+                    total + max(0, min(label.end, piece.end) - max(label.start, piece.start))
+                }
+                let labeled = Double(covered) / Double(max(1, piece.count)) > 0.5
+                var carried = false
+                if let end = lastLabelEnd, let who = lastLabelSpeaker, piece.start >= end {
+                    let gap = Double(piece.start - end) / 48_000
+                    let pauseBefore = lastPause != nil && lastPause! >= end
+                    if !pauseBefore, gap <= carrySeconds { carried = true }
+                    if pauseBefore, Double(piece.count) / 48_000 <= carryMaxPiece, gap <= carryAfterPause { carried = true }
+                    if labeled, carried,
+                       let own = labelSpans.filter({ $0.start < piece.end && $0.end > piece.start })
+                           .max(by: { min($0.end, piece.end) - max($0.start, piece.start)
+                               < min($1.end, piece.end) - max($1.start, piece.start) }),
+                       own.speaker != who { carryConflicts += 1 }
+                }
+                var row: [String: Any] = ["start_s": Double(piece.start) / 48_000, "end_s": Double(piece.end) / 48_000,
+                                          "labeled": labeled, "carried": carried]
+                if carried, let who = lastLabelSpeaker { row["carried_speaker"] = who.rawValue }
+                pieceRows.append(row)
             }
         }
         let counts = Dictionary(grouping: rows, by: { $0["speaker"] as! String }).mapValues(\.count)
+        let labeledPieces = pieceRows.filter { $0["labeled"] as! Bool }.count
+        let carriedPieces = pieceRows.filter { $0["carried"] as! Bool }.count
         try writeJSON(["stage": stage, "segments": rows, "speakers": counts, "processing_ms": elapsedMs(wall),
-                       "source_seconds": Double(samples.count) / 48_000])
-        print("{\"stage\":\"speakers\",\"labels\":\"\(rows.map { ($0["speaker"] as! String).dropFirst() }.joined())\",\"processing_ms\":\(Int(elapsedMs(wall)))}")
+                       "source_seconds": Double(samples.count) / 48_000,
+                       "pieces": pieceRows.count, "pieces_labeled": labeledPieces,
+                       "pieces_carried": carriedPieces, "speaker_carry_seconds": carrySeconds,
+                       "speaker_carry_after_pause_seconds": carryAfterPause,
+                       "speaker_carry_max_piece_seconds": carryMaxPiece,
+                       "carry_conflicts": carryConflicts,
+                       "pieces_unvoiced": pieceRows.count - labeledPieces - carriedPieces, "piece_rows": pieceRows])
+        print("{\"stage\":\"speakers\",\"labels\":\"\(rows.map { ($0["speaker"] as! String).dropFirst() }.joined())\","
+              + "\"pieces\":\(pieceRows.count),\"labeled\":\(labeledPieces),\"carried\":\(carriedPieces),"
+              + "\"conflicts\":\(carryConflicts),"
+              + "\"unvoiced\":\(pieceRows.count - labeledPieces - carriedPieces),\"processing_ms\":\(Int(elapsedMs(wall)))}")
     default: fail("unknown stage \(stage)")
     }
 } catch { fail(String(describing: error)) }

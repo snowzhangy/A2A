@@ -1,4 +1,5 @@
-// Capture branch and two-bus output mixer. Runs on the Core Audio IOProc thread.
+// Capture branch and original/translated mixer with an optional separated background bus.
+// Runs on the Core Audio IOProc thread.
 //
 // Control → RT commands travel through single 64-bit atomics (gains, delay) or
 // request/acknowledge counters (flush), so the render thread never waits.
@@ -20,6 +21,15 @@ struct a2a_engine {
     a2a_engine_config cfg;
     a2a_ring *capture;
     a2a_ring *translated;
+    a2a_ring *background;
+    float *scratch_background;
+    _Atomic uint64_t background_cmd;
+    uint64_t background_seq;
+    float gain_b, target_b, step_b;
+    uint32_t ramp_b;
+    bool background_active;
+    uint32_t background_fade, background_hold;
+    float background_last, background_tail;
     a2a_ring *rendered;
     a2a_record_ring *records;
 
@@ -61,6 +71,7 @@ struct a2a_engine {
     // RT → observers.
     _Atomic uint32_t gain_o_bits;
     _Atomic uint32_t gain_t_bits;
+    _Atomic uint32_t gain_b_bits;
     _Atomic uint64_t callbacks;
     _Atomic uint64_t captured;
     _Atomic uint64_t output;
@@ -115,6 +126,7 @@ a2a_engine *a2a_engine_create(const a2a_engine_config *config) {
     e->gain_o = e->target_o = 1.0f;
     e->gain_t = e->target_t = 0.0f;
     atomic_init(&e->gain_cmd, 0);
+    atomic_init(&e->background_cmd, 0);
     atomic_init(&e->delay_target, 0);
     atomic_init(&e->flush_to, 0);
     atomic_init(&e->flush_requests, 0);
@@ -122,6 +134,7 @@ a2a_engine *a2a_engine_create(const a2a_engine_config *config) {
     atomic_init(&e->capture_rendered, false);
     atomic_init(&e->gain_o_bits, float_bits(1.0f));
     atomic_init(&e->gain_t_bits, float_bits(0.0f));
+    atomic_init(&e->gain_b_bits, float_bits(0.0f));
     a2a_time_init();
     return e;
 }
@@ -130,6 +143,8 @@ void a2a_engine_destroy(a2a_engine *e) {
     if (!e) return;
     a2a_ring_destroy(e->capture);
     a2a_ring_destroy(e->translated);
+    a2a_ring_destroy(e->background);
+    free(e->scratch_background);
     a2a_ring_destroy(e->rendered);
     a2a_record_ring_destroy(e->records);
     free(e->delay);
@@ -143,6 +158,17 @@ void a2a_engine_destroy(a2a_engine *e) {
 
 a2a_ring *a2a_engine_capture_ring(a2a_engine *e) { return e->capture; }
 a2a_ring *a2a_engine_translated_ring(a2a_engine *e) { return e->translated; }
+a2a_ring *a2a_engine_background_ring(a2a_engine *e) { return e->background; }
+bool a2a_engine_enable_background(a2a_engine *e, uint32_t capacity) {
+    if (!e || !capacity || e->background || atomic_load_explicit(&e->callbacks, memory_order_relaxed)) return false;
+    a2a_ring *ring = a2a_ring_create(capacity, 1);
+    float *scratch = a2a_prefaulted_calloc(e->cfg.max_block_frames, sizeof(float));
+    if (!ring || !scratch) { a2a_ring_destroy(ring); free(scratch); return false; }
+    e->background = ring;
+    e->scratch_background = scratch;
+    e->background_fade = e->cfg.fade_frames;
+    return true;
+}
 a2a_ring *a2a_engine_rendered_ring(a2a_engine *e) { return e->rendered; }
 a2a_record_ring *a2a_engine_records(a2a_engine *e) { return e->records; }
 
@@ -180,6 +206,15 @@ void a2a_engine_set_gains(a2a_engine *e, float original, float translated, uint3
     atomic_store_explicit(&e->gain_cmd, cmd, memory_order_release);
 }
 
+void a2a_engine_set_background_gain(a2a_engine *e, float gain, uint32_t ramp_frames) {
+    uint64_t previous = atomic_load_explicit(&e->background_cmd, memory_order_relaxed);
+    uint64_t seq = ((previous >> 56) + 1) & 0xFF;
+    if (!seq) seq = 1;
+    if (ramp_frames > 0xFFFFFF) ramp_frames = 0xFFFFFF;
+    atomic_store_explicit(&e->background_cmd, (seq << 56) | ((uint64_t)ramp_frames << 32)
+        | gain_fixed(gain), memory_order_release);
+}
+
 void a2a_engine_flush_translated(a2a_engine *e) {
     // Only what is queued now is discarded. The position only grows, so a render thread that
     // sees a newer position than the request it acknowledges still discards nothing newer.
@@ -192,6 +227,9 @@ float a2a_engine_current_original_gain(const a2a_engine *e) {
 }
 float a2a_engine_current_translated_gain(const a2a_engine *e) {
     return bits_float(atomic_load_explicit(&((a2a_engine *)e)->gain_t_bits, memory_order_relaxed));
+}
+float a2a_engine_current_background_gain(const a2a_engine *e) {
+    return bits_float(atomic_load_explicit(&((a2a_engine *)e)->gain_b_bits, memory_order_relaxed));
 }
 #define LOAD64(field) atomic_load_explicit(&((a2a_engine *)e)->field, memory_order_relaxed)
 uint64_t a2a_engine_callbacks(const a2a_engine *e) { return LOAD64(callbacks); }
@@ -251,6 +289,14 @@ static void shape_translated(a2a_engine *e, uint32_t got, uint32_t frames) {
 }
 
 static void apply_commands(a2a_engine *e) {
+    uint64_t bg = atomic_load_explicit(&e->background_cmd, memory_order_acquire);
+    if ((bg >> 56) && (bg >> 56) != e->background_seq) {
+        e->background_seq = bg >> 56;
+        e->target_b = (float)(bg & 0xFFFF) / GAIN_SCALE;
+        e->ramp_b = (uint32_t)((bg >> 32) & 0xFFFFFF);
+        if (e->ramp_b) e->step_b = (e->target_b - e->gain_b) / (float)e->ramp_b;
+        else e->gain_b = e->target_b;
+    }
     uint64_t cmd = atomic_load_explicit(&e->gain_cmd, memory_order_acquire);
     uint64_t seq = cmd >> 56;
     if (seq != 0 && seq != e->gain_seq_applied) {
@@ -373,12 +419,34 @@ void a2a_engine_process(a2a_engine *e,
         a2a_record_ring_push(e->records, &rec);
     }
     shape_translated(e, got, out_frames);
+    uint32_t background_got = 0;
+    if (e->background) {
+        background_got = a2a_ring_read(e->background, e->scratch_background, out_frames);
+        if (background_got < out_frames)
+            memset(e->scratch_background + background_got, 0, (out_frames - background_got) * sizeof(float));
+    }
 
     for (uint32_t i = 0; i < out_frames; i++) {
         int64_t idx = e->delay_r + i;
         const bool have = idx >= 0 && idx < e->delay_w;
         const float *orig = e->delay + ((size_t)(idx & e->delay_mask)) * ch;
         const float trans = e->scratch_trans[i];
+        float bed = e->background ? e->scratch_background[i] : 0;
+        if (e->background && e->cfg.fade_frames) {
+            if (i < background_got) {
+                if (!e->background_active) e->background_fade = e->cfg.fade_frames;
+                if (e->background_fade) bed *= e->fade_curve[e->cfg.fade_frames - e->background_fade--];
+                e->background_active = true;
+            } else if (e->background_active) {
+                e->background_tail = e->background_last;
+                e->background_hold = e->cfg.fade_frames;
+                e->background_active = false;
+            }
+            if (e->background_hold) bed += e->background_tail * e->fade_curve[--e->background_hold];
+            e->background_last = bed;
+        }
+        if (e->ramp_b && --e->ramp_b == 0) e->gain_b = e->target_b;
+        else if (e->ramp_b) e->gain_b += e->step_b;
         float *dst = out + (size_t)i * ch;
         if (e->ramp_left) {
             e->gain_o += e->step_o;
@@ -391,7 +459,9 @@ void a2a_engine_process(a2a_engine *e,
         }
         for (uint32_t c = 0; c < ch; c++) {
             float o = (render && have) ? orig[c] : 0.0f;
-            dst[c] = render ? (o * e->gain_o + trans * e->gain_t) : 0.0f;
+            float mixed = o * e->gain_o + trans * e->gain_t + bed * e->gain_b;
+            if (e->background && e->gain_b > 0) mixed = fmaxf(-1, fminf(1, mixed));
+            dst[c] = render ? mixed : 0.0f;
         }
     }
     int64_t available = e->delay_w - e->delay_r;
@@ -406,6 +476,7 @@ void a2a_engine_process(a2a_engine *e,
     atomic_fetch_add_explicit(&e->output, out_frames, memory_order_relaxed);
     atomic_store_explicit(&e->gain_o_bits, float_bits(e->gain_o), memory_order_relaxed);
     atomic_store_explicit(&e->gain_t_bits, float_bits(e->gain_t), memory_order_relaxed);
+    atomic_store_explicit(&e->gain_b_bits, float_bits(e->gain_b), memory_order_relaxed);
 }
 
 // MARK: IOProc adapter

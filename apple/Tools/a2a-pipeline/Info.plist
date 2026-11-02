@@ -12,7 +12,5 @@
 	<string>1</string>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>A2A captures the selected application's audio to translate it locally.</string>
-	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>A2A recognizes speech locally to translate it.</string>
 </dict>
 </plist>

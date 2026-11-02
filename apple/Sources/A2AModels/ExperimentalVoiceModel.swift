@@ -4,19 +4,25 @@ import Synchronization
 /// Stable setup/worker keys. Artifact provenance stays in models/manifest.yaml.
 public enum ExperimentalVoiceModel: String, CaseIterable, Hashable, Sendable {
     case qwen
+    case audio8
     case omnivoice
     case chatterbox
 
     public var name: String {
         switch self {
         case .qwen: "Qwen3-TTS"
+        case .audio8: "Audio8 Realistic"
         case .omnivoice: "OmniVoice"
         case .chatterbox: "Chatterbox Multilingual"
         }
     }
 
     public var playbackDetail: String {
-        self == .qwen ? "Streams speech as it generates." : "Generates each phrase before playback."
+        switch self {
+        case .qwen: "Streams speech as it generates; audio-only voice reference."
+        case .audio8, .omnivoice: "Generates each phrase before playback. A short speaker reference is transcribed locally once per speaker."
+        case .chatterbox: "Generates each phrase before playback; audio-only voice reference."
+        }
     }
 }
 

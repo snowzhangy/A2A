@@ -88,6 +88,49 @@ private func timestamp(_ host: UInt64) -> AudioTimeStamp {
 }
 
 @Suite struct EngineTests {
+    @Test func independentBackgroundSurvivesTranslationFlushAndNeverUsesOriginalAudio() throws {
+        let e = try #require(makeEngine())
+        defer { a2a_engine_destroy(e) }
+        #expect(a2a_engine_enable_background(e, 512))
+        let bed = try #require(a2a_engine_background_ring(e))
+        a2a_engine_set_render_output(e, true)
+        a2a_engine_set_gains(e, 0, 1, 0)
+        a2a_engine_set_background_gain(e, 0.5, 0)
+        var music = [Float](repeating: 0.2, count: 128)
+        var speech = [Float](repeating: 0.4, count: 64)
+        _ = a2a_ring_write(bed, &music, 128)
+        _ = a2a_ring_write(a2a_engine_translated_ring(e), &speech, 64)
+        #expect(render(e, blocks: 1).allSatisfy { abs($0 - 0.5) < 0.0001 })
+        _ = a2a_ring_write(a2a_engine_translated_ring(e), &speech, 64)
+        a2a_engine_flush_translated(e)
+        #expect(render(e, blocks: 1).allSatisfy { abs($0 - 0.1) < 0.0001 })
+        a2a_engine_set_background_gain(e, 0, 0)
+        _ = a2a_ring_write(bed, &music, 64)
+        #expect(render(e, blocks: 1).allSatisfy { $0 == 0 })
+        #expect(!a2a_engine_enable_background(e, 512))
+    }
+
+    @Test func backgroundEdgesAndGainChangesHaveBoundedSteps() throws {
+        let e = try #require(makeEngine(fade: 240))
+        defer { a2a_engine_destroy(e) }
+        #expect(a2a_engine_enable_background(e, 2048))
+        let bed = try #require(a2a_engine_background_ring(e))
+        a2a_engine_set_render_output(e, true)
+        a2a_engine_set_gains(e, 0, 0, 0)
+        a2a_engine_set_background_gain(e, 0.8, 240)
+        var music = [Float](repeating: 0.7, count: 512)
+        _ = a2a_ring_write(bed, &music, 512)
+        let first = render(e, blocks: 12)
+        #expect(maxStep(first) < 0.01)
+        #expect(abs(first.last ?? 1) < 0.001)
+        _ = a2a_ring_write(bed, &music, 512)
+        let resumed = render(e, blocks: 4)
+        #expect(maxStep(resumed) < 0.01)
+        a2a_engine_set_background_gain(e, 0, 240)
+        #expect(maxStep(render(e, blocks: 4)) < 0.01)
+        #expect(a2a_engine_current_background_gain(e) == 0)
+    }
+
     @Test func capturesIntoRingAndRecordsTiming() throws {
         let e = try #require(makeEngine())
         defer { a2a_engine_destroy(e) }

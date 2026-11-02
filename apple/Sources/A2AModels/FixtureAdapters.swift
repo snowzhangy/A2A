@@ -212,6 +212,10 @@ public struct EnergyVAD: VoiceActivityDetector {
         self.hangoverMs = hangoverMs
     }
 
+    /// End of the last voiced frame while in speech, nil otherwise. The speech end this run will
+    /// report is this sample or a later one.
+    public var voicedEnd: Int64? { inSpeech ? lastVoiced : nil }
+
     public mutating func process(_ frame: AudioFrame16k) -> [VADEvent] {
         guard !frame.samples.isEmpty else { return [] }
         var acc: Float = 0

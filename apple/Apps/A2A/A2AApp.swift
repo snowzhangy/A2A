@@ -2,7 +2,7 @@ import AppKit
 import A2ACore
 import A2AModels
 import SwiftUI
-import Translation
+import UniformTypeIdentifiers
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
     var model: SessionModel?
@@ -32,7 +32,6 @@ import Translation
 
 private struct ContentView: View {
     @Bindable var model: SessionModel
-    @State private var translationSetup: TranslationSession.Configuration?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -45,48 +44,63 @@ private struct ContentView: View {
                 }
                 .labelsHidden()
                 .fixedSize()
-                .disabled(model.running || model.checking || translationSetup != nil)
+                .disabled(model.running || model.checking)
                 .accessibilityIdentifier("translation-direction")
                 Spacer()
                 Label(model.status, systemImage: model.running ? "waveform" : "circle")
                     .foregroundStyle(model.running ? Color.green : Color.secondary)
                     .accessibilityIdentifier("session-status")
             }
-            GroupBox("1. Prepare languages") {
+            Picker("Translation backend", selection: $model.backend) {
+                Text("Local: Hy-SimulMT + voice model").tag(TranslationBackend.local)
+                Text("Cloud: Qwen LiveTranslate").tag(TranslationBackend.qwenCloud)
+            }.disabled(model.running || model.checking)
+            GroupBox(model.backend == .local ? "Hy-SimulMT" : "Qwen LiveTranslate") {
                 VStack(alignment: .leading, spacing: 10) {
+                  if model.backend == .local {
+                    Picker("Hy-SimulMT", selection: $model.hyOnThisMac) {
+                        Text("On this Mac").tag(true)
+                        Text("Server").tag(false)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .fixedSize()
+                    .disabled(model.running || model.checking)
+                    .accessibilityIdentifier("hy-location")
+                    if !model.hyOnThisMac {
+                        TextField("Server address", text: $model.hyServer).disabled(model.running || model.checking)
+                    }
                     Text(model.languageDetail).font(.callout).foregroundStyle(.secondary)
                     HStack {
-                        Button("Check languages") { Task { await model.checkLanguages() } }
-                        if !model.speechReady {
-                            Button("Install \(model.direction.source.name) speech") { Task { await model.installSpeech() } }
-                        }
-                        if !model.translationReady {
-                            Button("Install translation languages") {
-                                translationSetup = TranslationSession.Configuration(
-                                    source: .init(identifier: model.direction.source.translationIdentifier),
-                                    target: .init(identifier: model.direction.target.translationIdentifier))
-                            }
-                        }
+                        Button(model.hyOnThisMac ? "Check again" : "Check server") { Task { await model.checkLanguages() } }
                         if model.checking { ProgressView().controlSize(.small) }
-                    }.disabled(model.checking || model.running || translationSetup != nil)
+                    }.disabled(model.checking || model.running)
+                  } else {
+                    SecureField("QwenCloud API key", text: $model.cloudAPIKey)
+                        .disabled(model.running).textContentType(.password)
+                    Picker("API key region", selection: $model.cloudRegion) {
+                        Text("Singapore").tag("ap-southeast-1")
+                        Text("Beijing").tag("cn-beijing")
+                    }.disabled(model.running)
+                    Text("Selected app audio is sent to Qwen Cloud; usage charges may apply. The key stays in memory for this app session.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Text("Speaker cloning is provided by Qwen; a default voice may be heard before cloning is ready. Music and effects are unavailable in this mode.")
+                        .font(.callout).foregroundStyle(.secondary)
+                  }
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(6)
             }
-            GroupBox("2. Choose an app playing \(model.direction.source.name)") {
-                HStack {
-                    Picker("Source", selection: $model.selectedSource) {
-                        if model.sources.isEmpty { Text("Play audio in an app, then refresh").tag("") }
-                        ForEach(model.sources) { source in Text(source.name).tag(source.id) }
-                    }.labelsHidden().accessibilityIdentifier("source-picker")
-                    Button("Refresh") { Task { await model.refreshSources() } }
-                }.disabled(model.running).padding(6)
-            }
+            // No app to choose: the tap hears the machine's whole output mix, so whatever starts playing is
+            // translated. Our own playback is excluded, so the clone never answers itself.
+            Label("Listens to everything this Mac plays. Sound we produce is left out of what we hear.",
+                  systemImage: "speaker.wave.2")
+                .font(.callout).foregroundStyle(.secondary).padding(.horizontal, 6)
             HStack {
                 Button(model.running ? "Stop" : "Start translation") {
                     if model.running { model.stop() } else { model.start() }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(model.stopping || (!model.running && (!model.languagesReady || !model.voiceReady
-                    || model.installingVoiceModel || model.selectedSource.isEmpty)))
+                .disabled(model.stopping || model.choosingPicture || (!model.running && (!model.languageReadyForSession || !model.voiceReady
+                    || model.installingVoiceModel)))
                 .accessibilityIdentifier("session-toggle")
                 Text(model.playbackMode == .original
                      ? "Original audio. \(model.direction.target.name) captions continue."
@@ -105,6 +119,43 @@ private struct ContentView: View {
                 .disabled(model.stopping)
                 .accessibilityIdentifier("playback-mode")
                 .help("Switch audio during a session. Translation and captions keep running.")
+            }
+            if model.backend == .local {
+            DisclosureGroup("Names and terminology") {
+                VStack(alignment: .leading, spacing: 8) {
+                    termFileRow("Pronunciation", selection: $model.pronunciationURL,
+                                help: "Choose a JSON object mapping translated words to how they should be spoken.")
+                    Text("Changes apply to the next session. Pronunciation changes speech only.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }.disabled(model.running || model.stopping)
+            }
+            Toggle("Prioritize complete phrases", isOn: $model.qualityFirst)
+                .disabled(model.running || model.stopping)
+                .help("Allows more delay to reduce skipped or cut-off speech. Applies to the next session.")
+                .accessibilityIdentifier("quality-first")
+            Toggle("Keep music and effects (experimental)", isOn: $model.keepBackground)
+                .disabled(model.running || model.stopping)
+                .help("Separates background sound from dialogue locally. Separation can leave artifacts or traces of voices.")
+                .accessibilityIdentifier("keep-background")
+            Toggle("Match picture to translated speech (opens a delayed copy of the video window)", isOn: $model.matchPicture)
+                .disabled(model.running || model.stopping || model.choosingPicture || model.backend != .local)
+                .help("Start asks which window shows the video. A2A shows that window late and gives translated speech, original audio, and music and effects the same delay, so each phrase lands on its picture. Protected (DRM) video captures as black. Keep the source window visible: some players stop drawing hidden windows.")
+                .accessibilityIdentifier("match-picture")
+            if model.matchPicture && model.backend == .local {
+                HStack(spacing: 16) {
+                    Stepper(value: $model.pictureDelaySeconds, in: 3...20, step: 1) {
+                        Text("Picture delay \(Int(model.pictureDelaySeconds)) s")
+                    }
+                    .disabled(model.running || model.stopping || model.choosingPicture)
+                    .help("Longer delays let slower phrases land on time. Applies to the next session.")
+                    .accessibilityIdentifier("picture-delay")
+                    Text("Fine-tune")
+                    Slider(value: $model.pictureOffsetMs, in: -500...500, step: 20)
+                        .frame(maxWidth: 180)
+                        .help("Moves the picture only, during a session. Positive shows it later. Use it once per output device.")
+                        .accessibilityIdentifier("picture-offset")
+                    Text("\(Int(model.pictureOffsetMs)) ms").monospacedDigit().frame(width: 64, alignment: .trailing)
+                }.font(.callout)
             }
             Toggle("Speak \(model.direction.target.name) in each original speaker’s voice (experimental, research-only model)",
                    isOn: $model.originalVoice)
@@ -138,23 +189,25 @@ private struct ContentView: View {
                         Button("Refresh") { Task { await model.refreshVoiceModels() } }
                             .disabled(model.running || model.checkingVoiceModels || model.installingVoiceModel)
                     }
-                    Text(model.voiceModel.playbackDetail + " Stop the session to switch models.")
+                    Text(model.voiceModel.playbackDetail)
                         .foregroundStyle(.secondary)
+                    if model.voiceModel == .audio8 || model.voiceModel == .omnivoice {
+                        Button("Install speech for voice references") { Task { await model.installReferenceSpeech() } }
+                            .disabled(model.running || model.checking)
+                    }
                     if !model.voiceSetupDetail.isEmpty { Text(model.voiceSetupDetail).foregroundStyle(.secondary) }
-                    HStack {
-                        Toggle("Remember voices for this source", isOn: $model.rememberVoices)
-                            .disabled(model.running)
-                            .help("Keeps short voice references on this Mac and reuses them after a confident speaker match.")
-                            .accessibilityIdentifier("remember-voices")
-                        Text("\(model.rememberedVoiceCount) saved").foregroundStyle(.secondary)
-                        Button("Forget saved voices") { model.forgetVoices() }
-                            .disabled(model.running || model.rememberedVoiceCount == 0)
+                    if model.rememberedVoiceCount > 0 {
+                        HStack {
+                            Text("\(model.rememberedVoiceCount) previously saved voices").foregroundStyle(.secondary)
+                            Button("Forget saved voices") { model.forgetVoices() }.disabled(model.running)
+                        }
                     }
                     if !model.voiceLearningDetail.isEmpty {
                         Text(model.voiceLearningDetail).foregroundStyle(.secondary)
                             .accessibilityIdentifier("voice-learning-progress")
                     }
                 }.font(.callout)
+            }
             }
             if let error = model.error {
                 Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
@@ -164,7 +217,7 @@ private struct ContentView: View {
                     VStack(alignment: .leading, spacing: 16) {
                         if model.captions.isEmpty {
                             ContentUnavailableView("Live \(model.direction.target.name) captions", systemImage: "captions.bubble",
-                                                   description: Text("Start a session to translate the selected app’s audio locally."))
+                                                   description: Text(model.backend == .local ? "Start a session to translate the selected app’s audio locally." : "Start a session to translate the selected app’s audio with Qwen Cloud."))
                         }
                         ForEach(model.captions) { caption in
                             Text(caption.text).font(.title2).textSelection(.enabled)
@@ -175,10 +228,9 @@ private struct ContentView: View {
                     if let id = model.captions.last?.id { proxy.scrollTo(id, anchor: .bottom) }
                 }
             }.background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 12))
-            if !model.sourceCaption.isEmpty {
-                Text(model.sourceCaption).font(.callout).foregroundStyle(.secondary).lineLimit(3).textSelection(.enabled)
-            }
-            Text(model.originalVoice
+            Text(model.backend == .qwenCloud
+                 ? "Development build · Qwen Cloud voice cloning is experimental. Use only with speakers who consented."
+                 : model.originalVoice
                  ? "Development build · Experimental voice cloning (research-only model; identity not qualified). Use only with speakers who consented."
                  : "Development build · \(model.direction.target.name) uses system voices, one per detected speaker.")
                 .font(.caption).foregroundStyle(.secondary)
@@ -194,47 +246,64 @@ private struct ContentView: View {
             let args = CommandLine.arguments
             if let i = args.firstIndex(of: "--smoke-output"), i + 1 < args.count {
                 // Synthetic presentation data; this path does no capture or inference.
-                model.sources = [AudioSource(id: "synthetic", name: "Synthetic meeting fixture", arguments: [])]
-                model.selectedSource = "synthetic"
                 let initialDirection = model.direction.rawValue
                 model.voiceInstallations = ExperimentalVoiceModel.allCases.map {
                     ExperimentalVoiceInstallation(key: $0.rawValue, installed: $0 == .qwen, bytes: 1_000)
                 }
                 model.originalVoice = true
                 let qwenReady = model.voiceReady
+                model.voiceModel = .audio8
+                let audio8Blocked = !model.voiceReady
+                let audio8Args = model.pipelineArguments(source: AudioSource.systemAudio, trace: URL(fileURLWithPath: "/tmp/a2a-ui-smoke-trace"))
                 model.voiceModel = .omnivoice
-                let missingOmniBlocked = !model.voiceReady
+                let omniBlocked = !model.voiceReady
                 model.voiceModel = .chatterbox
-                let missingChatterboxBlocked = !model.voiceReady
+                let chatterboxBlocked = !model.voiceReady
+                let chatterboxArgs = model.pipelineArguments(source: AudioSource.systemAudio, trace: URL(fileURLWithPath: "/tmp/a2a-ui-smoke-trace"))
                 model.voiceModel = .qwen
-                model.voiceSetupDetail = "Synthetic model selector preview."
+                let launchArgs = model.pipelineArguments(source: AudioSource.systemAudio, trace: URL(fileURLWithPath: "/tmp/a2a-ui-smoke-trace"))
+                let directPipeline = launchArgs.contains("audio") && (launchArgs.contains("hy") || launchArgs.contains("hy-local")) && !launchArgs.contains("apple")
+                    && (model.cloneWorker == nil || (launchArgs.contains("xvector") && launchArgs.contains("--dual-clone")))
+                model.backend = .qwenCloud
+                let cloudMissingKeyBlocked = !model.languageReadyForSession
+                model.cloudAPIKey = "synthetic-test-key"
+                let cloudReady = model.languageReadyForSession && model.voiceReady
+                let cloudArgs = model.pipelineArguments(source: AudioSource.systemAudio, trace: URL(fileURLWithPath: "/tmp/a2a-ui-smoke-trace"))
+                let cloudIsolated = cloudArgs.contains("--qwen-cloud") && !cloudArgs.contains("synthetic-test-key") && !cloudArgs.contains("--background")
+                model.cloudAPIKey = ""
+                model.backend = .local
+                model.voiceSetupDetail = "Synthetic model preview."
                 model.languagesReady = true
-                model.speechReady = true
-                model.translationReady = true
                 model.direction = .englishToChinese
-                let directionResetReadiness = !model.languagesReady && !model.speechReady && !model.translationReady
+                let directionResetReadiness = !model.languagesReady
                 model.languagesReady = true
-                model.speechReady = true
-                model.translationReady = true
                 model.languageDetail = "Synthetic UI preview · No capture or inference is running."
                 model.captions = [CaptionLine(id: "preview", text: "我们下周开会。")]
-                model.sourceCaption = "We will meet next week."
                 let initialPlayback = model.playbackMode.rawValue
                 model.playbackMode = .original
                 let originalSelected = model.playbackMode == .original
                 model.playbackMode = .translated
+                // A missing term file must stop before the helper can take over audio.
+                model.pronunciationURL = URL(fileURLWithPath: args[i + 1]).appendingPathExtension("missing")
+                model.start()
+                let badTermsBlocked = !model.running && model.error != nil
+                model.pronunciationURL = nil
+                model.error = nil
                 try? await Task.sleep(for: .milliseconds(500))
                 let url = URL(fileURLWithPath: args[i + 1])
                 let window = NSApp.windows.first(where: { $0.title == "A2A" })
                 let evidence: [String: Any] = ["mode": "synthetic-ui", "languages_ready": model.languagesReady,
-                    "source_count": model.sources.count, "status": model.status,
+                    "source": "system-audio", "status": model.status,
                     "running": model.running, "window_number": window?.windowNumber ?? 0,
                     "direction_initial": initialDirection, "direction_final": model.direction.rawValue,
                     "direction_reset_readiness": directionResetReadiness,
-                    "voice_model_count": ExperimentalVoiceModel.allCases.count,
-                    "qwen_ready": qwenReady, "missing_omnivoice_blocked": missingOmniBlocked,
-                    "missing_chatterbox_blocked": missingChatterboxBlocked,
+                    "qwen_ready": qwenReady, "direct_pipeline": directPipeline,
+                    "cloud_missing_key_blocked": cloudMissingKeyBlocked, "cloud_ready": cloudReady, "cloud_isolated": cloudIsolated,
+                    "audio8_blocked": audio8Blocked, "omni_blocked": omniBlocked, "chatterbox_blocked": chatterboxBlocked,
+                    "audio8_reference_helper": audio8Args.contains("--reference-transcriber"),
+                    "chatterbox_audio_only": chatterboxArgs.contains("xvector") && !chatterboxArgs.contains("--reference-transcriber"),
                     "voice_model_final": model.voiceModel.rawValue,
+                    "missing_terms_blocked": badTermsBlocked,
                     "playback_initial": initialPlayback, "playback_original_selected": originalSelected,
                     "playback_final": model.playbackMode.rawValue]
                 try? JSONSerialization.data(withJSONObject: evidence, options: [.prettyPrinted, .sortedKeys])
@@ -244,7 +313,7 @@ private struct ContentView: View {
                 try? await Task.sleep(for: .seconds(20))
                 NSApp.terminate(nil)
             } else {
-                await model.refreshSources()
+                model.refreshVoiceMemoryCount()
                 await model.checkLanguages()
                 await model.refreshVoiceModels()
             }
@@ -255,12 +324,24 @@ private struct ContentView: View {
                 Task { await model.checkLanguages() }
             }
         }
-        .translationTask(translationSetup) { session in
-            // The framework supplies a non-Sendable session; this setup task is its sole user.
-            nonisolated(unsafe) let setupSession = session
-            do { try await setupSession.prepareTranslation(); await model.checkLanguages() }
-            catch { model.error = String(describing: error) }
-            translationSetup = nil
-        }
+    }
+
+    private func termFileRow(_ title: String, selection: Binding<URL?>, help: String) -> some View {
+        HStack {
+            Text(title).frame(width: 130, alignment: .leading)
+            Text(selection.wrappedValue?.lastPathComponent ?? "None").foregroundStyle(.secondary)
+                .lineLimit(1)
+            Spacer()
+            Button("Choose…") {
+                let panel = NSOpenPanel()
+                panel.allowedContentTypes = [.json]
+                panel.allowsMultipleSelection = false
+                panel.canChooseDirectories = false
+                if panel.runModal() == .OK { selection.wrappedValue = panel.url }
+            }
+            if selection.wrappedValue != nil {
+                Button("Clear") { selection.wrappedValue = nil }
+            }
+        }.help(help)
     }
 }

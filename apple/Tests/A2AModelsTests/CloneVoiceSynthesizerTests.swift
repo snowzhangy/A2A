@@ -26,6 +26,33 @@ private func profile(version: Int = 1, seconds: Double = 3, rate: Int = 48_000) 
 
 @Suite(.enabled(if: FileManager.default.isExecutableFile(atPath: python)), .serialized)
 struct CloneVoiceSynthesizerTests {
+    @Test func dualWorkersKeepEachSpeakerProfileAvailableOnBothLanes() async throws {
+        let first = try await fakeWorker()
+        let second = try await fakeWorker()
+        let synth = DualCloneVoiceSynthesizer(first, second)
+        defer { synth.shutdown() }
+        let a = profile()
+        let b = VoiceProfile(speakerID: SpeakerID("S2"), version: 1, referencePCM: a.referencePCM,
+                             referenceText: a.referenceText, sampleRate: a.sampleRate,
+                             channelCount: a.channelCount, quality: a.quality)
+        let voiceA = try await synth.prepare(a)
+        let voiceB = try await synth.prepare(b)
+        func collect(_ id: Int, _ voice: PreparedVoice, _ lane: Int) async throws -> Int {
+            var frames = 0
+            for try await chunk in synth.synthesize(unit: UnitID(id), text: "Hello there.", voice: voice,
+                                                     targetSeconds: nil, lane: lane) { frames += chunk.frames }
+            return frames
+        }
+        async let left = collect(1, voiceA, 0)
+        async let right = collect(2, voiceB, 1)
+        let (aFrames, bFrames) = try await (left, right)
+        #expect(aFrames > 0 && bFrames > 0 && synth.failure == nil)
+        #expect(try await collect(3, voiceB, 0) > 0)
+        #expect(try await collect(4, voiceA, 1) > 0)
+        let missing = PreparedVoice(speakerID: SpeakerID("S3"), profileVersion: 1, handle: 1)
+        await #expect(throws: (any Error).self) { _ = try await collect(5, missing, 1) }
+    }
+
     @Test(arguments: ExperimentalVoiceModel.allCases)
     func selectedBackendReportsItsActualStreamingContract(_ model: ExperimentalVoiceModel) async throws {
         let synth = try await fakeWorker(["--model", model.rawValue])

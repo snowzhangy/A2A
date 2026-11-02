@@ -21,15 +21,39 @@ import Testing
         func candidate(_ text: String, complete: Bool = true) -> TranslationCandidate {
             TranslationCandidate(unitID: UnitID(1), text: text, complete: complete)
         }
-        #expect(chinese.validate(candidate("我们下周开会。"), source: source, previousTarget: nil) == nil)
-        #expect(chinese.validate(candidate("请在 Zoom 开会。"), source: source, previousTarget: nil) == nil)
-        #expect(chinese.validate(candidate(source), source: source, previousTarget: nil) == .wrongLanguage)
-        #expect(english.validate(candidate("我们下周开会。"), source: source, previousTarget: nil) == .wrongLanguage)
-        #expect(english.validate(candidate(source), source: "我们下周开会。", previousTarget: nil) == nil)
-        #expect(chinese.validate(candidate(" "), source: source, previousTarget: nil) == .empty)
-        #expect(chinese.validate(candidate("我们下周开会。", complete: false), source: source, previousTarget: nil) == .incomplete)
-        #expect(chinese.validate(candidate("我们下周开会。"), source: source, previousTarget: "我们下周开会。") == .duplicate)
-        #expect(chinese.validate(candidate(String(repeating: "会", count: 200)), source: source, previousTarget: nil) == .tooLong)
+        #expect(chinese.evaluate(candidate("我们下周开会。"), source: source, previousTarget: nil) == .accepted("我们下周开会。"))
+        #expect(chinese.evaluate(candidate("请在 Zoom 开会。"), source: source, previousTarget: nil).isAccepted)
+        #expect(chinese.evaluate(candidate(source), source: source, previousTarget: nil).rejection == .wrongLanguage)
+        #expect(english.evaluate(candidate("我们下周开会。"), source: source, previousTarget: nil).rejection == .wrongLanguage)
+        #expect(english.evaluate(candidate(source), source: "我们下周开会。", previousTarget: nil).isAccepted)
+        #expect(chinese.evaluate(candidate(" "), source: source, previousTarget: nil).silence == .empty)
+        #expect(chinese.evaluate(candidate("我们下周开会。", complete: false), source: source, previousTarget: nil).rejection == .incomplete)
+        #expect(chinese.evaluate(candidate("我们下周开会。"), source: source, previousTarget: "我们下周开会。").rejection == .duplicate)
+        #expect(chinese.evaluate(candidate(String(repeating: "会", count: 200)), source: source, previousTarget: nil).rejection == .tooLong)
+
+    }
+
+    @Test func fillersAreSilenceAndContentIsNot() {
+        let english = TranslationValidator(targetLanguage: .english)
+        let chinese = TranslationValidator(targetLanguage: .mandarin)
+        func candidate(_ text: String) -> TranslationCandidate {
+            TranslationCandidate(unitID: UnitID(1), text: text)
+        }
+        for filler in ["Yeah.", "yeah", "Hmm", "Oh, oh!", "Uh, uh, um", "haha"] {
+            #expect(english.evaluate(candidate(filler), source: "", previousTarget: nil).silence == .filler)
+        }
+        for filler in ["嗯", "嗯嗯", "哦啊", "哈哈"] {
+            #expect(chinese.evaluate(candidate(filler), source: "", previousTarget: nil).silence == .filler)
+        }
+        // Content words, however short, are a real translation.
+        #expect(english.evaluate(candidate("Oh, that is wrong."), source: "", previousTarget: nil).isAccepted)
+        #expect(english.evaluate(candidate("Yes."), source: "", previousTarget: nil).isAccepted)
+        #expect(english.evaluate(candidate("Yeah, right away."), source: "", previousTarget: nil).isAccepted)
+        #expect(chinese.evaluate(candidate("我们开会。"), source: "", previousTarget: nil).isAccepted)
+        // Turning the rule off restores the old empty failure.
+        var strict = english
+        strict.silencesFillers = false
+        #expect(strict.evaluate(candidate(" "), source: "", previousTarget: nil).rejection == .empty)
     }
 
     @Test(arguments: TranslationDirection.allCases)

@@ -23,3 +23,11 @@ fixtures/**/*.wav
 !fixtures/contract/**/*.wav
 
 .DS_Store
+
+# A tool run from the repo root with no --trace / --out path writes its output here. Keep the
+# tree clean; real runs point at .local/ (see AGENTS.md "Commands").
+/trace.jsonl
+/trace*.jsonl
+/:memory:.ses
+/out.wav
+/source.wav

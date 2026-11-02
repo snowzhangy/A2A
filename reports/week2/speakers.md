@@ -202,6 +202,10 @@ Nineteen new tests:
 
 ## Still open
 
+Update, 1 November: on real video, the 4-speaker cap filled with music and effects early in a session, and every
+later actor merged into an existing speaker. Passing voices now free their slots; see
+[speaker-slots.md](speaker-slots.md).
+
 - A live tap session and a listening check of dialogue voices.
 - Splitting units at speaker turns. On the excerpt, 4 of 29 units contain both pitch classes,
   three of them 10–14 s long. Splitting needs recognizer finalization at the turn.

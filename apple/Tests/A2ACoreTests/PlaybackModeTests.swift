@@ -2,6 +2,22 @@ import A2ACore
 import Testing
 
 @Suite struct PlaybackModeTests {
+    @Test func separatedBackgroundPlaysDuringVoiceAcquisitionButMutesForOriginalAndStop() {
+        var config = PipelineConfig(session: "background")
+        config.originalAudioEnabled = false
+        config.backgroundAudioEnabled = true
+        var p = SessionPipeline(config: config)
+        _ = p.handle(.arm, at: 0)
+        let armed = p.handle(.armSucceeded, at: 1)
+        #expect(armed.contains(.backgroundGain(0.8, durationMs: 0)))
+        #expect(armed.contains { if case .rampGains(let g, 0) = $0 {
+            g.original == 0 && g.translated == 0
+        } else { false } })
+        #expect(p.handle(.playbackMode(.original), at: 2).contains(.backgroundGain(0, durationMs: 30)))
+        #expect(p.handle(.playbackMode(.translated), at: 3).contains(.backgroundGain(0.8, durationMs: 30)))
+        #expect(p.handle(.stop, at: 4).contains(.backgroundGain(0, durationMs: 30)))
+    }
+
     private let speaker = SpeakerID("S1")
 
     private func session(mode: PlaybackMode = .translated) -> SessionPipeline {

@@ -3,6 +3,7 @@
 
 import A2ACore
 import A2AModels
+import A2ALegacyModels
 import Foundation
 import Testing
 
@@ -102,7 +103,7 @@ struct AppleAdapterContractTests {
         let c = try await t.translate(TranslationRequest(unitID: UnitID(1), context: [], glossary: [:], uncommittedSource: "我们下周开会。"))
         print("apple translation: \(c.text)")
         #expect(!c.text.isEmpty)
-        #expect(TranslationValidator().validate(c, source: "我们下周开会。", previousTarget: nil) == nil)
+        #expect(TranslationValidator().evaluate(c, source: "我们下周开会。", previousTarget: nil).isAccepted)
     }
 
     @Test func appleSpeechRecognizerRequiresInstalledAssets() async throws {

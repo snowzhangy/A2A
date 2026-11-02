@@ -102,6 +102,12 @@ def source_map(events: list[dict], feed_log: list[dict] | None = None) -> TimeMa
     return TimeMap.from_anchors([(e["span"][1], e["t_ns"]) for e in captures if e.get("host_time_valid", True)])
 
 
+def output_rate(events: list[dict]) -> int:
+    """Device rate of `out_sample` counters, from the output buffer records."""
+    rates = {e["rate"] for e in events if e["ev"] == "buf.output" and e.get("rate", 0) > 0}
+    return int(next(iter(rates))) if len(rates) == 1 else CANONICAL_RATE
+
+
 def output_map(events: list[dict]) -> TimeMap:
     # Records without a valid device host time carry a substituted time; never use them as anchors.
     records = [e for e in events if e["ev"] == "buf.output" and e.get("host_time_valid", True)]
@@ -223,6 +229,27 @@ def compute(events: list[dict], fixture: Fixture, *, device_latency_ms: float = 
             weights.append(len(idx))
         per_unit.append(row)
 
+    # Turn timing (dub parity): does each line take the time its actor took? A listener hears the
+    # rhythm of an exchange before the acting, so "dead air" (the English ends while the actor is
+    # still talking) and "overrun" (English still playing after their last sound) are measured per
+    # unit as durations, not clock positions: with a picture delay the two run D seconds apart, and
+    # without one the English starts after the actor stopped either way. A unit whose span is an
+    # artificial cut (`timing_estimated`, a forced split mid-speech) has no actor end to land on.
+    dead_air, overrun, turn_n = [], [], 0
+    out_rate = output_rate(events)
+    rows_by_unit = {r["unit"]: r for r in per_unit}
+    for unit, c in commits.items():
+        if unit not in play_start or unit not in play_end or c.get("timing_estimated"):
+            continue
+        gap = (c["span"][1] - c["span"][0]) / rate - (play_end[unit] - play_start[unit]) / out_rate
+        rows_by_unit.get(unit, {})["turn_gap_s"] = gap   # only units that played have a row
+        turn_n += 1
+        (dead_air if gap > 0 else overrun).append(abs(gap))
+
+    def _timing(values: list[float]) -> dict:
+        return {"median": _pct(values, 50), "p90": _pct(values, 90), "max": max(values, default=None),
+                "n": len(values)}
+
     # Coverage over the predefined warm interval: unique reference characters whose units
     # finished playing as translations.
     w0, w1 = fixture.warm_interval_s
@@ -253,6 +280,10 @@ def compute(events: list[dict], fixture: Fixture, *, device_latency_ms: float = 
                         "char_weighted_median": weighted_median, "n": len(lag_onset)},
         "lag_live_s": {"median": _pct(lag_live, 50), "p95": _pct(lag_live, 95), "n": len(lag_live)},
         "lag_end_s": {"median": _pct(lag_end, 50), "p95": _pct(lag_end, 95), "n": len(lag_end)},
+        # Positive is the actor still talking (dead air), negative English past the actor
+        # (overrun). Both are absolute; `turn_gap_s` on a per-unit row keeps its sign.
+        "turn_dead_air_s": _timing(dead_air),
+        "turn_overrun_s": _timing(overrun),
         "unit_chars": {"median": _pct(unit_lengths, 50), "p95": _pct(unit_lengths, 95)},
         "translation_coverage": coverage,
         "warm_interval_s": [w0, w1],
@@ -265,6 +296,7 @@ def compute(events: list[dict], fixture: Fixture, *, device_latency_ms: float = 
         "debt_ms": {"max": max((e["debt_ms"] for e in q), default=None), "slope_per_min": debt_slope},
         "oldest_source_age_ms": {"max": max((e["oldest_source_age_ms"] for e in q), default=None),
                                  "slope_per_min": age_slope},
+        "turn_timing_n": turn_n,
         "alignment_uncertainty_ms": fixture.alignment_uncertainty_ms,
         "device_latency_ms_assumed": device_latency_ms,
         "per_unit": per_unit,

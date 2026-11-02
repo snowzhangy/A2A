@@ -16,12 +16,16 @@ private struct Session {
     var effects: [PipelineEffect] = []
     private var captured: Int64 = 0
 
-    init(fluent: Bool = true, originalAudio: Bool = false, prebuffer: Double = 0.08, maxDebt: Double = 3) {
+    init(fluent: Bool = true, originalAudio: Bool = false, prebuffer: Double = 0.08,
+         maxDebt: Double = 3, adaptive: Bool = false, completePhrases: Bool = false, maxPending: Int = 8) {
         var config = PipelineConfig(session: "fluent")
         config.finishPhraseBeforeCatchUp = fluent
         config.originalAudioEnabled = originalAudio
         config.health.prebufferSeconds = prebuffer
         config.health.maxDebtSeconds = maxDebt
+        config.adaptiveStreamingPrebuffer = adaptive
+        config.completePhrasesBeforePlayback = completePhrases
+        config.maxPendingUnits = maxPending
         p = SessionPipeline(config: config)
         run(0, .arm)
         run(0, .armSucceeded)
@@ -74,6 +78,59 @@ private struct Session {
 }
 
 @Suite struct FluentPlayoutTests {
+    @Test func qualityQueueCapDiscardsUnheardWorkAndPreservesThePhraseOnTheBus() {
+        var s = Session(maxDebt: 20, completePhrases: true, maxPending: 2)
+        s.commit(1, from: 0, to: 1, at: 1.1)
+        s.pcm(1, seconds: 4, at: 1.3)
+        s.run(1.4, .synthesisFinished(UnitID(1), generation: 1))
+        s.run(1.5, .playStarted(UnitID(1), outSample: 0))
+        s.commit(2, from: 1, to: 2, at: 2.1)
+        s.commit(3, from: 2, to: 3, at: 3.1)
+        #expect(s.canceled("queue_limit") == ["u2"])
+        #expect(!s.effects.contains(.cancelSynthesis(UnitID(1))))
+        #expect(!s.effects.contains(.flushTranslatedBus))
+        #expect(s.p.state == .translating(speaker))
+    }
+
+    @Test func completePhraseModeHoldsInitialAndLaterAudioUntilGenerationEnds() {
+        var s = Session(maxDebt: 20, completePhrases: true)
+        s.commit(1, from: 0, to: 2, at: 2.5)
+        #expect(!s.pcm(1, seconds: 2, at: 2.7).contains(.releaseHeld(UnitID(1))))
+        #expect(!s.tick(2.8, backlog: 0).contains(.releaseHeld(UnitID(1))))
+        #expect(s.run(2.9, .synthesisFinished(UnitID(1), generation: 1)).contains(.releaseHeld(UnitID(1))))
+        s.run(3.0, .playStarted(UnitID(1), outSample: 0))
+        s.commit(2, from: 2, to: 3, at: 3.2)
+        s.pcm(2, seconds: 0.5, at: 3.4)
+        #expect(!s.run(4.0, .playEnded(UnitID(1), outSample: 96_000)).contains(.releaseHeld(UnitID(2))))
+        #expect(!s.tick(4.1, backlog: 0).contains(.releaseHeld(UnitID(2))))
+        #expect(s.run(4.2, .synthesisFinished(UnitID(2), generation: 1)).contains(.releaseHeld(UnitID(2))))
+        #expect(s.canceled("catch_up").isEmpty)
+    }
+
+    @Test func slowStreamingBuildsReserveBeforeTheInitialHandoff() {
+        var s = Session(prebuffer: 0.24, adaptive: true)
+        s.commit(1, from: 0, to: 2, at: 2.5)
+        #expect(!s.pcm(1, seconds: 0.32, at: 2.7).contains(.releaseHeld(UnitID(1))))
+        // Audio arrives at half real time. The ordinary 240ms reserve would already
+        // have started playback and exhausted the bus before the second chunk.
+        #expect(!s.pcm(1, seconds: 0.32, at: 3.34).contains(.releaseHeld(UnitID(1))))
+        #expect(!s.pcm(1, seconds: 0.32, at: 3.98).contains(.releaseHeld(UnitID(1))))
+        #expect(s.pcm(1, seconds: 0.32, at: 4.62).contains(.releaseHeld(UnitID(1))))
+    }
+
+    @Test func fastStreamingStartsAfterTwoChunksAndCompletionReleasesShortAudio() {
+        var s = Session(prebuffer: 0.24, adaptive: true)
+        s.commit(1, from: 0, to: 2, at: 2.5)
+        s.pcm(1, seconds: 0.32, at: 2.7)
+        #expect(s.pcm(1, seconds: 0.32, at: 2.8).contains(.releaseHeld(UnitID(1))))
+        s.run(2.9, .playStarted(UnitID(1), outSample: 0))
+        s.run(3, .synthesisFinished(UnitID(1), generation: 1))
+        s.run(3.1, .playEnded(UnitID(1), outSample: 30_720))
+        s.commit(2, from: 3.2, to: 3.4, at: 3.5)
+        #expect(!s.pcm(2, seconds: 0.05, at: 3.7).contains(.releaseHeld(UnitID(2))))
+        #expect(s.run(3.8, .synthesisFinished(UnitID(2), generation: 1)).contains(.releaseHeld(UnitID(2))))
+    }
+
     @Test func emptyBusDoesNotStarveByCancelingEveryInFlightSynthesis() {
         var s = Session(maxDebt: 0.3)
         s.commit(1, from: 0, to: 1, at: 1)
@@ -286,7 +343,12 @@ private struct Session {
         let out = units(p.process(hyp(tokens), at: 100_000_000))
         #expect(out.map(\.text) == ["我们今天开会"])
         #expect(out.first?.reason == .conjunction)
-        var plain = CommitPolicy()
+        // Without streaming clauses nothing closes at the conjunction. The source-time budget
+        // is off here because this suite's hypothesis stands 10 s ahead of its 12 keys; a
+        // frontier that far ahead of the text would close a length clause on its own.
+        var plainConfig = CommitPolicyConfig()
+        plainConfig.maxUnitSourceSeconds = 0
+        var plain = CommitPolicy(config: plainConfig)
         _ = plain.process(hyp(tokens), at: 0)
         #expect(units(plain.process(hyp(tokens), at: 100_000_000)).isEmpty)
     }

@@ -14,7 +14,7 @@ for _ in {1..150}; do
   sleep 0.1
 done
 [[ -f "$OUT/app.json" ]] || { echo "App did not produce startup evidence" >&2; exit 1; }
-WINDOW="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); assert e["mode"] == "synthetic-ui" and not e["running"]; assert e["playback_initial"] == "translated" and e["playback_original_selected"] and e["playback_final"] == "translated"; assert e["direction_initial"] == "zh-en" and e["direction_final"] == "en-zh" and e["direction_reset_readiness"]; assert e["voice_model_count"] == 3 and e["qwen_ready"] and e["missing_omnivoice_blocked"] and e["missing_chatterbox_blocked"] and e["voice_model_final"] == "qwen"; print(e["window_number"])' "$OUT/app.json")"
+WINDOW="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); assert e["mode"] == "synthetic-ui" and not e["running"]; assert e["playback_initial"] == "translated" and e["playback_original_selected"] and e["playback_final"] == "translated"; assert e["direction_initial"] == "zh-en" and e["direction_final"] == "en-zh" and e["direction_reset_readiness"]; assert e["qwen_ready"] and e["direct_pipeline"] and e["voice_model_final"] == "qwen" and e["audio8_blocked"] and e["omni_blocked"] and e["chatterbox_blocked"] and e["audio8_reference_helper"] and e["chatterbox_audio_only"]; assert e["cloud_missing_key_blocked"] and e["cloud_ready"] and e["cloud_isolated"]; assert e["missing_terms_blocked"]; print(e["window_number"])' "$OUT/app.json")"
 [[ "$WINDOW" -gt 0 ]] || { echo "App did not create a window" >&2; exit 1; }
 if [[ "${1:-}" == "--screenshot" ]]; then
   screencapture -x -o -l "$WINDOW" "$OUT/app.png"

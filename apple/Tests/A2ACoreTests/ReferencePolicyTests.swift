@@ -17,6 +17,31 @@ private func seconds(_ s: Double, at start: Double = 0) -> SourceSpan {
 }
 
 @Suite struct ReferencePolicyTests {
+    @Test func longUtterancesSplitOnlyAtSafeTimedTokens() throws {
+        let policy = ReferencePolicy(speaker: SpeakerID("S1"))
+        let tokens = (0..<12).map { i in ASRToken(text: "\(i)", span: seconds(1, at: Double(i))) }
+        let h = ASRHypothesis(utterance: 1, tokens: tokens, isFinal: true, audioFrontier: 12 * rate)
+        let candidates = policy.referenceCandidates(of: h)
+        #expect(candidates.map(\.text) == ["012", "345", "678", "91011"])
+        #expect(candidates.allSatisfy { (policy.speechSpan(of: $0)?.durationSeconds ?? 100) <= policy.config.maxSeconds })
+        let coarse = ASRHypothesis(utterance: 1, tokens: [ASRToken(text: "whole", span: seconds(12))], isFinal: true, audioFrontier: 12 * rate)
+        #expect(policy.referenceCandidates(of: coarse).isEmpty)
+        let overlap = ASRHypothesis(utterance: 1, tokens: [ASRToken(text: "a", span: seconds(7)), ASRToken(text: "b", span: seconds(7, at: 5))], isFinal: true, audioFrontier: 12 * rate)
+        #expect(policy.referenceCandidates(of: overlap).isEmpty)
+    }
+
+    @Test func lockedReferenceNeverChangesWhenAnActorReturns() throws {
+        var config = ReferencePolicyConfig()
+        config.allowUpgrade = false
+        var policy = ReferencePolicy(speaker: SpeakerID("actor-A"), config: config)
+        let first = try #require(try policy.offer(span: seconds(3.5), text: "第一句。", levelDB: -20, clippedFraction: 0).get())
+        #expect(first.version == 1 && policy.isComplete)
+        #expect(policy.offer(span: seconds(6, at: 20), text: "后面的台词。", levelDB: -20, clippedFraction: 0) == .failure(.complete))
+        #expect(policy.acceptedSeconds == 3.5)
+        policy.reset(speaker: SpeakerID("actor-B"))
+        #expect(!policy.isComplete && policy.acceptedSeconds == 0)
+    }
+
     @Test func speechSpanPadsTokenTimingAndNeedsFinalTimedResults() {
         let policy = ReferencePolicy(speaker: SpeakerID("S1"))
         let pad = policy.config.paddingSamples

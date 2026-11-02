@@ -60,12 +60,26 @@ let package = Package(
         // Third-party model packages are added per selected combination (T0.2/T0.3).
         .target(name: "A2AModels", dependencies: ["A2ACore", "A2AMedia"]),
 
+        // Delayed picture of the source window (ADR-0012): capture, hardware encode, and
+        // presentation on a host-clock timebase. App only; frames never leave memory.
+        .target(name: "A2AVideo"),
+
+        // Offline comparison tools only; never linked into the app or live pipeline.
+        .target(name: "A2ALegacyModels", dependencies: ["A2ACore", "A2AModels"]),
+
         .executableTarget(
             name: "a2a-tapctl",
             dependencies: ["A2ACore", "A2AAudio", "A2ATrace", "A2AMedia", "A2ARTShim"],
             path: "Tools/a2a-tapctl",
             exclude: ["Info.plist"],
             linkerSettings: embeddedInfoPlist("a2a-tapctl") + sdkVersionStamp()
+        ),
+        .executableTarget(
+            name: "a2a-loopprobe",
+            dependencies: ["A2AAudio", "A2AMedia", "A2ARTShim"],
+            path: "Tools/a2a-loopprobe",
+            exclude: ["Info.plist"],
+            linkerSettings: embeddedInfoPlist("a2a-loopprobe") + sdkVersionStamp()
         ),
         .executableTarget(
             name: "a2a-pipeline",
@@ -83,13 +97,13 @@ let package = Package(
         ),
         .executableTarget(
             name: "a2a-transcribe",
-            dependencies: ["A2ACore", "A2AMedia", "A2AModels"],
+            dependencies: ["A2ACore", "A2AMedia", "A2AModels", "A2ALegacyModels"],
             path: "Tools/a2a-transcribe",
             exclude: ["Info.plist"],
             linkerSettings: embeddedInfoPlist("a2a-transcribe") + sdkVersionStamp()
         ),
         .executableTarget(
-            name: "a2a-stage-probe", dependencies: ["A2ACore", "A2AMedia", "A2AModels"],
+            name: "a2a-stage-probe", dependencies: ["A2ACore", "A2AMedia", "A2AModels", "A2ALegacyModels"],
             path: "Tools/a2a-stage-probe", exclude: ["Info.plist"],
             linkerSettings: embeddedInfoPlist("a2a-stage-probe") + sdkVersionStamp()
         ),
@@ -105,12 +119,13 @@ let package = Package(
 
         .testTarget(name: "A2ACoreTests", dependencies: ["A2ACore"], exclude: ["Golden"]),
         .executableTarget(
-            name: "A2AApp", dependencies: ["A2ACore", "A2AAudio", "A2AModels"],
+            name: "A2AApp", dependencies: ["A2ACore", "A2AAudio", "A2AModels", "A2AVideo"],
             path: "Apps/A2A", exclude: ["Info.plist"], linkerSettings: sdkVersionStamp()
         ),
         .testTarget(name: "A2ATraceTests", dependencies: ["A2ATrace", "A2ACore"]),
         .testTarget(name: "A2AAudioTests", dependencies: ["A2AAudio", "A2ARTShim"]),
         .testTarget(name: "A2AMediaTests", dependencies: ["A2AMedia"]),
-        .testTarget(name: "A2AModelsTests", dependencies: ["A2AModels", "A2ACore"]),
+        .testTarget(name: "A2AVideoTests", dependencies: ["A2AVideo"]),
+        .testTarget(name: "A2AModelsTests", dependencies: ["A2AModels", "A2ACore", "A2ALegacyModels"]),
     ]
 )

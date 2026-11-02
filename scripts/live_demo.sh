@@ -8,8 +8,7 @@
 # Defaults: --out .local/runs/live-demo, --fixture .local/fixtures/zh-demo (generated with
 # a2a_harness.zh_demo when missing). Extra options go to a2a-pipeline, for example
 # `--max-debt-seconds 6 --max-source-lag-seconds 8`. Needs System Audio Recording for the
-# terminal, the zh_CN speech asset (a2a-preflight --install-speech-assets), installed
-# zh-Hans→en Translation languages, and ffplay. The system voice preserves no speaker
+# terminal, the Hy-SimulMT server, the English speech asset for back-transcription, and ffplay. The system voice preserves no speaker
 # identity: results are plumbing only.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -41,7 +40,7 @@ ffplay -autoexit -loglevel error -window_title "A2A demo (Mandarin source)" -x 6
 PLAYER=$!
 trap 'kill $PLAYER 2>/dev/null || true' EXIT
 status=0
-"$BIN/a2a-pipeline" --tap-pid "$PLAYER" --asr apple --mt apple --tts system --research-text \
+"$BIN/a2a-pipeline" --tap-pid "$PLAYER" --asr audio --mt hy --tts system --research-text \
   --seconds "$SECONDS_LIVE" --tail-seconds 15 --trace "$OUT/trace.jsonl" \
   --source-out "$OUT/source.wav" --translated-out "$OUT/translated.wav" ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"} \
   > "$OUT/summary.json" 2> >(tee "$OUT/pipeline.log" >&2) || status=$?

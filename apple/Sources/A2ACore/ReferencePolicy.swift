@@ -4,14 +4,16 @@
 //
 // A reference-conditioned (ICL) synthesizer needs the transcript to match the audio, so
 // only finalized utterances with recognizer token timing qualify, cut on their token spans.
-// The first version is due as soon as enough clean speech exists; one upgraded version
-// follows at the target length, then acquisition stops.
+// The first version is due as soon as enough clean speech exists. When upgrades are
+// enabled, one longer version follows at the target length; otherwise acquisition stops.
 
 public struct ReferencePolicyConfig: Sendable {
     /// Voiced audio needed before the first profile version.
     public var minSeconds = 3.0
     /// Voiced audio for the upgraded (final) profile version.
     public var targetSeconds = 8.0
+    /// Stop after the first usable reference. Live clones keep one voice for the session.
+    public var allowUpgrade = true
     /// Reference length cap; longer prefill slows every synthesis.
     public var maxSeconds = 10.0
     public var minSegmentSeconds = 0.3
@@ -19,6 +21,8 @@ public struct ReferencePolicyConfig: Sendable {
     public var paddingSamples: Int64 = 4_800
     public var minLevelDB: Float = -45
     public var maxClippedFraction = 0.002
+    /// Audio-only speaker conditioning does not require a transcript.
+    public var allowEmptyText = false
 
     public init() {}
 }
@@ -64,8 +68,8 @@ public struct ReferencePolicy: Sendable {
         self.config = config
     }
 
-    /// True once the upgraded version was issued; later utterances are not needed.
-    public var isComplete: Bool { version >= 2 }
+    /// Later utterances cannot replace a reference when upgrades are disabled.
+    public var isComplete: Bool { version >= (config.allowUpgrade ? 2 : 1) }
     public var hasIssuedProfile: Bool { version > 0 }
     public var acceptedSeconds: Double { segments.reduce(0) { $0 + $1.span.durationSeconds } }
 
@@ -83,13 +87,47 @@ public struct ReferencePolicy: Sendable {
         return SourceSpan(start: first, end: last)
     }
 
+    /// Split an overlong final only at independently timed token boundaries. Each
+    /// returned transcript still describes exactly the audio selected for it.
+    /// Coarse or overlapping timings are not safe evidence for cutting a reference.
+    public func referenceCandidates(of h: ASRHypothesis) -> [ASRHypothesis] {
+        guard h.isFinal, let full = speechSpan(of: h) else { return [] }
+        if full.durationSeconds <= config.maxSeconds { return [h] }
+        guard !h.tokens.isEmpty else { return [] }
+        var groups: [[ASRToken]] = []
+        var group: [ASRToken] = []
+        var start: Int64 = 0
+        var previousEnd: Int64 = -1
+        let maxSamples = Int64(config.maxSeconds * Double(canonicalSampleRate)) - 2 * config.paddingSamples
+        let targetSamples = Int64(config.minSeconds * Double(canonicalSampleRate))
+        guard maxSamples > 0 else { return [] }
+        for token in h.tokens {
+            guard let span = token.span, !span.isEmpty, span.end <= h.audioFrontier,
+                  span.start >= previousEnd, span.count <= maxSamples else { return [] }
+            if group.isEmpty { start = span.start }
+            if span.end - start > maxSamples {
+                groups.append(group)
+                group = []
+                start = span.start
+            }
+            group.append(token)
+            previousEnd = span.end
+            if span.end - start >= targetSamples {
+                groups.append(group)
+                group = []
+            }
+        }
+        if !group.isEmpty { groups.append(group) }
+        return groups.map { ASRHypothesis(utterance: h.utterance, tokens: $0, isFinal: true, audioFrontier: h.audioFrontier) }
+    }
+
     /// Offer one measured, finalized utterance. Returns the plan for a new profile version
     /// when this segment makes one due.
     public mutating func offer(span: SourceSpan, text: String, levelDB: Float,
                                clippedFraction: Double) -> Result<ReferencePlan?, ReferenceRejection> {
         if isComplete { return .failure(.complete) }
         let trimmed = text.trimmingWhitespace()
-        guard !trimmed.isEmpty else { return .failure(.empty) }
+        guard config.allowEmptyText || !trimmed.isEmpty else { return .failure(.empty) }
         guard span.durationSeconds >= config.minSegmentSeconds else { return .failure(.tooShort) }
         guard levelDB.isFinite, levelDB >= config.minLevelDB else { return .failure(.quiet) }
         guard clippedFraction <= config.maxClippedFraction else { return .failure(.clipped) }

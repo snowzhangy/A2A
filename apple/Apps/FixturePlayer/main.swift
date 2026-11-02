@@ -7,6 +7,7 @@
 //   FixturePlayer --silence [--seconds N]        opens output but renders digital silence
 //   --write-reference ref.wav                    also save exactly what is played (mono), the
 //                                                reference for `a2a-tapctl fidelity`
+//   --wait-for-stdin                             open output, then wait for a newline before playing
 
 import A2AMedia
 import AVFoundation
@@ -19,6 +20,7 @@ var startDelay = 0.0
 var gain: Float = 1.0
 var mode = "file"
 var referencePath: String?
+var waitForStdin = false
 
 var args = CommandLine.arguments.dropFirst().makeIterator()
 while let a = args.next() {
@@ -31,6 +33,7 @@ while let a = args.next() {
     case "--probe": mode = "probe"
     case "--silence": mode = "silence"
     case "--write-reference": referencePath = args.next()
+    case "--wait-for-stdin": waitForStdin = true
     default:
         FileHandle.standardError.write(Data("FixturePlayer: unknown argument \(a)\n".utf8))
         exit(2)
@@ -73,6 +76,7 @@ try engine.start()
 print("{\"pid\":\(getpid()),\"rate\":\(rate),\"frames\":\(samples.count),\"mode\":\"\(mode)\"}")
 fflush(stdout)
 
+if waitForStdin, readLine() == nil { engine.stop(); exit(0) }
 if startDelay > 0 { Thread.sleep(forTimeInterval: startDelay) }
 player.scheduleBuffer(buffer, at: nil, options: loop ? .loops : []) {}
 player.play()

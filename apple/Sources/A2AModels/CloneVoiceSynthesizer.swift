@@ -16,19 +16,37 @@ import Synchronization
 public enum CloneConditioning: String, Sendable, CaseIterable {
     /// Speaker embedding plus reference codec tokens and transcript (in-context learning).
     case icl
-    /// Speaker embedding only: robust to transcript errors, shorter prefill.
+    /// Audio-only input from the pipeline. Qwen uses a speaker embedding; backends
+    /// that require text transcribe the reference separately during preparation.
     case xvector
 }
 
 /// Worker-side pacing of one completed unit: numbers only, no text or audio.
 public struct CloneSynthesisStats: Sendable, Equatable {
-    /// WSOLA speed-up applied to fit the source span (1 = none).
+    /// WSOLA pacing applied to fit the source span: above 1 a long take was sped up, below 1 a
+    /// short one was slowed to end with the actor (fill), 1 = no pacing.
     public let pace: Double
     /// Shaped audio before pacing and quiet-run compaction.
     public let nativeSeconds: Double
     /// Audio actually sent to the host.
     public let audioSeconds: Double
     public let quietRemovedSeconds: Double
+    /// Character-count duration budget the worker enforced, and whether it stopped generation.
+    public let budgetSeconds: Double
+    public let truncated: Bool
+    /// Takes discarded because they produced no voiced audio before the worker's silent-take limit.
+    public let retries: Int
+
+    public init(pace: Double, nativeSeconds: Double, audioSeconds: Double, quietRemovedSeconds: Double,
+                budgetSeconds: Double = 0, truncated: Bool = false, retries: Int = 0) {
+        self.pace = pace
+        self.nativeSeconds = nativeSeconds
+        self.audioSeconds = audioSeconds
+        self.quietRemovedSeconds = quietRemovedSeconds
+        self.budgetSeconds = budgetSeconds
+        self.truncated = truncated
+        self.retries = retries
+    }
 }
 
 public struct CloneWorkerInfo: Sendable {
@@ -150,10 +168,15 @@ public final class CloneVoiceSynthesizer: VoiceSynthesizer, @unchecked Sendable 
     }
 
     public func synthesize(unit: UnitID, text: String, voice: PreparedVoice) -> AsyncThrowingStream<SynthesizedAudio, Error> {
-        synthesize(unit: unit, text: text, voice: voice, targetSeconds: nil)
+        synthesize(unit: unit, text: text, voice: voice, targetSeconds: nil, allowFill: false)
     }
 
     public func synthesize(unit: UnitID, text: String, voice: PreparedVoice, targetSeconds: Double?) -> AsyncThrowingStream<SynthesizedAudio, Error> {
+        synthesize(unit: unit, text: text, voice: voice, targetSeconds: targetSeconds, allowFill: false)
+    }
+
+    public func synthesize(unit: UnitID, text: String, voice: PreparedVoice, targetSeconds: Double?,
+                           allowFill: Bool) -> AsyncThrowingStream<SynthesizedAudio, Error> {
         // About 80 s of 0.32 s chunks; the driver forwards each chunk as it arrives.
         AsyncThrowingStream(bufferingPolicy: .bufferingOldest(256)) { continuation in
             let (id, failure) = shared.state.withLock { s -> (Int, String?) in
@@ -180,7 +203,11 @@ public final class CloneVoiceSynthesizer: VoiceSynthesizer, @unchecked Sendable 
             }
             var request: [String: Any] = ["op": "synth", "id": id,
                 "voice": Self.key(voice.speakerID, voice.profileVersion), "text": text]
-            if let targetSeconds, targetSeconds.isFinite, targetSeconds > 0 { request["target_s"] = targetSeconds }
+            if let targetSeconds, targetSeconds.isFinite, targetSeconds > 0 {
+                request["target_s"] = targetSeconds
+                // Only a slotted host may slow a take; see the protocol comment in A2ACore.
+                if allowFill { request["fill"] = true }
+            }
             send(request)
         }
     }
@@ -294,7 +321,9 @@ public final class CloneVoiceSynthesizer: VoiceSynthesizer, @unchecked Sendable 
                     s.stats[unit] = CloneSynthesisStats(
                         pace: (event["pace"] as? NSNumber)?.doubleValue ?? 1, nativeSeconds: number("native_s"),
                         audioSeconds: number("audio_s"),
-                        quietRemovedSeconds: number("quiet_samples_removed") / Double(sampleRate))
+                        quietRemovedSeconds: number("quiet_samples_removed") / Double(sampleRate),
+                        budgetSeconds: number("budget_s"), truncated: event["truncated"] as? Bool ?? false,
+                        retries: (event["retries"] as? NSNumber)?.intValue ?? 0)
                 }
                 return continuation
             }?.finish()

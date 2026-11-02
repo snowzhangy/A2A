@@ -66,6 +66,14 @@ def test_choose_speed_is_bounded_and_ignores_bad_targets():
     assert 1.0 < audio_pacing.choose_speed("x" * 60, 3.5, 0.075) < audio_pacing.MAX_SPEED
 
 
+def test_reference_duration_controls_pacing_when_available():
+    text = "A short line."
+    assert audio_pacing.choose_speed(text, 2.0, 0.075, 3.0) == audio_pacing.MAX_SPEED
+    assert audio_pacing.choose_speed(text, 2.0, 0.075, 1.0) == 1.0
+    for bad in (None, float("nan"), float("inf"), -1, 0):
+        assert audio_pacing.choose_speed(text, 2.0, 0.075, bad) == audio_pacing.choose_speed(text, 2.0, 0.075)
+
+
 def test_quiet_run_compactor_shortens_only_long_pauses():
     c = audio_pacing.QuietRunCompactor(RATE, max_pause=0.18)
     tone, short, long = voice(150, 0.2), np.zeros(RATE // 10, np.float32), np.zeros(RATE, np.float32)

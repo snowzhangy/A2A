@@ -87,6 +87,43 @@ def test_lag_coverage_and_disposition(tiny_fixture):
     assert gate["checks"]["lag_onset_median"] and not gate["checks"]["coverage"]
 
 
+def test_turn_timing_measures_dead_air_and_overrun_against_the_actor(tiny_fixture):
+    """Whether each line takes its actor's time (`turn_dead_air_s` / `turn_overrun_s`).
+
+    dub-anything re-times every line to end where the actor stops; this is the instrument for
+    whether a live run does the same. Both sides are durations, so the measure holds whatever
+    delay the run plays with: source span seconds against seconds actually on the bus."""
+    events = [ev(t, "buf.capture", span=[(t - 20) * 48, t * 48], frames=960) for t in range(20, 8020, 20)]
+    events += [ev(t, "buf.output", out_sample=t * 48, frames=960) for t in range(0, 8000, 20)]
+    events += [
+        # u1: 0.4 s of actor speech, 0.2 s of English: the tail of their turn is left silent.
+        ev(1500, "commit.source", unit="u1", spk="S1", span=[48_000, 67_200], reason="finalized",
+           timing_estimated=False, wait_ms=0, text="好的。"),
+        ev(1500, "play.start", unit="u1", out_sample=int(1.0 * 48_000)),
+        ev(1520, "play.end", unit="u1", out_sample=int(1.2 * 48_000)),
+        # u2: 0.4 s of actor speech, 0.5 s of English: it runs past their last sound.
+        ev(2600, "commit.source", unit="u2", spk="S1", span=[96_000, 115_200], reason="finalized",
+           timing_estimated=False, wait_ms=0, text="没有。"),
+        ev(2600, "play.start", unit="u2", out_sample=int(2.4 * 48_000)),
+        ev(2900, "play.end", unit="u2", out_sample=int(2.9 * 48_000)),
+        # u3: an artificial cut mid-speech has no actor end to land on, so it is not counted.
+        ev(5000, "commit.source", unit="u3", spk="S1", span=[200_000, 344_000], reason="max_length",
+           timing_estimated=True, wait_ms=0, text="好的。"),
+        ev(5000, "play.start", unit="u3", out_sample=int(5.0 * 48_000)),
+        ev(5100, "play.end", unit="u3", out_sample=int(5.1 * 48_000)),
+        # Never played: no English to place.
+        ev(6000, "commit.source", unit="u4", spk="S1", span=[300_000, 320_000], reason="finalized",
+           timing_estimated=False, wait_ms=0, text="好的。"),
+    ]
+    events.sort(key=lambda e: e["t_ns"])
+    m = metrics.compute(events, tiny_fixture)
+    assert m["turn_dead_air_s"]["n"] == 1 and m["turn_dead_air_s"]["median"] == pytest.approx(0.2, abs=1e-6)
+    assert m["turn_overrun_s"]["n"] == 1 and m["turn_overrun_s"]["median"] == pytest.approx(0.1, abs=1e-6)
+    assert m["turn_timing_n"] == 2
+    gaps = {r["unit"]: r["turn_gap_s"] for r in m["per_unit"] if "turn_gap_s" in r}
+    assert gaps == {"u1": pytest.approx(0.2), "u2": pytest.approx(-0.1)}
+
+
 def test_future_access_violation_is_detected():
     feed = [{"t_ns": 1_000, "start_frames": 0, "frames": 960}, {"t_ns": 2_000, "start_frames": 960, "frames": 1_920}]
     ok = [ev(0.0015, "buf.capture", span=[0, 960], frames=960)]

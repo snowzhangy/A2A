@@ -5,6 +5,8 @@
 // 2. A unit closes at a clause boundary or at a finalized utterance. A VAD end only
 //    requests finalization. The reconsideration window never forces an unsafe split.
 // 3. Unfinished numbers, negation, and dangling function words wait for context.
+// 4. An un-finalized unit that already covers `maxUnitSourceSeconds` of speech closes at its
+//    last safe boundary rather than holding the whole utterance (M4).
 
 public struct CommitPolicyConfig: Sendable {
     /// Stable-but-uncommitted material older than this asks for weaker boundary evidence.
@@ -17,6 +19,17 @@ public struct CommitPolicyConfig: Sendable {
     public var preferWordBoundaries = false
     /// Live mode may use stable conjunctions and timed pauses before sentence finality.
     public var streamingClauses = false
+    /// A unit that covers this much source speech closes at its last safe boundary without
+    /// waiting for finalization. Key counts mean different speech durations across languages,
+    /// so the budget is measured in source seconds. Zero disables the rule.
+    public var maxUnitSourceSeconds: Double = 4
+    /// Stable keys a length-forced cut leaves behind, so the rest of the utterance stays
+    /// splittable and a cut never strands one or two characters.
+    public var minTailKeys = 3
+    /// Keys the clause must already carry before the seconds budget may cut it. A recognizer
+    /// that keeps VAD open over music advances its audio frontier without new text, and the
+    /// floor keeps that from cutting a short clause nobody meant to end.
+    public var lengthClauseMinKeys = 12
     /// Silence between consecutive timed tokens that closes a clause (180 ms of source).
     public var minClausePauseSamples: Int64 = 8_640
 
@@ -29,7 +42,9 @@ public enum CommitReason: String, Sendable {
     case finalized
     case conjunction
     case forcedLength = "forced_length"
+    case lengthClause = "length_clause"
     case prosodicPause = "prosodic_pause"
+    case audioSegment = "audio_segment"
 }
 
 public struct SourceUnit: Hashable, Sendable {
@@ -73,8 +88,23 @@ public enum CommitOutput: Hashable, Sendable {
     case abandoned(utterance: Int, text: String)
 }
 
+/// Decides whether a cut falls inside a word.
+///
+/// Keys are not words. The recognizers emit one key per Han character while Mandarin
+/// words run one to four characters, so no rule that inspects keys or spaces can see a
+/// cut like `…讨 | 论…` — which is what the length budget did to an idiom and to a proper
+/// noun in the real-clip replay of reports/week2/length-clause-commits.md. A2ACore stays
+/// model-free, so a host with an on-device segmenter injects one (see
+/// `NaturalLanguageWordSegmenter`).
+public protocol WordSegmenter: Sendable {
+    /// True when the character offset `offset` in `text` lies strictly inside a word.
+    func splitsWord(in text: String, at offset: Int) -> Bool
+}
+
 public struct CommitPolicy: Sendable {
     public let config: CommitPolicyConfig
+    /// Nil keeps the Latin-only rule. Han hosts inject a segmenter: see `WordSegmenter`.
+    private let wordSegmenter: (any WordSegmenter)?
     private var nextUnit: Int
     private var utterance: Int?
     private var previousKeys: [String]?
@@ -87,8 +117,10 @@ public struct CommitPolicy: Sendable {
     private var lastHold: HoldReason?
     private var revisionReported = false
 
-    public init(config: CommitPolicyConfig = .init(), firstUnit: Int = 1) {
+    public init(config: CommitPolicyConfig = .init(), firstUnit: Int = 1,
+                wordSegmenter: (any WordSegmenter)? = nil) {
         self.config = config
+        self.wordSegmenter = wordSegmenter
         self.nextUnit = firstUnit
     }
 
@@ -142,15 +174,23 @@ public struct CommitPolicy: Sendable {
         let text = NormalizedText(h.text)
         lastText = text
         let keys = text.keys
-        let f = committedKeys.count
 
-        // The committed prefix must survive; otherwise report once and continue past it.
-        if keys.count < f || Array(keys[0..<f]) != committedKeys {
+        // The committed prefix must survive; otherwise report once and try to re-align.
+        if keys.count < committedKeys.count || Array(keys[0..<committedKeys.count]) != committedKeys {
             if !revisionReported {
-                out.append(.revisionBehindFrontier(utterance: h.utterance, committedKeys: f))
+                out.append(.revisionBehindFrontier(utterance: h.utterance, committedKeys: committedKeys.count))
                 revisionReported = true
             }
+            // The usual revision is punctuation the recognizer adds late, which inserts keys
+            // into text that was already spoken. Without re-alignment the frontier index points
+            // into the inserted keys and the next unit speaks the words after it a second time.
+            if let aligned = reSync(committedKeys, with: keys) {
+                committedKeys = Array(keys[0..<aligned])
+                while keyStableAt.count > aligned { keyStableAt.removeLast(keyStableAt.count - aligned) }
+                while keyStableAt.count < aligned { keyStableAt.append(tNs) }
+            }
         }
+        let f = committedKeys.count
 
         let stable: Int
         if h.isFinal {
@@ -201,11 +241,24 @@ public struct CommitPolicy: Sendable {
                 }
                 // A confirmed connective with a stable suffix is stronger evidence than a timer.
                 if stable - f >= 8, let split = conjunctionSplit(in: text, from: f, to: stable),
-                   stable - split >= 3 {
+                   stable - split >= config.minTailKeys {
                     out.append(.commit(makeUnit(text: text, hypothesis: h, keys: f..<split,
                                                 reason: .conjunction, at: tNs)))
                     continue
                 }
+            }
+            // Meetings produce recognizer utterances of 10-14 s (measured: 24 of 29 commits in
+            // reports/week2/dub-anything-review.md waited for finalization, longest unit 14.1 s).
+            // Once a stable unit exceeds its budget, holding it costs a whole utterance of lag
+            // and projects English 1.7x its own length into the debt, so close it at the latest
+            // safe position instead.
+            if pendingKeys >= config.lengthClauseMinKeys,
+               let seconds = pendingSourceSeconds(text: text, hypothesis: h, stable: stable),
+               seconds >= config.maxUnitSourceSeconds,
+               let split = lateBoundary(in: text, from: f, to: stable) {
+                out.append(.commit(makeUnit(text: text, hypothesis: h, keys: f..<split,
+                                            reason: .lengthClause, at: tNs)))
+                continue
             }
             if pendingKeys >= config.maxUnitKeys {
                 let end = forcedSplit(in: text, from: f, to: stable)
@@ -254,6 +307,76 @@ public struct CommitPolicy: Sendable {
         return nil
     }
 
+    /// Index just past the committed keys in a revised hypothesis, skipping keys the recognizer
+    /// inserted (late punctuation). Nil when the change is in spoken content, where no alignment
+    /// is safe and the frontier must stay where it is.
+    private func reSync(_ committed: [String], with keys: [String]) -> Int? {
+        var i = 0
+        for k in committed {
+            while i < keys.count, keys[i] != k {
+                guard CommitLexicon.punctuation.contains(keys[i]) else { return nil }
+                i += 1
+            }
+            guard i < keys.count else { return nil }
+            i += 1
+        }
+        return i
+    }
+
+    /// Source speech the pending unit covers, from where uncovered source begins to the newest
+    /// stable key. That key's own token timing is preferred when the recognizer reports one: an
+    /// utterance held open over music advances the audio frontier without any speech.
+    private func pendingSourceSeconds(text: NormalizedText, hypothesis h: ASRHypothesis,
+                                      stable: Int) -> Double? {
+        guard config.maxUnitSourceSeconds > 0, stable > 0 else { return nil }
+        let start = uncommittedStart
+        let spans = charSpans(for: h)
+        let raw = text.rawIndex[stable - 1]
+        let end = raw < spans.count ? spans[raw]?.end ?? h.audioFrontier : h.audioFrontier
+        guard end > start else { return nil }
+        return Double(end - start) / Double(canonicalSampleRate)
+    }
+
+    /// Recognizer timing for every raw character of the hypothesis (nil where a token has none).
+    private func charSpans(for h: ASRHypothesis) -> [SourceSpan?] {
+        var spans: [SourceSpan?] = []
+        spans.reserveCapacity(h.tokens.reduce(0) { $0 + $1.text.count })
+        for token in h.tokens { for _ in token.text { spans.append(token.span) } }
+        return spans
+    }
+
+    /// Latest boundary in `(from, to)` that leaves a splittable tail and a safe ending.
+    /// Cutting as late as possible keeps the delivered clause as natural as a forced split
+    /// can be; the cut happens only because the unit is already over budget.
+    private func lateBoundary(in text: NormalizedText, from: Int, to: Int) -> Int? {
+        var p = to - config.minTailKeys
+        while p - from >= config.minCommaUnitKeys {
+            if unsafeEnding(text.rawText(keys: from..<p)) == nil, !splitsAnyWord(text, at: p) {
+                return p
+            }
+            p -= 1
+        }
+        return nil
+    }
+
+    /// True when cutting before key `p` would split a Latin word in space-delimited text.
+    private func splitsWord(_ text: NormalizedText, at p: Int) -> Bool {
+        guard p > 0, p < text.keys.count, text.rawIndex[p] == text.rawIndex[p - 1] + 1 else { return false }
+        func wordPart(_ key: String) -> Bool {
+            key.first.map { $0.isLetter || $0.isNumber || "'’-".contains($0) } == true
+        }
+        return wordPart(text.keys[p - 1]) && wordPart(text.keys[p])
+    }
+
+    /// True when cutting before key `p` would split a word. The Latin rule stays behind
+    /// `preferWordBoundaries` because there spaces are the only cue; an injected segmenter
+    /// always applies, because per-character keys reveal nothing about Han words.
+    private func splitsAnyWord(_ text: NormalizedText, at p: Int) -> Bool {
+        if config.preferWordBoundaries, splitsWord(text, at: p) { return true }
+        guard let wordSegmenter, p > 0, p < text.keys.count else { return false }
+        return wordSegmenter.splitsWord(in: String(text.raw), at: text.rawIndex[p])
+    }
+
     private func conjunctionSplit(in text: NormalizedText, from: Int, to: Int) -> Int? {
         let keys = text.keys
         var p = to - 1
@@ -289,21 +412,16 @@ public struct CommitPolicy: Sendable {
 
     private func forcedSplit(in text: NormalizedText, from: Int, to: Int) -> Int {
         let limit = min(to, from + config.maxUnitKeys)
-        func wordPart(_ key: String) -> Bool {
-            key.first.map { $0.isLetter || $0.isNumber || "'’-".contains($0) } == true
-        }
         var p = limit
         while p > from + config.minCommaUnitKeys {
-            if config.preferWordBoundaries, p < text.keys.count,
-               text.rawIndex[p] == text.rawIndex[p - 1] + 1,
-               wordPart(text.keys[p - 1]), wordPart(text.keys[p]) {
+            if splitsAnyWord(text, at: p) {
                 p -= 1
                 continue
             }
             if unsafeEnding(text.rawText(keys: from..<p)) == nil { return p }
             p -= 1
         }
-        return limit
+        return limit   // nowhere safe at all: split rather than hold a unit forever
     }
 
     private func isDecimalPoint(_ text: NormalizedText, at i: Int, stableEnd: Int) -> Bool {
@@ -342,11 +460,7 @@ public struct CommitPolicy: Sendable {
     private func spanFor(text: NormalizedText, hypothesis h: ASRHypothesis, keys range: Range<Int>) -> (SourceSpan, Bool) {
         let start = max(speechOnset, lastUnitEnd ?? speechOnset)
         let estimate = SourceSpan(start: start, end: max(start, h.audioFrontier))
-        var charSpans: [SourceSpan?] = []
-        charSpans.reserveCapacity(text.raw.count)
-        for token in h.tokens {
-            for _ in token.text { charSpans.append(token.span) }
-        }
+        let charSpans = charSpans(for: h)
         var merged: SourceSpan?
         for k in range {
             let ri = text.rawIndex[k]

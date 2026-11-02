@@ -50,6 +50,12 @@ uv run --project research python research/voice_models.py --install omnivoice
 uv run --project research python research/voice_models.py --install chatterbox
 ```
 
+OmniVoice's worker estimates duration from the current speaker's reference text and
+audio tokens. Model warmup occurs once; new OmniVoice profiles encode their references
+without synthesizing another warm-up sentence. The first complete phrase supplies a
+bounded loudness estimate, and fluent pacing uses the reference-based duration.
+Whole-phrase generation remains slower to first audio than Qwen's streaming path.
+
 OmniVoice includes its full reference-audio codec (about 2.0 GB combined). Chatterbox
 Multilingual V3 includes a separately pinned S3TokenizerV2 dependency (about 3.2 GB
 combined). Chatterbox's loader initializes the verified local tokenizer directly, avoiding

@@ -19,9 +19,13 @@ private struct Dialogue {
     var effects: [PipelineEffect] = []
     private var captured: Int64 = 0
 
-    init(fluent: Bool = true, voices: [SpeakerID] = [s1, s2]) {
+    init(fluent: Bool = true, voices: [SpeakerID] = [s1, s2], locked: Bool = false, attributed: Bool = false,
+         carry: Double? = nil) {
         var config = PipelineConfig(session: "dialogue")
         config.multiSpeaker = true
+        config.pinSpeakerProfiles = locked
+        config.requireSpeakerAttribution = attributed
+        if let carry { config.unlabeledSpeakerCarrySeconds = carry }
         config.finishPhraseBeforeCatchUp = fluent
         config.originalAudioEnabled = false
         p = SessionPipeline(config: config)
@@ -45,6 +49,12 @@ private struct Dialogue {
 
     mutating func label(_ speaker: SpeakerID, from start: Double, to end: Double, at t: Double) {
         run(t, .speaker(.assign(speaker, span(start, end))))
+    }
+
+    /// A VAD pause: the tracker ends the stretch it has been labeling, so the next speech is
+    /// a new turn and needs its own label.
+    mutating func pause(afterSeconds seconds: Double, at t: Double) {
+        run(t, .vad(.speechEnd(Int64(seconds * rate))))
     }
 
     @discardableResult
@@ -73,6 +83,134 @@ private struct Dialogue {
 }
 
 @Suite struct MultiSpeakerTests {
+    @Test func returningActorsKeepTheirFirstVoiceDespiteLaterProfileEvents() {
+        var d = Dialogue(locked: true, attributed: true)
+        let turns = [s1, s2, s1, s2]
+        for (i, actor) in turns.enumerated() {
+            let start = Double(i * 2) + 0.2
+            d.label(actor, from: start, to: start + 1.0, at: start + 1.1)
+            if i >= 2 { d.run(start + 1.2, .profileReady(actor, version: 2)) }
+            d.commit(i + 1, from: start, to: start + 1.0, at: start + 1.3)
+        }
+        #expect(d.jobs().map(\.speaker) == turns)
+        #expect(d.jobs().map(\.profileVersion) == [1, 1, 1, 1])
+        #expect(d.traces(.profileReady).count == 2)
+    }
+
+    @Test func translationThatBeatsTheSpeakerLabelWaitsForTheReturningActor() {
+        var d = Dialogue(locked: true, attributed: true)
+        d.label(s2, from: 0.2, to: 1, at: 1.1)
+        d.pause(afterSeconds: 1.2, at: 1.15)  // the labeled stretch ended: the next turn is unknown
+        d.commit(1, from: 1.5, to: 3.1, at: 3.2)
+        #expect(d.jobs().isEmpty)
+        // A profile-ready event for the previous actor must not release the guess.
+        d.run(3.25, .profileReady(s2, version: 2))
+        #expect(d.jobs().isEmpty)
+        d.label(s1, from: 1.5, to: 3.1, at: 3.4)
+        #expect(d.jobs().map(\.speaker) == [s1])
+        #expect(d.jobs().map(\.profileVersion) == [1])
+    }
+
+    @Test func aBriefReplyJustAfterAPauseContinuesThePreviousSpeaker() {
+        // Measured: most unlabeled pieces are short replies a moment after a pause, and at
+        // 3 s / 1 s limits no real turn was mislabeled by carrying them.
+        var d = Dialogue(locked: true, attributed: true)
+        d.label(s2, from: 0.2, to: 1, at: 1.1)
+        d.pause(afterSeconds: 1.1, at: 1.2)
+        d.commit(1, from: 1.4, to: 2.1, at: 2.2)   // 0.7 s, 0.4 s after the pause
+        #expect(d.jobs().map(\.speaker) == [s2])
+        #expect(d.traces(.commitTarget).contains { $0.jsonLine().contains("\"speaker_carried\":true") })
+    }
+
+    @Test func aBriefReplyTooFarAfterAPauseStillWaitsForItsOwnLabel() {
+        var d = Dialogue(locked: true, attributed: true)
+        d.label(s2, from: 0.2, to: 1, at: 1.1)
+        d.pause(afterSeconds: 1.1, at: 1.2)
+        d.commit(1, from: 4.6, to: 5.3, at: 5.4)   // 3.6 s after that label ended
+        #expect(d.jobs().isEmpty)
+    }
+
+    @Test func anUnlabeledTurnAfterAPauseExpiresInsteadOfBorrowingThePreviousActorsVoice() {
+        var d = Dialogue(locked: true, attributed: true)
+        d.label(s2, from: 0.2, to: 1, at: 1.1)
+        // The labeled stretch ended, and what follows is a turn of its own (1.6 s): whoever
+        // speaks has to be identified again.
+        d.pause(afterSeconds: 1.2, at: 1.3)
+        d.commit(1, from: 1.5, to: 3.1, at: 3.2)
+        d.run(7.6, .tick)   // the source-lag limit for that piece has run out
+        #expect(d.jobs().isEmpty)
+        #expect(d.traces(.sourceDisposition).contains { $0.jsonLine().contains("\"reason\":\"no_speaker\"") })
+        d.label(s1, from: 1.5, to: 3.1, at: 7.7)
+        #expect(d.jobs().isEmpty)   // an expired line is never voiced late
+    }
+
+    @Test func speechWithNoPauseInheritsTheSpeakerOfTheLabeledPiece() {
+        // The tracker labels a 3 s piece of a long turn and stays silent on the next: the
+        // voiceprint of the labeled piece covers the whole uninterrupted stretch.
+        var d = Dialogue(locked: true, attributed: true)
+        d.label(s2, from: 0.2, to: 3, at: 3.1)
+        d.commit(1, from: 3, to: 6, at: 6.1)
+        #expect(d.jobs().map(\.speaker) == [s2])
+        #expect(d.traces(.commitTarget).contains { $0.jsonLine().contains("\"speaker_carried\":true") })
+        // …and the piece after that, while the stretch is still within the carry limit.
+        d.commit(2, from: 6, to: 9, at: 9.1)
+        #expect(d.jobs().map(\.speaker) == [s2, s2])
+    }
+
+    @Test func aLaterLabelNeverFlowsBackIntoAnEarlierUnlabeledPiece() {
+        var d = Dialogue(locked: true, attributed: true)
+        d.commit(1, from: 0.2, to: 3, at: 3.1)
+        #expect(d.jobs().isEmpty)
+        d.label(s2, from: 3, to: 6, at: 6.1)
+        #expect(d.jobs().isEmpty)
+    }
+
+    @Test func theCarryEndsAtItsLimitAndThePieceWaitsAgain() {
+        var d = Dialogue(locked: true, attributed: true)
+        d.label(s2, from: 0.2, to: 3, at: 3.1)
+        d.commit(1, from: 12, to: 15, at: 15.1)   // 9 s of unlabeled speech since the label
+        #expect(d.jobs().isEmpty)
+        d.run(20.1, .tick)   // the wait for a label of its own has run out
+        #expect(d.traces(.sourceDisposition).contains { $0.jsonLine().contains("\"reason\":\"no_speaker\"") })
+    }
+
+    @Test func theCarryIsSwitchableOffForComparingRuns() {
+        var d = Dialogue(locked: true, attributed: true, carry: 0)
+        d.label(s2, from: 0.2, to: 3, at: 3.1)
+        d.commit(1, from: 3, to: 6, at: 6.1)
+        #expect(d.jobs().isEmpty)
+    }
+
+    @Test func anUnrelatedTurnCannotReassignAUnitWaitingForItsOwnVoice() {
+        var d = Dialogue(voices: [s1], locked: true, attributed: true)
+        d.label(s2, from: 0.2, to: 1.2, at: 1.3)
+        d.commit(1, from: 0.2, to: 1.2, at: 1.4)
+        #expect(d.jobs().isEmpty)
+        // A later, disjoint span cannot reassign this waiting unit to S1.
+        d.label(s1, from: 1.5, to: 2.5, at: 2.6)
+        #expect(d.jobs().isEmpty)
+        d.run(2.7, .profileReady(s2, version: 1))
+        #expect(d.jobs().map(\.speaker) == [s2])
+    }
+
+    @Test func aSmallOrTiedLabeledShareCannotSelectThePreviousActor() {
+        var d = Dialogue(locked: true, attributed: true)
+        d.label(s2, from: 0.2, to: 0.7, at: 1.3)
+        d.commit(1, from: 0.2, to: 1.2, at: 1.4)
+        #expect(d.jobs().isEmpty)
+        d.label(s1, from: 0.7, to: 1.2, at: 1.6)
+        #expect(d.jobs().isEmpty)
+    }
+
+    @Test func aSourceDiscontinuityAllowsANewSessionVoice() {
+        var d = Dialogue(locked: true, attributed: true)
+        d.run(0.1, .discontinuity("test"))
+        d.run(0.2, .profileReady(s1, version: 2))
+        d.label(s1, from: 0.3, to: 1.3, at: 1.4)
+        d.commit(1, from: 0.3, to: 1.3, at: 1.5)
+        #expect(d.jobs().map(\.profileVersion) == [2])
+    }
+
     @Test func eachUnitIsVoicedByTheSpeakerWhoSaidIt() {
         var d = Dialogue()
         d.label(s1, from: 0.2, to: 2.0, at: 2.3)

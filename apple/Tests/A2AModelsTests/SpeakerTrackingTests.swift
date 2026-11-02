@@ -145,6 +145,41 @@ private let gap = [Float](repeating: 0, count: 9_600)   // 0.6 s
         #expect(tracker.speakerCount >= 2)
     }
 
+    /// Two speakers talk, a passing voice takes the last slot, and after a long quiet a new voice
+    /// arrives. The passing voice gives up its slot; its ID is never handed out again.
+    @Test func aPassingVoiceGivesItsSlotToANewSpeaker() {
+        let regulars: [(Double, Double)] = [(100, 0.9), (260, 1.35)]
+        var audio: [Float] = []
+        for turn in 0..<8 { audio += voice(f0: regulars[turn % 2].0, scale: regulars[turn % 2].1, syllables: 8, offset: turn) + gap }
+        for turn in 0..<2 { audio += voice(f0: 300, scale: 1.5, syllables: 8, offset: turn) + gap }
+        let opening = audio.count
+        audio += [Float](repeating: 0, count: 16_000 * 31)
+        for turn in 0..<4 {
+            audio += voice(f0: 190, scale: 0.8, syllables: 8, offset: turn) + gap
+            audio += voice(f0: regulars[turn % 2].0, scale: regulars[turn % 2].1, syllables: 8, offset: turn) + gap
+        }
+        var config = VoiceprintSpeakerTracker.Config()
+        config.maxSpeakers = 3
+        func run(_ config: VoiceprintSpeakerTracker.Config) -> (before: Set<String>, after: [String], count: Int) {
+            var tracker = VoiceprintSpeakerTracker(config: config)
+            let labels = track(audio, tracker: &tracker)
+            let split = Int64(opening * 3)
+            return (Set(labels.filter { $0.1.end <= split }.map(\.0.rawValue)),
+                    labels.filter { $0.1.start > split }.map(\.0.rawValue), tracker.speakerCount)
+        }
+        let recycled = run(config)
+        #expect(recycled.before == ["S1", "S2", "S3"])
+        // Once its second turn confirms it, the newcomer is S4; the regulars keep their own IDs.
+        #expect(recycled.after.dropFirst() == ["S1", "S4", "S2", "S4", "S1", "S4", "S2"])
+        #expect(recycled.count == 3)
+
+        config.staleSegments = 0
+        let capped = run(config)
+        #expect(capped.before == recycled.before)
+        // With no slot to free, the newcomer is read as someone already known.
+        #expect(Set(capped.after).isSubset(of: capped.before))
+    }
+
     @Test func shortRepliesCanReuseAKnownVoiceWithoutInventingAnotherSpeaker() {
         var tracker = VoiceprintSpeakerTracker()
         let initial = track(voice(f0: 120, scale: 1, syllables: 8) + gap, tracker: &tracker)
@@ -291,5 +326,51 @@ private let gap = [Float](repeating: 0, count: 9_600)   // 0.6 s
         #expect(store.count == 1)
         #expect(try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).count == 2)
         #expect(try VoiceMemoryStore(directory: root).match(printFor(samples))?.identityID == identity)
+    }
+}
+
+/// The energy VAD, the segmenter and the stream feed together: a streaming translator hears every
+/// closed span exactly once, in order, and never a sample past the end of the span it belongs to.
+@Suite struct AudioStreamFeedVADTests {
+    @Test func streamedAudioTilesEveryClosedSpanAndNothingElse() {
+        var rng = SystemRandomNumberGenerator()
+        for trial in 0..<20 {
+            var vad = EnergyVAD()
+            var segments = AudioSegmentPolicy(maxSeconds: 3, minSeconds: 0.25)
+            var feed = AudioStreamFeed(maxSamples: segments.maxSamples, minAppendSeconds: trial % 2 == 0 ? 0.1 : 0)
+            var pending: [SourceSpan] = []   // appends since the last close or discard
+            var closed: [SourceSpan] = []
+            var heard: [SourceSpan] = []
+            var position: Int64 = 0
+            var voiced = false
+            var run = 0
+            for _ in 0..<1_500 {
+                if run == 0 {
+                    voiced.toggle()
+                    run = Int.random(in: voiced ? 3...400 : 1...60, using: &rng)   // 10 ms blocks
+                }
+                run -= 1
+                let block = Int64([480, 512, 960].randomElement(using: &rng)!)
+                let span = SourceSpan(start: position, end: position + block)
+                position += block
+                let frame = AudioFrame16k(span: span, samples: [Float](repeating: voiced ? 0.1 : 0.0001, count: Int(block / 3)))
+                let events = vad.process(frame)
+                let spans = segments.process(events: events, frontier: span.end)
+                closed += spans
+                for action in feed.update(closed: spans, openStart: segments.openStart, voicedEnd: vad.voicedEnd) {
+                    switch action {
+                    case .append(let s): pending.append(s)
+                    case .discard: pending.removeAll()
+                    case .close(let s):
+                        // Contiguous appends from the span's start to its end.
+                        #expect(pending.first?.start == s.start && pending.last?.end == s.end)
+                        #expect(zip(pending, pending.dropFirst()).allSatisfy { $0.end == $1.start })
+                        heard.append(s)
+                        pending.removeAll()
+                    }
+                }
+            }
+            #expect(heard == closed)
+        }
     }
 }

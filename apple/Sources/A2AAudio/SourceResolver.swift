@@ -16,8 +16,31 @@ public struct ResolvedSource: Sendable {
     public let appRoot: String?
     public let members: [Member]
     public let excluded: [Member]
+    /// A global tap: the machine's whole output mix, so there is no app to choose. `members` then names
+    /// nothing and `excluded` holds the processes the tap leaves out — ours, so the mixer never hears its
+    /// own English coming back.
+    public var global = false
 
     public var objectIDs: [AudioObjectID] { members.map(\.process.objectID) }
+
+    /// True when every process this source names has exited. A global source names none — whoever is
+    /// playing may come and go — and an empty list would make `allSatisfy` vacuously true, so both answer
+    /// "not gone"; for the whole mix only a capture stall says anything.
+    public func processesAllExited(liveness: (pid_t) -> Bool = { kill($0, 0) != 0 && errno == ESRCH }) -> Bool {
+        guard !global, !members.isEmpty else { return false }
+        return members.allSatisfy { liveness($0.process.pid) }
+    }
+
+    /// True when a capture with no frames is only a quiet machine. A global tap gets no callbacks at all
+    /// until something plays, so frames are missing for a reason only while another process has a running
+    /// output. A process tap is never idle in this sense: missing frames there are a stall, as before.
+    public func mixIsIdle(processes: [AudioProcessInfo], selfPID: pid_t = getpid(),
+                          selfBundleRoot: String? = SourceResolver.ownAppRoot()) -> Bool {
+        guard global else { return false }
+        return !processes.contains {
+            $0.isRunningOutput && !SourceResolver.isSelf($0, selfPID: selfPID, selfBundleRoot: selfBundleRoot)
+        }
+    }
 }
 
 public enum SourceResolutionError: Error, CustomStringConvertible {
@@ -80,6 +103,32 @@ public enum SourceResolver {
         guard let p = processes.first(where: { $0.pid == pid }) else { throw SourceResolutionError.notFound("pid \(pid)") }
         return ResolvedSource(bundleID: p.bundleID, appRoot: p.appBundleRoot,
                               members: [.init(process: p, reason: "explicit pid")], excluded: [])
+    }
+
+    /// The machine's output as the source. Every app is heard, including ones started after the session,
+    /// so nothing has to be picked; our own processes are the tap's exclusion list.
+    public static func systemAudio(processes: [AudioProcessInfo], selfPID: pid_t = getpid(),
+                                   selfBundleRoot: String? = ownAppRoot()) -> ResolvedSource {
+        let own = processes.filter { isSelf($0, selfPID: selfPID, selfBundleRoot: selfBundleRoot) }
+        return ResolvedSource(bundleID: "system:audio", appRoot: nil, members: [],
+                              excluded: own.map { ResolvedSource.Member(process: $0, reason: "our own output, kept out of the mix") },
+                              global: true)
+    }
+
+    /// The `.app` holding this executable, if it lives in one. The app's helper runs from
+    /// `A2A.app/Contents/Helpers`, where `Bundle.main` is not the app bundle itself.
+    public static func ownAppRoot(_ executable: String? = nil) -> String? {
+        if let executable { return appRoot(in: executable) }
+        return appRoot(in: Bundle.main.bundlePath) ?? appRoot(in: Bundle.main.executablePath ?? "")
+    }
+
+    private static func appRoot(in path: String) -> String? {
+        var prefix = ""
+        for component in path.split(separator: "/") {
+            prefix += "/" + component
+            if component.hasSuffix(".app") { return prefix }
+        }
+        return nil
     }
 
     static func isSelf(_ p: AudioProcessInfo, selfPID: pid_t, selfBundleRoot: String?) -> Bool {

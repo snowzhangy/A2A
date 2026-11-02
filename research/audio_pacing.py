@@ -2,6 +2,10 @@
 
 WSOLA changes duration while retaining pitch. Limits deliberately favor intelligibility
 over an exact duration match. Silence compaction only affects unusually long quiet runs.
+Pacing is symmetric: a take longer than the speech it translates speeds up, and a take
+shorter than that speech slows down so the line ends where the actor stops (fill). Only
+the host that plays each phrase in its own slot asks for the slow side, because there a
+shorter take is silence over the actor's own tail rather than saved latency.
 NumPy is optional so the standard-library fake worker can import this module; without it,
 `available` is False and callers skip pacing.
 """
@@ -18,6 +22,19 @@ available = np is not None
 # Faster speech costs more naturalness than the latency it saves; the host's catch-up
 # skipping handles the remaining debt. Matches the system voice's cap.
 MAX_SPEED = 1.3
+# Slowest speech worth emitting. dub-anything re-times each take between 0.8x and 1.25x of
+# the model's own pace and its listeners preferred the re-timed dub: the exchange's rhythm,
+# lines taking the time the actor takes, mattered at least as much as the acting. It resamples
+# (pitch moves with duration); WSOLA keeps pitch, and holding the time rather than the pitch
+# is the point here. A stretched overlap shows up as smearing well before 15% does, so A2A
+# stops at 0.85x and leaves the remaining deficit as the actor's own silence.
+MIN_SPEED = 0.85
+# Widest stretch the pacer can compute, so a caller asking for more gets the floor, not a
+# rejected frame.
+MIN_COMPUTABLE_SPEED = 0.75
+# A deficit smaller than this does not restyle a line's cadence, mirroring the +0.15 s the
+# speed-up side allows. Filling changes every syllable's length; a 0.1 s overhang does not.
+FILL_GUARD_SECONDS = 0.25
 
 
 class QuietRunCompactor:
@@ -52,8 +69,8 @@ class QuietRunCompactor:
 
 class StreamingWSOLA:
     def __init__(self, speed: float, rate: int = 24000):
-        if not math.isfinite(speed) or not 1 <= speed <= 1.6:
-            raise ValueError("Speech speed must be in [1, 1.6]")
+        if not math.isfinite(speed) or not MIN_COMPUTABLE_SPEED <= speed <= 1.6:
+            raise ValueError(f"Speech speed must be in [{MIN_COMPUTABLE_SPEED}, 1.6]")
         self.np = np
         self.speed = speed
         self.hop = rate // 50  # 20 ms synthesis hop, 40 ms window
@@ -110,9 +127,22 @@ class StreamingWSOLA:
         return np.concatenate(pieces) if pieces else np.empty(0, dtype=np.float32)
 
 
-def choose_speed(text: str, target_seconds, seconds_per_character: float) -> float:
+def choose_speed(text: str, target_seconds, seconds_per_character: float, estimated_seconds=None,
+                 allow_fill: bool = False) -> float:
+    """Pace one take against the seconds of source speech it translates.
+
+    Above 1 the take is longer than its source and gets faster. Below 1 (`allow_fill`, the
+    host that plays phrases in slots) a take shorter than its source is slowed so it ends
+    with the actor instead of leaving the tail of their turn silent. Speed-up allows a 0.15 s
+    overhang and fill a `FILL_GUARD_SECONDS` deficit before it touches the cadence.
+    """
     if not isinstance(target_seconds, (float, int)) or not math.isfinite(target_seconds) or target_seconds <= 0:
         return 1.0
-    estimated = max(0.2, len(text) * seconds_per_character)
+    if isinstance(estimated_seconds, (float, int)) and math.isfinite(estimated_seconds) and estimated_seconds > 0:
+        estimated = estimated_seconds
+    else:
+        estimated = max(0.2, len(text) * seconds_per_character)
     # Small timing errors should not alter a short acknowledgement's cadence.
+    if allow_fill and estimated < target_seconds - FILL_GUARD_SECONDS:
+        return max(MIN_SPEED, estimated / max(0.5, target_seconds))
     return min(MAX_SPEED, max(1.0, estimated / max(0.5, target_seconds + 0.15)))

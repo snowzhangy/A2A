@@ -26,6 +26,7 @@
     "unit": {"$ref": "#/$defs/unit"},
     "spk": {"type": "string"},
     "prof": {"type": "integer", "minimum": 0},
+    "speaker_pending": {"type": "boolean"},
     "text": {"type": "string"},
     "out_sample": {"type": "integer", "minimum": 0},
     "src_sample": {"type": "integer", "minimum": 0}
@@ -38,7 +39,7 @@
       "maxItems": 2
     },
     "unit": {"type": "string", "pattern": "^u[0-9]+$"},
-    "disposition": {"enum": ["translated", "original_only", "abandoned", "never_committed", "uncertain_overlap", "repeated_handoff", "inaudible"]}
+    "disposition": {"enum": ["translated", "original_only", "abandoned", "never_committed", "uncertain_overlap", "repeated_handoff", "inaudible", "silence"]}
   },
   "allOf": [
     {"if": {"properties": {"ev": {"const": "buf.capture"}}},
@@ -62,7 +63,10 @@
     {"if": {"properties": {"ev": {"const": "mt.result"}}},
      "then": {"required": ["unit", "ok"]}},
     {"if": {"properties": {"ev": {"const": "commit.target"}}},
-     "then": {"required": ["unit", "spk", "span"]}},
+     "then": {"required": ["unit", "span"], "anyOf": [
+       {"required": ["spk"]},
+       {"required": ["speaker_pending"], "properties": {"speaker_pending": {"const": true}}}
+     ]}},
     {"if": {"properties": {"ev": {"enum": ["tts.first_chunk", "tts.chunk"]}}},
      "then": {"required": ["unit", "frames", "rate"]}},
     {"if": {"properties": {"ev": {"enum": ["play.start", "play.end"]}}},

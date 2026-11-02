@@ -34,12 +34,6 @@ enum HAL {
         AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element)
     }
 
-    static func has(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector,
-                    scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> Bool {
-        var addr = address(selector, scope)
-        return AudioObjectHasProperty(object, &addr)
-    }
-
     static func scalar<T: BitwiseCopyable>(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector,
                           scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal,
                           qualifier: UnsafeRawPointer? = nil, qualifierSize: UInt32 = 0,
@@ -190,16 +184,6 @@ public enum AudioProcessList {
             isRunningOutput: flag(kAudioProcessPropertyIsRunningOutput),
             isRunningInput: flag(kAudioProcessPropertyIsRunningInput),
             executablePath: executablePath(pid), parentPID: parentPID(pid))
-    }
-
-    public static func objectID(forPID pid: pid_t) throws -> AudioObjectID {
-        var p = pid
-        let id: AudioObjectID = try withUnsafePointer(to: &p) {
-            try HAL.scalar(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyTranslatePIDToProcessObject,
-                           qualifier: $0, qualifierSize: UInt32(MemoryLayout<pid_t>.size), default: AudioObjectID(0))
-        }
-        guard id != kAudioObjectUnknown else { throw CoreAudioError(-1, "pid \(pid) has no audio process object") }
-        return id
     }
 
     static func executablePath(_ pid: pid_t) -> String {

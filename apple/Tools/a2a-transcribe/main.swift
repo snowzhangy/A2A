@@ -9,7 +9,9 @@
 import A2ACore
 import A2AMedia
 import A2AModels
+import A2ALegacyModels
 import Foundation
+import Speech
 
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write(Data("a2a-transcribe: \(message)\n".utf8))
@@ -20,14 +22,51 @@ let args = CommandLine.arguments
 func value(_ name: String) -> String? {
     args.firstIndex(of: name).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
 }
-guard let input = value("--input") else { fail("usage: a2a-transcribe --input x.wav [--locale en-US]") }
+let input = value("--input")
+let stdinPCM = args.contains("--stdin-f32")
+let checkAssets = args.contains("--check-assets")
+let installAssets = args.contains("--install-assets")
+guard checkAssets || installAssets || (input != nil) != stdinPCM else { fail("usage: a2a-transcribe --input x.wav | --stdin-f32 [--rate 24000] [--locale en-US]") }
 let locale = Locale(identifier: value("--locale") ?? "en-US")
 let rate = Int(canonicalSampleRate)
 
 do {
-    let wav = try WAV.read(URL(fileURLWithPath: input))
-    var mono = wav.mono()
-    if wav.sampleRate != rate { mono = StreamingResampler.resample(mono, from: wav.sampleRate, to: rate) }
+    if installAssets {
+        guard let supported = await SpeechTranscriber.supportedLocale(equivalentTo: locale) else {
+            fail("unsupported reference speech locale")
+        }
+        _ = try await AssetInventory.reserve(locale: supported)
+        let module = SpeechTranscriber(locale: supported, preset: .timeIndexedProgressiveTranscription)
+        if let request = try await AssetInventory.assetInstallationRequest(supporting: [module]) {
+            try await request.downloadAndInstall()
+        }
+        _ = try await AppleSpeechRecognizer.checkInstalled(locale: locale)
+        exit(0)
+    }
+    if checkAssets {
+        _ = try await AppleSpeechRecognizer.checkInstalled(locale: locale)
+        exit(0)
+    }
+    var mono: [Float]
+    let inputRate: Int
+    if stdinPCM {
+        let data = FileHandle.standardInput.readDataToEndOfFile()
+        guard !data.isEmpty, data.count <= 2_000_000, data.count % 4 == 0,
+              let suppliedRate = Int(value("--rate") ?? "24000"), (8_000...48_000).contains(suppliedRate) else {
+            fail("invalid in-memory reference audio")
+        }
+        mono = data.withUnsafeBytes { bytes in
+            stride(from: 0, to: bytes.count, by: 4).map { offset in
+                Float(bitPattern: UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
+            }
+        }
+        inputRate = suppliedRate
+    } else {
+        let wav = try WAV.read(URL(fileURLWithPath: input!))
+        mono = wav.mono()
+        inputRate = wav.sampleRate
+    }
+    if inputRate != rate { mono = StreamingResampler.resample(mono, from: inputRate, to: rate) }
     let low = StreamingResampler.resample(mono, from: rate, to: 16_000)
     let recognizer = try await AppleSpeechRecognizer(locale: locale)
     // 100 ms buffers fed at about 10x real time. The adapter's input stream keeps only the

@@ -3,10 +3,11 @@
 //   a2a-tapctl permission
 //   a2a-tapctl list [--all] [--json]
 //   a2a-tapctl devices
-//   a2a-tapctl resolve (--bundle ID | --pid N)
+//   a2a-tapctl resolve (--global | --bundle ID | --pid N)
 //   a2a-tapctl taps
 //   a2a-tapctl destroy-tap --uid UID     (only for taps a killed a2a-tapctl left behind)
-//   a2a-tapctl capture (--bundle ID | --pid N) --out x.wav [--seconds S] [--mute unmuted|muted|muted-when-tapped] [--trace t.jsonl]
+//   a2a-tapctl capture (--global | --bundle ID | --pid N) --out x.wav [--seconds S] [--mute unmuted|muted|muted-when-tapped] [--trace t.jsonl]
+//   (--global taps the machine's whole output mix, so no app has to be chosen; this tool's own audio is excluded)
 //   a2a-tapctl monitor (--bundle ID | --pid N) [--seconds S] [--delay-ms D] [--crossfade-every S] [--trace t.jsonl]
 //   a2a-tapctl fidelity --reference ref.wav --capture x.wav [--max-offset-seconds 30] [--window-seconds 10]
 //   a2a-tapctl lifecycle (--bundle ID | --pid N) [--cycles 50] [--kill-cycles 5] [--json out.json]
@@ -68,16 +69,21 @@ let args = Args(CommandLine.arguments)
 
 func resolveSource() throws -> ResolvedSource {
     let processes = try AudioProcessList.current()
+    if args.flags.contains("global") {
+        // The whole output mix: nothing to choose, and this tool's own audio stays out of it.
+        return SourceResolver.systemAudio(processes: processes)
+    }
     if let pid = args.values["pid"].flatMap(Int32.init) {
         return try SourceResolver.resolve(pid: pid, processes: processes)
     }
-    guard let bundle = args.values["bundle"] else { fail("pass --bundle ID or --pid N") }
+    guard let bundle = args.values["bundle"] else { fail("pass --global, --bundle ID or --pid N") }
     return try SourceResolver.resolve(bundleID: bundle, processes: processes)
 }
 
 func describe(_ source: ResolvedSource) -> [String: Any] {
     [
         "bundle_id": source.bundleID,
+        "global": source.global,
         "app_root": source.appRoot ?? NSNull(),
         "members": source.members.map { ["object_id": $0.process.objectID, "pid": $0.process.pid,
                                          "bundle_id": $0.process.bundleID, "path": $0.process.executablePath,
@@ -306,6 +312,8 @@ do {
                    "pass": corr > 0.99 && weak.isEmpty && dropouts.isEmpty && n == capMono.count && n > 0])
 
     case "lifecycle":
+        // The kill -9 cycles kill and reopen a specific source process; a global tap has none to kill.
+        if args.flags.contains("global") { fail("lifecycle needs --bundle or --pid: it kills the source app on purpose") }
         try lifecycle()
 
     case "_hold":
@@ -372,6 +380,7 @@ func lifecycle() throws {
     let me = CommandLine.arguments[0]
     var target = ["--bundle", source.bundleID]
     if let pid = args.values["pid"] { target = ["--pid", pid] }
+    if source.global { target = ["--global"] }
     for i in 0..<killCycles {
         let child = Process()
         child.executableURL = URL(fileURLWithPath: me)

@@ -36,10 +36,51 @@ public struct PipelineConfig: Sendable {
     /// oldest units nobody has heard yet, always keeping the newest. Worker loss, underruns,
     /// and the hard queue cap still fall back immediately.
     public var finishPhraseBeforeCatchUp = false
+    /// Experimental: observe at least two chunks and reserve enough audio for measured
+    /// generation slower than playout. Completed phrases can always start immediately.
+    public var adaptiveStreamingPrebuffer = false
+    /// Quality-first live playback admits a whole synthesized phrase at once. Capture,
+    /// recognition and translation continue while it waits; the queue stays bounded.
+    public var completePhrasesBeforePlayback = false
+    /// Separated music/effects, never the unprocessed source track.
+    public var backgroundAudioEnabled = false
     /// Dialogue (ADR-0005): each unit takes the speaker who covers most of its span, speaker
     /// turns never fall back, and a unit whose speaker has no profile yet waits for one
     /// (up to the source-lag limit) instead of being dropped.
     public var multiSpeaker = false
+    /// Keep each speaker's first prepared voice until stop/discontinuity.
+    public var pinSpeakerProfiles = false
+    /// Clone dialogue must have a majority source label before choosing a voice.
+    public var requireSpeakerAttribution = false
+    /// How far unlabeled speech may reach back to the previous label, in seconds, when no
+    /// pause separated them. The tracker labels the speech between two pauses as one stretch
+    /// and gives no label to a piece with too little voiced speech in it; inside one
+    /// uninterrupted stretch the same actor keeps talking, so such a piece inherits that
+    /// speaker's voice. 0 disables the carry.
+    public var unlabeledSpeakerCarrySeconds = 6.0
+    /// How far a *brief* unlabeled piece may reach back across a pause: a short reply or the
+    /// tail of a sentence. Measured on real drama audio, this is where most unlabeled pieces
+    /// are, and the near-miss is what keeps the identity risk low
+    /// (reports/week2/live-session-recovery.md).
+    public var unlabeledSpeakerCarryAfterPauseSeconds = 3.0
+    /// A piece this long or longer is a turn of its own: after a pause it waits for its own label.
+    public var unlabeledSpeakerCarryMaxPieceSeconds = 1.0
+    /// Direct speech translation receives bounded source audio, not recognized text.
+    public var directAudioTranslation = false
+    /// Provider emits translated PCM directly, without locally committed units.
+    public var providerStreaming = false
+    /// Picture delay D in seconds (ADR-0012). The host shows the source picture D seconds
+    /// late and delays the original and separated-background buses to match, so each unit
+    /// plays in its own slot: never before its source start + D. Lag limits (source lag,
+    /// voice and attribution waits, catch-up staleness) then count from the slot, not from
+    /// capture, and audio still early for its slot is not debt. 0 keeps live playback
+    /// unchanged. Needs fluent playout (`finishPhraseBeforeCatchUp`), which holds PCM.
+    public var presentationDelaySeconds = 0.0
+    /// Turn fill (ADR-0013): slow a take that comes out shorter than the speech it translates so
+    /// the line ends with its actor. Applies only with `presentationDelaySeconds`, where a line
+    /// that ends on its actor's last sound cannot delay the phrase after it. Off for an A/B
+    /// listening run (`a2a-pipeline --no-turn-fill`).
+    public var turnFillEnabled = true
 
     public init(session: String, direction: TranslationDirection = .chineseToEnglish) {
         self.session = session
@@ -50,6 +91,8 @@ public struct PipelineConfig: Sendable {
             estimatedSecondsPerSourceChar = 1.0 / 15.0
             estimatedSecondsPerTargetChar = 0.25
         }
+        // The spoken budget and the debt estimate must agree about how fast the target talks.
+        validator.spokenCharactersPerSecond = 1 / estimatedSecondsPerTargetChar
     }
 }
 
@@ -64,11 +107,14 @@ public enum PipelineInput: Hashable, Sendable {
     case armFailed(String)
     case stop
     case playbackMode(PlaybackMode)
+    /// A cloud provider has emitted a PCM chunk (the payload stays in the driver).
+    case providerPCM
     /// A capture buffer covering `span` became available to the pipeline.
     case captured(span: SourceSpan)
     case vad(VADEvent)
     case speaker(SpeakerEvent)
     case hypothesis(ASRHypothesis)
+    case audioSegment(SourceSpan)
     case profileReady(SpeakerID, version: Int)
     case translation(UnitID, TranslationOutcome)
     case pcm(PCMChunkHeader, frames: Int)
@@ -95,6 +141,10 @@ public struct SynthesisJob: Hashable, Sendable {
     public let generation: PlayoutGeneration
     public let span: SourceSpan
     public var targetSeconds: Double? = nil
+    /// The host may slow a take that comes out shorter than `targetSeconds`, so the line ends
+    /// where the actor stops (ADR-0013). Set only for a phrase that plays in a slot and is not
+    /// yet late for it; see `SessionPipeline.synthesize`.
+    public var allowFill: Bool = false
 }
 
 public enum PipelineEffect: Hashable, Sendable {
@@ -113,7 +163,9 @@ public enum PipelineEffect: Hashable, Sendable {
     case releaseHeld(UnitID)
     case discardHeld(UnitID)
     case dropPCM(PCMChunkHeader, reason: String)
+    case enqueueProviderPCM
     case rampGains(BusGains, durationMs: Int)
+    case backgroundGain(Float, durationMs: Int)
     case flushTranslatedBus
     case teardown
 }
@@ -123,19 +175,23 @@ public enum SourceDisposition: String, Sendable {
     case originalOnly = "original_only"
     case abandoned
     case neverCommitted = "never_committed"
+    /// The source held no speech to translate (empty or filler-only answer): silence by design,
+    /// not a failed line.
+    case silence
 }
 
 public struct SessionPipeline: Sendable {
     enum Stage: String, Sendable {
         /// `waiting`: fluent playout holds the unit's PCM until the phrase ahead of it ends.
+        /// `awaitingSpeaker`: translated; the source has insufficient speaker labels.
         /// `awaitingVoice`: translated; its speaker's profile is not ready yet (multi-speaker).
-        case translating, awaitingVoice, synthesizing, held, waiting, queued, playing, finished, canceled, rejected
+        case translating, awaitingSpeaker, awaitingVoice, synthesizing, held, waiting, queued, playing, finished, canceled, rejected
 
         /// Synthesis has started: PCM may be in flight, held, or on the bus.
         var synthesisStarted: Bool {
             self == .synthesizing || self == .held || self == .waiting || self == .queued || self == .playing
         }
-        var isLive: Bool { self == .translating || self == .awaitingVoice || synthesisStarted }
+        var isLive: Bool { self == .translating || self == .awaitingSpeaker || self == .awaitingVoice || synthesisStarted }
         /// Scheduled on the translated bus.
         var onBus: Bool { self == .queued || self == .playing }
     }
@@ -147,6 +203,10 @@ public struct SessionPipeline: Sendable {
         var target: String?
         var generation: PlayoutGeneration = 0
         var bufferedSeconds = 0.0
+        var firstPCMAt: UInt64?
+        var firstPCMSeconds = 0.0
+        var lastPCMAt: UInt64?
+        var pcmChunks = 0
         var synthesisComplete = false
         var scheduled = false
         var handoff = false
@@ -158,6 +218,11 @@ public struct SessionPipeline: Sendable {
     public private(set) var machine: SessionStateMachine
     public private(set) var playbackMode: PlaybackMode
     private var policy: CommitPolicy
+    /// Kept for the target-side rules too: shortening a Han target cuts at the same word
+    /// boundaries the commit policy respects (`WordSegmenter`).
+    private let wordSegmenter: (any WordSegmenter)?
+    /// Segmenter of the target language, used when shortening an over-long target.
+    private let targetWordSegmenter: (any WordSegmenter)?
     private var units: [UnitID: UnitRecord] = [:]
     private var order: [UnitID] = []
     private var context: [CommittedPair] = []
@@ -166,17 +231,31 @@ public struct SessionPipeline: Sendable {
     private var speakerAssigned = false
     /// Multi-speaker: tracker labels in source order, for attributing units by span.
     private var speakerTimeline: [(span: SourceSpan, speaker: SpeakerID)] = []
+    /// Most recent tracker label and where it ended, for the unlabeled-piece carry.
+    private var lastLabel: (speaker: SpeakerID, end: Int64)?
+    /// Sample of the most recent VAD pause: a label is only carried across stretches with none.
+    private var lastPause: Int64?
     private var backlogSeconds = 0.0
     private var underrunPending = false
     private var workerHealthy = true
     private var speechOnset: Int64?
     private var inSpeech = false
     private var anchors: [(sample: Int64, tNs: UInt64)] = []
+    private var nextAudioUnit = 1
+    private var lastAudioEnd: Int64 = 0
     private var now: UInt64 = 0
+    private var providerArmed = false
 
-    public init(config: PipelineConfig) {
+    /// `wordSegmenter` lets a host keep clause cuts off Han words (see `WordSegmenter`);
+    /// golden traces and tests run without one, where the policy uses its own rules only.
+    /// `targetWordSegmenter` is the same service for the *target* language, which is a
+    /// different model whenever the session translates into Mandarin.
+    public init(config: PipelineConfig, wordSegmenter: (any WordSegmenter)? = nil,
+                targetWordSegmenter: (any WordSegmenter)? = nil) {
         self.config = config
-        self.policy = CommitPolicy(config: config.commit)
+        self.wordSegmenter = wordSegmenter
+        self.targetWordSegmenter = targetWordSegmenter
+        self.policy = CommitPolicy(config: config.commit, wordSegmenter: wordSegmenter)
         self.machine = SessionStateMachine(thresholds: config.health, generation: 1, multiSpeaker: config.multiSpeaker)
         self.playbackMode = config.playbackMode
         self.speaker = config.defaultSpeaker
@@ -186,6 +265,26 @@ public struct SessionPipeline: Sendable {
 
     public mutating func handle(_ input: PipelineInput, at tNs: UInt64) -> [PipelineEffect] {
         now = tNs
+        if config.providerStreaming {
+            switch input {
+            case .arm:
+                guard !providerArmed else { return [] }
+                providerArmed = true
+                return [.rampGains(playbackMode == .original ? .original : .translated, durationMs: 0)]
+            case .playbackMode(let mode):
+                guard mode != playbackMode else { return [] }
+                playbackMode = mode
+                guard providerArmed else { return [] }
+                return [.flushTranslatedBus, .rampGains(mode == .original ? .original : .translated, durationMs: config.health.rampMs)]
+            case .providerPCM:
+                return providerArmed && playbackMode == .translated ? [.enqueueProviderPCM] : []
+            case .stop:
+                guard providerArmed else { return [] }
+                providerArmed = false
+                return [.flushTranslatedBus, .teardown]
+            default: return []
+            }
+        }
         if machine.state == .idle {
             switch input {
             case .arm, .playbackMode: break
@@ -216,6 +315,9 @@ public struct SessionPipeline: Sendable {
                                          .double("translated", Double(gains.translated)),
                                          .int("ms", config.health.rampMs), .string("playback", mode.rawValue)]))
             out.append(.rampGains(gains, durationMs: config.health.rampMs))
+            out += backgroundGainEffect(durationMs: config.health.rampMs)
+        case .providerPCM:
+            break
         case .stop:
             out += cancelAll(disposition: .abandoned, reason: "stop")
             out += commitOutputs(policy.reset())
@@ -233,8 +335,12 @@ public struct SessionPipeline: Sendable {
             inSpeech = false
             speakerAssigned = false
             speakerTimeline.removeAll()
+            lastLabel = nil
+            lastPause = nil
             backlogSeconds = 0
             workerHealthy = true
+            nextAudioUnit = 1
+            lastAudioEnd = 0
 
         case .captured(let span):
             anchors.append((span.end, tNs))
@@ -249,6 +355,7 @@ public struct SessionPipeline: Sendable {
             out += session(.speech(speaker))
         case .vad(.speechEnd(let s)):
             inSpeech = false
+            lastPause = max(lastPause ?? 0, s)
             out.append(trace(.vadEnd, [.int64("src_sample", s)]))
             out += commitOutputs(policy.speechEnded(at: s))
 
@@ -256,11 +363,13 @@ public struct SessionPipeline: Sendable {
             let changed = speakerAssigned && spk != speaker
             speaker = spk
             speakerAssigned = true
+            if lastLabel == nil || span.end >= lastLabel!.end { lastLabel = (spk, span.end) }
             out.append(trace(.spkAssign, [.speaker(spk), .span(span)]))
             if config.multiSpeaker {
                 speakerTimeline.append((span, spk))
                 if speakerTimeline.count > 512 { speakerTimeline.removeFirst(speakerTimeline.count - 256) }
                 if changed { out.append(trace(.spkChange, [.speaker(spk), .span(span)])) }
+                out += scheduleWaitingVoices()
             } else if changed {
                 out.append(trace(.spkChange, [.speaker(spk), .span(span)]))
                 out += session(.speakerChange(spk))
@@ -269,6 +378,7 @@ public struct SessionPipeline: Sendable {
             out.append(trace(.spkChange, [.span(span)]))
 
         case .hypothesis(let h):
+            guard !config.directAudioTranslation else { break }
             if config.emitCaptions {
                 out.append(.caption(kind: h.isFinal ? "source.final" : "source.partial",
                                     id: "utt\(h.utterance)", text: h.text))
@@ -281,12 +391,20 @@ public struct SessionPipeline: Sendable {
             out.append(trace(h.isFinal ? .asrFinal : .asrPartial, fields))
             out += commitOutputs(policy.process(h, at: tNs))
 
+        case .audioSegment(let span):
+            guard config.directAudioTranslation, !span.isEmpty, span.start >= lastAudioEnd,
+                  span.durationSeconds <= 30 else { break }
+            lastAudioEnd = span.end
+            let unit = SourceUnit(id: UnitID(nextAudioUnit), utterance: nextAudioUnit, span: span,
+                                  text: "", reason: .audioSegment, timingEstimated: false, semanticWaitNs: 0)
+            nextAudioUnit += 1
+            out += commitOutputs([.commit(unit)])
+
         case .profileReady(let spk, let version):
+            if config.pinSpeakerProfiles, profileVersions[spk] != nil { break }
             out.append(trace(.profileReady, [.speaker(spk), .int("prof", version)]))
             out += session(.profileReady(spk, version: version))
-            for id in order where units[id]?.stage == .awaitingVoice && units[id]?.speaker == spk {
-                out += synthesize(id, version: version)
-            }
+            out += scheduleWaitingVoices()
 
         case .translation(let id, let outcome):
             out += translationResult(id, outcome)
@@ -347,6 +465,8 @@ public struct SessionPipeline: Sendable {
             profileVersions.removeAll()
             context.removeAll()
             speakerTimeline.removeAll()
+            lastLabel = nil
+            lastPause = nil
             lastTarget = nil
             backlogSeconds = 0
             inSpeech = false
@@ -355,6 +475,7 @@ public struct SessionPipeline: Sendable {
             out += session(.armSucceeded)
             anchors.removeAll()
             speechOnset = nil
+            lastAudioEnd = 0
         }
         out += promoteWaiting()
         return out
@@ -378,17 +499,21 @@ public struct SessionPipeline: Sendable {
                 units[unit.id] = UnitRecord(source: unit, speaker: unitSpeaker)
                 order.append(unit.id)
                 let pending = order.filter { units[$0]?.stage.isLive == true }
-                if pending.count > max(1, config.maxPendingUnits) {
-                    for id in pending.prefix(pending.count - max(1, config.maxPendingUnits)) {
+                if pending.count > maxPendingUnits {
+                    let candidates = config.completePhrasesBeforePlayback
+                        ? pending.filter { units[$0]?.stage.onBus != true } : pending
+                    for id in candidates.prefix(pending.count - maxPendingUnits) {
                         out += cancel(id, disposition: .originalOnly, reason: "queue_limit")
                     }
-                    out += session(.health(HealthSample(debtSeconds: config.health.maxDebtSeconds + 1,
-                                                        sourceLagSeconds: 0)))
+                    if !config.completePhrasesBeforePlayback {
+                        out += session(.health(HealthSample(debtSeconds: config.health.maxDebtSeconds + 1,
+                                                            sourceLagSeconds: 0)))
+                    }
                 }
                 guard units[unit.id]?.stage == .translating else { continue }
                 let request = TranslationRequest(
                     unitID: unit.id, context: Array(context.suffix(config.contextPairs)),
-                    glossary: config.glossary, uncommittedSource: unit.text)
+                    glossary: config.glossary, uncommittedSource: unit.text, sourceSpan: unit.span)
                 out.append(trace(.mtRequest, [.unit(unit.id), .int("context_pairs", request.context.count)]))
                 out.append(.translate(request))
             case .requestFinalize(let u):
@@ -408,6 +533,11 @@ public struct SessionPipeline: Sendable {
         return out
     }
 
+    private func workerFields(_ candidate: TranslationCandidate) -> [TraceEvent.Field] {
+        guard let s = candidate.workerStats else { return [] }
+        return [.int("worker_ms", s.afterCloseMs), .int("worker_turns", s.turns), .bool("worker_st", s.sentenceFallback)]
+    }
+
     private mutating func translationResult(_ id: UnitID, _ outcome: TranslationOutcome) -> [PipelineEffect] {
         guard var r = units[id], r.stage == .translating else {
             return [trace(.mtResult, [.unit(id), .bool("ok", false), .string("reason", "stale")])]
@@ -421,32 +551,61 @@ public struct SessionPipeline: Sendable {
             guard candidate.unitID == id else {
                 return rejectTranslation(id, reason: "wrong_unit")
             }
-            if let rejection = config.validator.validate(candidate, source: r.source.text, previousTarget: lastTarget) {
+            let verdict = config.validator.evaluate(candidate, source: r.source.text, previousTarget: lastTarget,
+                                                    sourceDurationSeconds: config.directAudioTranslation ? r.source.span.durationSeconds : nil,
+                                                    wordSegmenter: targetWordSegmenter)
+            switch verdict {
+            case .rejected(let rejection):
                 return [trace(.mtResult, [.unit(id), .bool("ok", false), .string("reason", rejection.rawValue)])]
                     + rejectTranslation(id, reason: rejection.rawValue)
-            }
-            let text = candidate.text.trimmingWhitespace()
-            var out: [PipelineEffect] = [trace(.mtResult, [.unit(id), .bool("ok", true)])]
-            if config.emitCaptions { out.append(.caption(kind: "target.final", id: id.description, text: text)) }
-            // The tracker may have labeled more of the unit's span since it was committed.
-            if config.multiSpeaker { r.speaker = speaker(for: r.source.span) }
-            var fields: [TraceEvent.Field] = [.unit(id), .speaker(r.speaker), .span(r.source.span)]
-            r.target = text
-            lastTarget = text
-            context.append(CommittedPair(source: r.source.text, target: text))
-            if context.count > config.contextPairs { context.removeFirst(context.count - config.contextPairs) }
-            guard machine.hasProfile(r.speaker), let version = profileVersion(r.speaker) else {
-                if config.multiSpeaker { r.stage = .awaitingVoice }
-                units[id] = r
+            case .silent(let silence):
+                // Music, laughter, or a pause the translator answered with nothing at all. The
+                // honest output is silence: no error, no fallback over audio that held no
+                // speech, and the unit stops holding debt the moment it is dismissed.
+                return [trace(.mtResult, [.unit(id), .bool("ok", true), .string("silence", silence.rawValue)] + workerFields(candidate))]
+                    + finish(id, as: .silence, reason: silence.rawValue)
+            case .accepted(let text):
+                var out: [PipelineEffect] = [trace(.mtResult, [.unit(id), .bool("ok", true)] + workerFields(candidate))]
+                if config.emitCaptions { out.append(.caption(kind: "target.final", id: id.description, text: text)) }
+                // The tracker may have labeled more of the unit's span since it was committed.
+                if config.multiSpeaker { r.speaker = speaker(for: r.source.span) }
+                var fields: [TraceEvent.Field] = [.unit(id), .speaker(r.speaker), .span(r.source.span)]
+                if text != candidate.text.trimmingWhitespace() {
+                    fields.append(.bool("shortened", true))
+                    fields.append(.int("mt_chars", candidate.text.trimmingWhitespace().count))
+                }
+                if config.multiSpeaker, config.requireSpeakerAttribution,
+                   (speakerCoverage(of: r.source.span)?.share ?? 0) <= 0.5, carriedSpeaker(for: r.source.span) != nil {
+                    fields.append(.bool("speaker_carried", true))
+                }
+                r.target = text
+                lastTarget = text
+                // Context and captions carry what the listener is actually told, which after a
+                // deletion is shorter than what the model returned.
+                context.append(CommittedPair(source: r.source.text, target: text))
+                if context.count > config.contextPairs { context.removeFirst(context.count - config.contextPairs) }
+                if !hasSpeakerAttribution(for: r.source.span) {
+                    r.stage = .awaitingSpeaker
+                    units[id] = r
+                    // The last turn's speaker is only a guess; never report it as confirmed.
+                    fields = [.unit(id), .span(r.source.span), .bool("speaker_pending", true)]
+                    if config.traceText { fields.append(.string("text", text)) }
+                    out.append(trace(.commitTarget, fields))
+                    return out
+                }
+                guard machine.hasProfile(r.speaker), let version = profileVersion(r.speaker) else {
+                    if config.multiSpeaker { r.stage = .awaitingVoice }
+                    units[id] = r
+                    if config.traceText { fields.append(.string("text", text)) }
+                    out.append(trace(.commitTarget, fields))
+                    return config.multiSpeaker ? out : out + finish(id, as: .originalOnly, reason: "no_profile")
+                }
+                fields.insert(.int("prof", version), at: 2)
                 if config.traceText { fields.append(.string("text", text)) }
                 out.append(trace(.commitTarget, fields))
-                return config.multiSpeaker ? out : out + finish(id, as: .originalOnly, reason: "no_profile")
+                units[id] = r
+                return out + synthesize(id, version: version)
             }
-            fields.insert(.int("prof", version), at: 2)
-            if config.traceText { fields.append(.string("text", text)) }
-            out.append(trace(.commitTarget, fields))
-            units[id] = r
-            return out + synthesize(id, version: version)
         }
     }
 
@@ -455,20 +614,71 @@ public struct SessionPipeline: Sendable {
         r.stage = .synthesizing
         r.generation = gate.generation
         units[id] = r
-        return [trace(.ttsRequest, [.unit(id), .int("prof", version), .int("chars", text.count)]),
+        // A unit whose timing is estimated has no trustworthy speech end to pace against.
+        let target = config.finishPhraseBeforeCatchUp && !r.source.timingEstimated
+            ? max(0.5, r.source.span.durationSeconds) : nil
+        return [trace(.ttsRequest, [.unit(id), .int("prof", version), .int("chars", text.count)]
+                        + (target != nil && allowFill(of: r) ? [(.bool("fill", true))] : [])),
                 .synthesize(SynthesisJob(unit: id, text: text, speaker: r.speaker, profileVersion: version,
                                          epoch: gate.epoch, generation: gate.generation, span: r.source.span,
-                                         targetSeconds: config.finishPhraseBeforeCatchUp && !r.source.timingEstimated
-                                             ? max(0.5, r.source.span.durationSeconds) : nil))]
+                                         targetSeconds: target, allowFill: target != nil && allowFill(of: r)))]
+    }
+
+    /// Fill (ADR-0013): slow a short take so it ends with the actor's own last sound rather
+    /// than leaving the tail of their turn silent. Only a phrase that plays in a slot gains
+    /// this, and only while it is still ahead of its slot: a filled line ends at
+    /// `slot + source speech`, which is where the actor stops and never later, so it cannot
+    /// delay the phrase after it. A phrase already late for its slot would only spend that
+    /// lateness on stretching, and the next phrase would carry the debt.
+    private func allowFill(of r: UnitRecord) -> Bool {
+        config.turnFillEnabled && slotted && lateness(of: r.source.span.start) <= 0
     }
 
     private var profileVersions: [SpeakerID: Int] = [:]
     private func profileVersion(_ spk: SpeakerID) -> Int? { profileVersions[spk] }
 
+    private func hasSpeakerAttribution(for span: SourceSpan) -> Bool {
+        guard config.multiSpeaker, config.requireSpeakerAttribution else { return true }
+        if let coverage = speakerCoverage(of: span), coverage.share > 0.5 { return true }
+        return carriedSpeaker(for: span) != nil
+    }
+
+    /// The speaker of the previous label, when `span` continues their turn: with no pause in
+    /// between (`unlabeledSpeakerCarrySeconds`), or as a brief piece just after a pause
+    /// (`unlabeledSpeakerCarryAfterPauseSeconds`, `unlabeledSpeakerCarryMaxPieceSeconds`).
+    /// Never carried backwards: a later label may belong to an actor who started talking
+    /// without a detectable pause, and it must not speak an earlier line.
+    private func carriedSpeaker(for span: SourceSpan) -> SpeakerID? {
+        guard config.multiSpeaker, config.unlabeledSpeakerCarrySeconds > 0, let last = lastLabel else { return nil }
+        guard span.start >= last.end else { return nil }
+        let gap = Double(span.start - last.end) / Double(canonicalSampleRate)
+        if lastPause == nil || lastPause! < last.end {
+            return gap <= config.unlabeledSpeakerCarrySeconds ? last.speaker : nil
+        }
+        guard span.durationSeconds <= config.unlabeledSpeakerCarryMaxPieceSeconds else { return nil }
+        return gap <= config.unlabeledSpeakerCarryAfterPauseSeconds ? last.speaker : nil
+    }
+
+    /// Labels and profiles can arrive in either order. Resolve again before synthesis,
+    /// including units that were initially waiting for a different speaker's profile.
+    private mutating func scheduleWaitingVoices() -> [PipelineEffect] {
+        var out: [PipelineEffect] = []
+        for id in order {
+            guard var r = units[id], r.stage == .awaitingSpeaker || r.stage == .awaitingVoice else { continue }
+            guard hasSpeakerAttribution(for: r.source.span) else { continue }
+            if config.multiSpeaker { r.speaker = speaker(for: r.source.span) }
+            r.stage = .awaitingVoice
+            units[id] = r
+            if let version = profileVersion(r.speaker) { out += synthesize(id, version: version) }
+        }
+        return out
+    }
+
     /// The speaker who covers most of `span` in the tracker's labels; without overlap, the
     /// latest speaker labeled before the span ends (multi-speaker sessions).
     public func speaker(for span: SourceSpan) -> SpeakerID {
         if let best = overlaps(of: span).first { return best.speaker }
+        if let carried = carriedSpeaker(for: span) { return carried }
         return speakerTimeline.last { $0.span.start < span.end }?.speaker ?? speaker
     }
 
@@ -520,6 +730,9 @@ public struct SessionPipeline: Sendable {
         out.append(trace(r.bufferedSeconds == 0 ? .ttsFirstChunk : .ttsChunk,
                          [.unit(header.unitID), .int("frames", frames), .int("rate", header.format.sampleRate)]))
         r.bufferedSeconds += seconds
+        if r.firstPCMAt == nil { r.firstPCMAt = now; r.firstPCMSeconds = seconds }
+        r.lastPCMAt = now
+        r.pcmChunks += 1
         if r.stage.onBus {
             units[header.unitID] = r
             out.append(.enqueuePCM(header))
@@ -554,8 +767,35 @@ public struct SessionPipeline: Sendable {
     }
 
     private func readiness(_ r: UnitRecord, _ id: UnitID) -> UnitReadiness {
-        UnitReadiness(unit: id, speaker: r.speaker, generation: r.generation,
-                      bufferedSeconds: r.bufferedSeconds, complete: r.synthesisComplete)
+        // Not ready before its slot: a handoff would put the phrase ahead of its picture.
+        guard isDue(r) else {
+            return UnitReadiness(unit: id, speaker: r.speaker, generation: r.generation, bufferedSeconds: 0, complete: false)
+        }
+        return UnitReadiness(unit: id, speaker: r.speaker, generation: r.generation,
+                      bufferedSeconds: hasSufficientPrebuffer(r) ? r.bufferedSeconds : 0,
+                      complete: r.synthesisComplete)
+    }
+
+    private func hasSufficientPrebuffer(_ r: UnitRecord) -> Bool {
+        if r.synthesisComplete { return true }
+        if config.completePhrasesBeforePlayback { return false }
+        let reserve = config.health.prebufferSeconds
+        guard config.adaptiveStreamingPrebuffer else { return r.bufferedSeconds >= reserve }
+        // One chunk gives no evidence about sustained generation speed. Both native
+        // whole-phrase adapters and short streams release on synthesisFinished.
+        guard r.pcmChunks >= 2, let first = r.firstPCMAt, let last = r.lastPCMAt else { return false }
+        let elapsed = Double(last - first) / 1e9
+        guard elapsed > 0 else { return r.bufferedSeconds >= reserve }
+        let rate = (r.bufferedSeconds - r.firstPCMSeconds) / elapsed
+        guard rate > 0 else { return false }
+        let expected = max(r.bufferedSeconds, max(r.source.span.durationSeconds,
+                           Double(r.target?.count ?? 0) * config.estimatedSecondsPerTargetChar))
+        let remaining = max(0, expected - r.bufferedSeconds)
+        // Wait for a reserve covering the predicted generation deficit. A source/text
+        // duration estimate is imperfect, so this reduces starvation rather than
+        // guaranteeing uninterrupted playback. No model or wall clock is called here.
+        let required = reserve + max(0, remaining / rate - remaining)
+        return r.bufferedSeconds >= required
     }
 
     // MARK: State machine effects
@@ -573,6 +813,7 @@ public struct SessionPipeline: Sendable {
                 out.append(trace(.gainRamp, [.double("original", Double(audible.original)),
                                              .double("translated", Double(audible.translated)), .int("ms", ms)]))
                 out.append(.rampGains(audible, durationMs: ms))
+                out += backgroundGainEffect(durationMs: ms)
             case .advanceGeneration:
                 gate.advanceGeneration()
                 machine.syncGeneration(gate.generation)
@@ -597,7 +838,7 @@ public struct SessionPipeline: Sendable {
         // Earlier units were already heard as original; their PCM is stale.
         for older in order where older < id {
             guard let r = units[older],
-                  r.stage == .held || r.stage == .synthesizing || r.stage == .translating || r.stage == .awaitingVoice else { continue }
+                  r.stage == .held || r.stage == .synthesizing || r.stage == .translating || r.stage == .awaitingSpeaker || r.stage == .awaitingVoice else { continue }
             out += cancel(older, disposition: .originalOnly, reason: "superseded_by_handoff")
         }
         guard var r = units[id] else { return out }
@@ -606,7 +847,12 @@ public struct SessionPipeline: Sendable {
         r.handoff = true
         units[id] = r
         out.append(.releaseHeld(id))
-        out.append(trace(.playScheduled, [.unit(id), .bool("handoff", true)]))
+        out.append(trace(.playScheduled, [.unit(id), .bool("handoff", true)] + slotFields(r)))
+        // Picture delay hands off the newest *due* unit, so later phrases may already be held.
+        // They queue behind it for their own slots instead of waiting for another handoff.
+        if slotted {
+            for newer in order where newer > id && units[newer]?.stage == .held { units[newer]?.stage = .waiting }
+        }
         return out
     }
 
@@ -676,17 +922,17 @@ public struct SessionPipeline: Sendable {
                 return r.stage == .translating || r.stage == .synthesizing || r.stage == .held
             }
             for id in config.finishPhraseBeforeCatchUp ? candidates.dropLast() : candidates[...] {
-                guard let r = units[id], sourceAgeSeconds(of: r.source.span.start) > config.health.maxSourceLagSeconds
+                guard let r = units[id], lateness(of: r.source.span.start) > config.health.maxSourceLagSeconds
                 else { continue }
                 out += cancel(id, disposition: .originalOnly, reason: "source_expired")
             }
         default: break
         }
-        // A unit waits for its speaker's profile only while its source is fresh.
+        // Attribution and voice acquisition are bounded by the same source-lag limit.
         for id in order {
-            guard let r = units[id], r.stage == .awaitingVoice,
-                  sourceAgeSeconds(of: r.source.span.end) > config.health.maxSourceLagSeconds else { continue }
-            out += finish(id, as: .originalOnly, reason: "no_profile")
+            guard let r = units[id], r.stage == .awaitingVoice || r.stage == .awaitingSpeaker,
+                  lateness(of: r.source.span.end) > config.health.maxSourceLagSeconds else { continue }
+            out += finish(id, as: .originalOnly, reason: r.stage == .awaitingSpeaker ? "no_speaker" : "no_profile")
         }
         var (pressure, pending) = queuePressure()
         out.append(trace(.queueDepth, [.int("debt_ms", Int((pressure.debt * 1000).rounded())),
@@ -723,7 +969,8 @@ public struct SessionPipeline: Sendable {
         for id in order {
             guard let r = units[id], r.stage.isLive else { continue }
             pending += 1
-            pendingEstimate += unscheduledSeconds(r)
+            // Audio still early for its slot is owed to no one yet.
+            if isDue(r) { pendingEstimate += unscheduledSeconds(r) }
             // Scheduled audio is covered source; the mixer reports it as backlog.
             if r.stage.onBus || r.stage == .waiting { continue }
             oldest = min(oldest ?? r.source.span.start, r.source.span.start)
@@ -734,7 +981,8 @@ public struct SessionPipeline: Sendable {
             let start = policy.uncommittedStart
             oldest = min(oldest ?? start, start)
         }
-        return ((backlogSeconds + pendingEstimate, oldest.map { sourceAgeSeconds(of: $0) } ?? 0), pending)
+        let age = oldest.map { slotted ? max(0, lateness(of: $0)) : sourceAgeSeconds(of: $0) } ?? 0
+        return ((backlogSeconds + pendingEstimate, age), pending)
     }
 
     /// Debt a unit adds beyond the bus backlog: estimated audio still to generate, plus
@@ -742,8 +990,8 @@ public struct SessionPipeline: Sendable {
     private func unscheduledSeconds(_ r: UnitRecord) -> Double {
         let total = Double(r.target?.count ?? 0) * config.estimatedSecondsPerTargetChar
         switch r.stage {
-        case .translating: return Double(r.source.text.count) * config.estimatedSecondsPerSourceChar
-        case .awaitingVoice, .synthesizing, .held: return max(0, total - r.bufferedSeconds)
+        case .translating: return config.directAudioTranslation ? r.source.span.durationSeconds : Double(r.source.text.count) * config.estimatedSecondsPerSourceChar
+        case .awaitingSpeaker, .awaitingVoice, .synthesizing, .held: return max(0, total - r.bufferedSeconds)
         case .waiting: return max(total, r.bufferedSeconds)
         case .queued, .playing, .finished, .canceled, .rejected: return 0
         }
@@ -757,7 +1005,7 @@ public struct SessionPipeline: Sendable {
         guard pressure.debt > health.maxDebtSeconds || pressure.age > health.maxSourceLagSeconds else { return [] }
         let unheard = order.filter { id in
             guard let stage = units[id]?.stage else { return false }
-            return stage == .translating || stage == .awaitingVoice || stage == .synthesizing || stage == .waiting
+            return stage == .translating || stage == .awaitingSpeaker || stage == .awaitingVoice || stage == .synthesizing || stage == .waiting
         }
         var debt = pressure.debt
         var skipped: [UnitID] = []
@@ -766,9 +1014,11 @@ public struct SessionPipeline: Sendable {
         let refilling = order.contains(where: { units[$0]?.stage.onBus == true }) ? nil
             : unheard.first(where: { units[$0]?.stage == .synthesizing })
         for id in unheard.dropLast() {
-            if id == refilling { continue }
             guard let r = units[id] else { continue }
-            let stale = sourceAgeSeconds(of: r.source.span.end) > health.maxSourceLagSeconds
+            let stale = lateness(of: r.source.span.end) > health.maxSourceLagSeconds
+            // With a picture delay a refill already past its slot would push every later phrase
+            // off its picture too; the newest unit is still kept, so the bus does not stay empty.
+            if id == refilling, !(slotted && stale) { continue }
             guard debt > health.maxDebtSeconds || stale else { break }
             debt -= unscheduledSeconds(r)
             skipped.append(id)
@@ -781,16 +1031,60 @@ public struct SessionPipeline: Sendable {
         return out
     }
 
-    /// Fluent playout: the oldest waiting unit goes on the bus once nothing is scheduled ahead.
+    /// Fluent playout: the oldest waiting unit goes on the bus once nothing is scheduled ahead
+    /// and, with a picture delay, once its slot has come.
     private mutating func promoteWaiting() -> [PipelineEffect] {
+        if slotted { return offerDueHeld() + promoteDue() }
+        return promoteDue()
+    }
+
+    private mutating func promoteDue() -> [PipelineEffect] {
         guard config.finishPhraseBeforeCatchUp, case .translating = machine.state,
               !order.contains(where: { units[$0]?.stage.onBus == true }),
               let id = order.first(where: { units[$0]?.stage == .waiting }),
-              let r = units[id],
-              r.synthesisComplete || r.bufferedSeconds >= config.health.prebufferSeconds else { return [] }
+              let r = units[id], isDue(r),
+              hasSufficientPrebuffer(r) else { return [] }
         units[id]?.stage = .queued
         units[id]?.scheduled = true
-        return [.releaseHeld(id), trace(.playScheduled, [.unit(id)])]
+        return [.releaseHeld(id), trace(.playScheduled, [.unit(id)] + slotFields(r))]
+    }
+
+    /// Picture delay: a held unit reaches its slot between ticks. Offer it to the session as
+    /// soon as it is due rather than on the next 100 ms tick (unitReady is a no-op when the
+    /// handoff is not allowed yet).
+    private mutating func offerDueHeld() -> [PipelineEffect] {
+        switch machine.state {
+        case .acquiringVoice, .degraded: break
+        default: return []
+        }
+        // The newest held unit whose slot has come; older backlog is never replayed.
+        guard let id = order.last(where: { units[$0].map { $0.stage == .held && isDue($0) } ?? false }),
+              let r = units[id] else { return [] }
+        return session(.unitReady(readiness(r, id)))
+    }
+
+    // MARK: Picture delay (ADR-0012)
+
+    private var slotted: Bool { config.presentationDelaySeconds > 0 }
+
+    /// Units held at once: the delay keeps up to D more seconds of dialogue in flight.
+    private var maxPendingUnits: Int {
+        max(1, config.maxPendingUnits) + Int(config.presentationDelaySeconds.rounded(.up))
+    }
+
+    /// Seconds past the slot of a source sample (negative while early). Source age when D = 0.
+    private func lateness(of sample: Int64) -> Double {
+        sourceAgeSeconds(of: sample) - config.presentationDelaySeconds
+    }
+
+    private func isDue(_ r: UnitRecord) -> Bool {
+        !slotted || lateness(of: r.source.span.start) >= 0
+    }
+
+    /// How far from its slot a unit was scheduled; positive is late. Only with a picture delay.
+    private func slotFields(_ r: UnitRecord) -> [TraceEvent.Field] {
+        guard slotted else { return [] }
+        return [.int("late_ms", Int((lateness(of: r.source.span.start) * 1000).rounded()))]
     }
 
     /// Age of a source sample, mapped to event time through capture anchors.
@@ -814,5 +1108,11 @@ public struct SessionPipeline: Sendable {
     private func outputGains(_ gains: BusGains) -> BusGains {
         if playbackMode == .original { return .original }
         return BusGains(original: config.originalAudioEnabled ? gains.original : 0, translated: gains.translated)
+    }
+
+    private func backgroundGainEffect(durationMs: Int) -> [PipelineEffect] {
+        guard config.backgroundAudioEnabled else { return [] }
+        let active = machine.state != .idle && machine.state != .arming && playbackMode == .translated
+        return [.backgroundGain(active ? 0.8 : 0, durationMs: durationMs)]
     }
 }
