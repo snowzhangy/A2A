@@ -28,7 +28,7 @@ def test_offline_replay_is_valid_and_deterministic(synthetic_fixture, pipeline_b
     e1 = _deterministic(trace.load(tmp_path / "r1" / "trace.jsonl"))
     e2 = _deterministic(trace.load(tmp_path / "r2" / "trace.jsonl"))
     assert e1 == e2, "virtual-clock replay must be byte-for-byte reproducible"
-    assert (tmp_path / "r1" / "report.md").read_text().startswith("# Replay report")
+    assert (tmp_path / "r1" / "report.md").read_text(encoding="utf-8").startswith("# Replay report")
 
 
 def test_fluent_replay_finishes_each_audible_phrase(synthetic_fixture, pipeline_binary, tmp_path):
@@ -90,14 +90,14 @@ def test_english_to_chinese_replay_produces_captions_and_audio(synthetic_fixture
     trace_path = tmp_path / "reverse.jsonl"
     script.write_text(json.dumps({"hypotheses": [
         {"at_sample": 96_000, "utt": 1, "text": source, "final": True,
-         "tokens": [{"text": source, "start": 24_000, "end": 72_000}]}]}))
-    dictionary.write_text(json.dumps({source: target}))
+         "tokens": [{"text": source, "start": 24_000, "end": 72_000}]}]}), encoding="utf-8")
+    dictionary.write_text(json.dumps({source: target}), encoding="utf-8")
     result = subprocess.run([
         str(pipeline_binary), "--input", str(fx.audio), "--asr", "scripted", "--asr-script", str(script),
         "--mt", "dictionary", "--mt-dictionary", str(dictionary), "--direction", "en-zh",
         "--translation-only", "--fluent", "--events-stdout", "--trace", str(trace_path),
         "--out", str(tmp_path / "reverse.wav"),
-    ], capture_output=True, text=True, timeout=30, check=True)
+    ], capture_output=True, text=True, encoding="utf-8", timeout=30, check=True)
     messages = [json.loads(line) for line in result.stdout.splitlines()]
     summary = messages[-1]
     assert summary["direction"] == "en-zh" and summary["pair"] == "en-US>zh-CN"
@@ -113,7 +113,7 @@ def test_english_to_chinese_replay_produces_captions_and_audio(synthetic_fixture
 @pytest.mark.parametrize("value", ["auto", "en-en", "zh-fr"])
 def test_unknown_direction_fails_before_audio_startup(pipeline_binary, value):
     result = subprocess.run([str(pipeline_binary), "--stdin", "--direction", value],
-                            capture_output=True, text=True, timeout=5)
+                            capture_output=True, text=True, encoding="utf-8", timeout=5)
     assert result.returncode == 2 and "--direction is zh-en or en-zh" in result.stderr
 
 
@@ -145,7 +145,7 @@ def test_caption_delivery_does_not_persist_text(synthetic_fixture, pipeline_bina
         str(pipeline_binary), "--input", str(fx.audio), "--asr", "scripted",
         "--asr-script", str(fx.asr_script), "--mt", "dictionary", "--mt-dictionary", str(fx.mt_dictionary),
         "--captions-only", "--events-stdout", "--trace", str(trace_path),
-    ], capture_output=True, text=True, timeout=30, check=True)
+    ], capture_output=True, text=True, encoding="utf-8", timeout=30, check=True)
     messages = [json.loads(line) for line in result.stdout.splitlines()]
     assert any(m.get("caption") == "target.final" and m["text"] for m in messages)
     assert messages[-1]["captions_only"]
@@ -156,7 +156,7 @@ def test_caption_delivery_does_not_persist_text(synthetic_fixture, pipeline_bina
 
 def test_nonfinite_duration_is_rejected_before_startup(pipeline_binary):
     result = subprocess.run([str(pipeline_binary), "--stdin", "--tail-seconds", "nan"],
-                            capture_output=True, text=True, timeout=5)
+                            capture_output=True, text=True, encoding="utf-8", timeout=5)
     assert result.returncode == 2
     assert "invalid duration" in result.stderr
 

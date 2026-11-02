@@ -26,7 +26,7 @@ def pct(values: list[float], q: float) -> float | None:
 
 
 def summarize(run: str) -> dict:
-    with open(f"{run}/trace.jsonl") as source:
+    with open(f"{run}/trace.jsonl", encoding="utf-8") as source:
         events = [json.loads(line) for line in source]
     by = collections.defaultdict(dict)
     for e in events:

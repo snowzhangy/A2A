@@ -5,7 +5,8 @@ Status: accepted for local development, 27 October 2026, following the user's re
 
 The app defaults to streaming translated speech with adaptive buffering, an 8-second
 estimated-debt budget and an 8-second source-lag budget. **Prioritize complete phrases**
-remains available but is no longer the default; its 20-second budget in ADR-0007 caused
+remains available but is no longer the default; its 20-second budget in
+[ADR-0014](0014-quality-first-live-playback.md) caused
 an unacceptable delay in the user's watching experience. These are policy limits,
 not promises of measured latency or full dialogue coverage.
 

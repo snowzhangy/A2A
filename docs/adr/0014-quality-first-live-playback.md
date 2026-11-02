@@ -1,7 +1,11 @@
-# ADR-0007 — Complete phrases within a bounded live delay budget
+# ADR-0014 — Complete phrases within a bounded live delay budget
 
 Status: accepted for local development, 27 October 2026, following the user's request:
 "quality first. speed next. but need live".
+
+Numbering note: [ADR-0007](0007-portable-runtime-experiment.md) was written the same day on the
+branch that was published first, so it kept 0007 and this record took the next free number when
+the two branches merged on 2 November. Nothing in the decision changed.
 
 Update: [ADR-0008](0008-separated-background-and-live-delay.md) restores a streaming
 default after the user rejected the measured delay. Complete-phrase mode remains opt-in.

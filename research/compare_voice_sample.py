@@ -36,7 +36,7 @@ def main() -> None:
         path.resolve().relative_to((ROOT / ".local").resolve())
     if args.out.exists():
         raise FileExistsError("Use a fresh output directory to preserve measurements")
-    plan = json.loads(args.plan.read_text())
+    plan = json.loads(args.plan.read_text(encoding="utf-8"))
     if not 1 <= len(plan["rows"]) <= 32:
         raise ValueError("Use 1–32 comparison lines")
     # Respect other local model jobs without modifying dub-anything's work tree.
@@ -131,7 +131,7 @@ def main() -> None:
         (args.out / "result.json").write_text(json.dumps(dict(engine=args.engine, model=model_name,
             identity_qualified=False, offline=True, scope="isolated TTS; matched directed text and references",
             plan_sha256=hashlib.sha256(args.plan.read_bytes()).hexdigest(), load_s=load_s,
-            warm_s=warm_s, rows=records), indent=2) + "\n")
+            warm_s=warm_s, rows=records), indent=2) + "\n", encoding="utf-8")
         print(json.dumps({k: record[k] for k in ("id", "prepare_s", "generation_s", "first_audio_s", "audio_s")}), flush=True)
     if lock:
         lock.close()

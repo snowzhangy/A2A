@@ -1,5 +1,26 @@
 **Implementation status — 25 October 2026**
 
+2 November, merge. GitHub's `main` had moved while this tree grew: the published branch carries
+*Add experimental Windows translation runtime and UI* (`runtime/`, with its own ADR-0007). The two
+sides met in three files, and both were kept. `research/tts_worker.py` holds the take retry, the
+speech budget and ADR-0013's fill, and gains the `native_speed` path: a backend that paces a phrase
+itself is handed a speed-up only, because no native slowdown has been measured, so a fill still runs
+through WSOLA and the pace learned from a native take is divided back out. `research/run_metrics.py`
+keeps the closed file handle and the explicit UTF-8. `harness/tests/test_clone_pipeline.py` keeps the
+dual-clone prefetch test with the wider skip reason. One
+`generate(voice, text, interval, attempt, speed)` contract now covers all three backends and every
+test stub — four budget tests failed until the stubs followed it. Two ADRs were numbered 0007 and
+dated 27 October: the published one keeps the number, and complete-phrase playback became
+[ADR-0014](../../docs/adr/0014-quality-first-live-playback.md), with the reason in the file.
+
+The port's parity claim was checked rather than assumed: `runtime/tests` gives 119 passed, 23
+skipped. It passes because the five golden scenarios contain no slot session — the port has no
+`presentationDelaySeconds` and no turn fill, so it reproduces none of ADR-0012 or ADR-0013 and still
+matches byte for byte. A golden with a presentation delay is what would catch that, and AGENTS.md now
+states the mirroring duty for `A2ACore` changes. Neither the WASAPI host nor `--backend torch` is
+exercised here: those need Windows and a CUDA or MPS host. Checks on the merged tree:
+`scripts/check.sh` ok (270 Swift tests, 123 harness tests, exit 0) — the Mac tier only.
+
 2 November. Each line now takes its actor's time. A2A paced translated speech in one direction:
 a long take was sped up to 1.3×, a short one was played short and the rest of the actor's turn went
 by with nothing on the bus. dub-anything re-times every line to end where the actor stops and its
@@ -207,7 +228,7 @@ timeline previews retain actual silence and delayed final speech. Details and li
 app build and synthetic app smoke. Dub-quality live playback remains unachieved.
 
 Quality-first follow-up: the app now defaults to complete-phrase playback with a bounded
-20-second debt/lag budget (ADR-0007). An actual private process tap of the synchronized
+20-second debt/lag budget (ADR-0014). An actual private process tap of the synchronized
 test player completed 13/13 committed units, with no underruns or capture overflow,
 at 16.17 s median onset delay on the selected AirPods output. This establishes live
 capture/playback completeness for one scene, not semantic accuracy or dub quality.

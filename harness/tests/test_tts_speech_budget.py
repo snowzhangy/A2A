@@ -70,7 +70,7 @@ class Backend:
     def prepare(self, voice: Voice) -> None:
         voice.native = "stub-reference"
 
-    def generate(self, voice, text, interval):
+    def generate(self, voice, text, interval, attempt=0, speed=1.0):
         total = int(RATE * len(text) * self.seconds_per_character)
         step = RATE // 2
         for start in range(0, total, step):
@@ -150,7 +150,7 @@ class SilentStartBackend:
     def prepare(self, voice: Voice) -> None:
         voice.native = "stub-reference"
 
-    def generate(self, voice, text, interval, attempt=0):
+    def generate(self, voice, text, interval, attempt=0, speed=1.0):
         self.calls.append((text, attempt))
         self.generated.append(0)
         silent = len(self.calls) <= self.silent_takes

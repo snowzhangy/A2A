@@ -65,6 +65,12 @@ filled line could be *requested* longer instead of stretched after the fact. Tha
 experiment with its own listening check; the reference project found that asking OmniVoice for a
 slower speed barely changes a take's length, while an explicit duration does.
 
+A backend that reports `native_speed` — the PyTorch path of
+[ADR-0007](0007-portable-runtime-experiment.md) — is asked for a speed-up itself and gets no
+software stretching. Fill keeps the software path: no native slowdown has been measured on a device,
+so `speed < 1` still runs through WSOLA and the model is handed 1.0. The pace learned from a native
+take is divided back out, so a fast take does not teach the next line to speak faster than the actor.
+
 A/B listening evidence is outstanding. The deterministic checks prove the mechanism and its
 measurement, not that a stretched line sounds better than the actor's own silence.
 

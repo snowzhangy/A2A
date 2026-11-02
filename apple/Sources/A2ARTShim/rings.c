@@ -2,11 +2,13 @@
 
 #include "A2ARTShim.h"
 
-#include <mach/mach_time.h>
-#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(__APPLE__)
+#include <mach/mach_time.h>
+#include <pthread.h>
 
 // MARK: Time
 
@@ -36,6 +38,54 @@ uint64_t a2a_host_ticks_to_ns(uint64_t ticks) {
 uint64_t a2a_now_ns(void) {
     return a2a_host_ticks_to_ns(mach_absolute_time());
 }
+
+static void *aligned_alloc64(size_t size) { return aligned_alloc(64, size); }
+static void aligned_free64(void *p) { free(p); }
+
+#elif defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <malloc.h>
+
+// MARK: Time (portable runtime, ADR-0007)
+
+// Host ticks are 100 ns units: WASAPI reports QPC positions in 100 ns, and
+// a2a_now_ns matches Python's time.perf_counter_ns() (both scale the raw QPC counter).
+static LARGE_INTEGER g_qpc_frequency;
+
+void a2a_time_init(void) {
+    QueryPerformanceFrequency(&g_qpc_frequency);
+}
+
+uint64_t a2a_host_ticks_to_ns(uint64_t ticks) { return ticks * 100; }
+
+uint64_t a2a_now_ns(void) {
+    if (!g_qpc_frequency.QuadPart) QueryPerformanceFrequency(&g_qpc_frequency);
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    const uint64_t f = (uint64_t)g_qpc_frequency.QuadPart, c = (uint64_t)counter.QuadPart;
+    return (c / f) * 1000000000ull + (c % f) * 1000000000ull / f;
+}
+
+static void *aligned_alloc64(size_t size) { return _aligned_malloc(size, 64); }
+static void aligned_free64(void *p) { _aligned_free(p); }
+
+#else
+#include <time.h>
+
+// MARK: Time (portable runtime, ADR-0007): host ticks are CLOCK_MONOTONIC nanoseconds.
+
+void a2a_time_init(void) {}
+uint64_t a2a_host_ticks_to_ns(uint64_t ticks) { return ticks; }
+uint64_t a2a_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void *aligned_alloc64(size_t size) { return aligned_alloc(64, size); }
+static void aligned_free64(void *p) { free(p); }
+#endif
 
 // Allocate zeroed memory and touch every page now, on the creating thread. calloc maps
 // pages lazily, so the first write from an IOProc would otherwise page-fault on the RT path.
@@ -73,14 +123,14 @@ struct a2a_ring {
 a2a_ring *a2a_ring_create(uint32_t capacity_frames, uint32_t channels) {
     const uint32_t capacity = next_pow2(capacity_frames);
     if (channels == 0 || !capacity) return NULL;
-    a2a_ring *ring = aligned_alloc(64, sizeof(a2a_ring));
+    a2a_ring *ring = aligned_alloc64(sizeof(a2a_ring));
     if (!ring) return NULL;
     memset(ring, 0, sizeof(*ring));
     ring->capacity = capacity;
     ring->mask = ring->capacity - 1;
     ring->channels = channels;
     ring->data = a2a_prefaulted_calloc((size_t)ring->capacity * channels, sizeof(float));
-    if (!ring->data) { free(ring); return NULL; }
+    if (!ring->data) { aligned_free64(ring); return NULL; }
     atomic_init(&ring->write_index, 0);
     atomic_init(&ring->read_index, 0);
     atomic_init(&ring->overflow, 0);
@@ -90,7 +140,7 @@ a2a_ring *a2a_ring_create(uint32_t capacity_frames, uint32_t channels) {
 void a2a_ring_destroy(a2a_ring *ring) {
     if (!ring) return;
     free(ring->data);
-    free(ring);
+    aligned_free64(ring);
 }
 
 uint32_t a2a_ring_channels(const a2a_ring *ring) { return ring->channels; }
@@ -172,13 +222,13 @@ struct a2a_record_ring {
 a2a_record_ring *a2a_record_ring_create(uint32_t capacity) {
     capacity = next_pow2(capacity);
     if (!capacity) return NULL;
-    a2a_record_ring *ring = aligned_alloc(64, sizeof(a2a_record_ring));
+    a2a_record_ring *ring = aligned_alloc64(sizeof(a2a_record_ring));
     if (!ring) return NULL;
     memset(ring, 0, sizeof(*ring));
     ring->capacity = capacity;
     ring->mask = ring->capacity - 1;
     ring->data = a2a_prefaulted_calloc(ring->capacity, sizeof(a2a_rt_record));
-    if (!ring->data) { free(ring); return NULL; }
+    if (!ring->data) { aligned_free64(ring); return NULL; }
     atomic_init(&ring->write_index, 0);
     atomic_init(&ring->read_index, 0);
     atomic_init(&ring->dropped, 0);
@@ -188,7 +238,7 @@ a2a_record_ring *a2a_record_ring_create(uint32_t capacity) {
 void a2a_record_ring_destroy(a2a_record_ring *ring) {
     if (!ring) return;
     free(ring->data);
-    free(ring);
+    aligned_free64(ring);
 }
 
 bool a2a_record_ring_push(a2a_record_ring *ring, const a2a_rt_record *record) {

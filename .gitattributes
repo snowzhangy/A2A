@@ -1,0 +1,9 @@
+# Byte-exact text across platforms: golden traces compare byte for byte, and shell scripts
+# break under CRLF. Windows checkouts with core.autocrlf=true would otherwise rewrite both.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.wav binary
+*.png binary
+*.safetensors binary

@@ -20,7 +20,7 @@ def main() -> None:
     args = ap.parse_args()
     events = trace.load(args.trace)
     out = args.output or args.trace.with_suffix(".perfetto.json")
-    out.write_text(json.dumps(perfetto.convert(events, include_buffers=args.include_buffers)))
+    out.write_text(json.dumps(perfetto.convert(events, include_buffers=args.include_buffers)), encoding="utf-8")
     print(out)
 
 

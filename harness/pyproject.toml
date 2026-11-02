@@ -23,5 +23,8 @@ build-backend = "hatchling.build"
 packages = ["a2a_harness"]
 
 [tool.pytest.ini_options]
+# Implicit locale encodings break Mandarin text on stock Windows code pages; scripts/check
+# runs pytest with PYTHONWARNDEFAULTENCODING=1 so these become errors.
+filterwarnings = ["error::EncodingWarning"]
 testpaths = ["tests"]
 pythonpath = ["."]

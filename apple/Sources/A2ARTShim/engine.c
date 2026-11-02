@@ -15,6 +15,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 #define GAIN_SCALE 16384.0f   // 16-bit fixed point, range [0, 4)
 
 struct a2a_engine {
@@ -481,6 +485,7 @@ void a2a_engine_process(a2a_engine *e,
 
 // MARK: IOProc adapter
 
+#if defined(__APPLE__)
 // Frame count of a buffer list: the largest buffer (empty sub-streams report 0 bytes).
 static uint32_t abl_frames(const AudioBufferList *abl) {
     if (!abl) return 0;
@@ -573,3 +578,4 @@ OSStatus a2a_engine_ioproc(AudioObjectID device, const AudioTimeStamp *_Nonnull 
     if (out_frames) scatter(e->scratch_out, output, out_frames, ch);
     return noErr;
 }
+#endif

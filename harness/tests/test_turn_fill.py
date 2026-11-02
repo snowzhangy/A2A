@@ -53,7 +53,7 @@ class Backend:
     def prepare(self, voice: Voice) -> None:
         voice.native = "stub-reference"
 
-    def generate(self, voice, text, interval):
+    def generate(self, voice, text, interval, attempt=0, speed=1.0):
         total = int(RATE * len(text) * self.seconds_per_character)
         step = int(RATE * interval)
         for start in range(0, total, step):

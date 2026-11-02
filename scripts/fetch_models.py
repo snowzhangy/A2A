@@ -157,7 +157,7 @@ def fetch(doc: dict, ids: list[str], cache: Path, *, allow_restricted: bool = Fa
             dest = staging / f["path"]
             dest.parent.mkdir(parents=True, exist_ok=True)
             os.replace(partial_root / (f["path"] + ".part"), dest)
-        (staging / ".a2a-manifest-entry.json").write_text(json.dumps(e, indent=2, ensure_ascii=False))
+        (staging / ".a2a-manifest-entry.json").write_text(json.dumps(e, indent=2, ensure_ascii=False), encoding="utf-8")
         final.parent.mkdir(parents=True, exist_ok=True)
         if final.exists():
             shutil.rmtree(final)

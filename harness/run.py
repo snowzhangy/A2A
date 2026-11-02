@@ -32,7 +32,7 @@ def main() -> None:
     result = run(RunConfig(fixture=args.fixture, pipeline=args.pipeline, out_dir=out, mode=args.mode,
                            speed=args.speed, asr=args.asr, mt=args.mt, tts=args.tts,
                            profile_ready_ms=args.profile_ready_ms, research_text=not args.no_text))
-    print((out / "report.md").read_text())
+    print((out / "report.md").read_text(encoding="utf-8"))
     print(json.dumps({"out_dir": str(out), "gate_valid": result["gate_valid"],
                       "streaming_gate_pass": result["streaming_gate"]["pass"]}))
 

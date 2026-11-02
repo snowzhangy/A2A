@@ -34,7 +34,7 @@ def digest(path: Path) -> str:
 def verified_model(model_id: str = MODEL_ID) -> tuple[Path, dict]:
     import yaml
 
-    manifest = yaml.safe_load((ROOT / "models/manifest.yaml").read_text())
+    manifest = yaml.safe_load((ROOT / "models/manifest.yaml").read_text(encoding="utf-8"))
     entry = next(e for e in manifest["entries"] if e["id"] == model_id)
     if not entry["enabled"] or entry["status"] not in ("verified", "qualified"):
         raise ValueError("Model must be explicitly enabled and verified in the manifest")
@@ -68,8 +68,8 @@ def main() -> None:
             raise ValueError("Reference must be mono PCM16 WAV")
         if reference_rate < 24000 or not 3 <= reference_seconds <= 10:
             raise ValueError("Use a 3–10 second full-band source reference, at least 24 kHz")
-    text = args.text.read_text().strip()
-    ref_text = args.reference_text.read_text().strip()
+    text = args.text.read_text(encoding="utf-8").strip()
+    ref_text = args.reference_text.read_text(encoding="utf-8").strip()
     if not text or not ref_text:
         raise ValueError("Both target text and the reference clip's own ASR transcript are required")
     if not 1 <= args.max_tokens <= 500:
@@ -160,7 +160,7 @@ def main() -> None:
         "pcm_gain": gain,
         "speech_sha256": digest(args.out / "speech.wav"),
     }
-    (args.out / "result.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+    (args.out / "result.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({k: report[k] for k in ("audio_seconds", "generation_seconds", "real_time_factor", "peak_memory_bytes")}))
 
 

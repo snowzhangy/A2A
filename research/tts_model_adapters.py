@@ -148,7 +148,7 @@ def load_adapter(key, path, dependencies, mx):
         # Load its components directly from our independently verified manifest entries.
         from mlx_audio.tts.models.chatterbox import Model, ModelConfig
         from mlx_audio.tts.models.chatterbox.s3tokenizer import S3TokenizerV2
-        model = Model(ModelConfig.from_dict(json.loads((path / "config.json").read_text())))
+        model = Model(ModelConfig.from_dict(json.loads((path / "config.json").read_text(encoding="utf-8"))))
         weights = model.sanitize(mx.load(str(path / "model.safetensors")))
         model.load_weights(list(weights.items()), strict=True)
         model._init_text_tokenizers(path)

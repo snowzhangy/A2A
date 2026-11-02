@@ -23,7 +23,7 @@ def test_fixture_loads_and_audio_matches_manifest(synthetic_fixture):
 
 def test_scripted_hypotheses_never_use_future_audio(synthetic_fixture):
     fx = fixture.load(synthetic_fixture)
-    script = json.loads(fx.asr_script.read_text())["hypotheses"]
+    script = json.loads(fx.asr_script.read_text(encoding="utf-8"))["hypotheses"]
     assert script
     for h in script:
         for tok in h.get("tokens", []):
@@ -32,7 +32,7 @@ def test_scripted_hypotheses_never_use_future_audio(synthetic_fixture):
 
 def test_dictionary_covers_every_clause_combination(synthetic_fixture):
     fx = fixture.load(synthetic_fixture)
-    table = json.loads(fx.mt_dictionary.read_text())
+    table = json.loads(fx.mt_dictionary.read_text(encoding="utf-8"))
     for unit in fx.units:
         assert unit.text in table
 

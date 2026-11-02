@@ -3,19 +3,48 @@
 // Rules (AGENTS.md): no allocation, locks, logging, Objective-C/Swift runtime calls, or
 // blocking on the callback path. All memory is allocated by *_create on a normal thread.
 // Each ring is single-producer/single-consumer; indices are C11 atomics.
+//
+// The same sources also build the portable runtime's native library on Windows (WASAPI
+// engine thread) and other non-Apple hosts (ADR-0007); see runtime/native/build.py.
 
 #ifndef A2A_RT_SHIM_H
 #define A2A_RT_SHIM_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+#if defined(__APPLE__)
 #include <CoreAudio/CoreAudio.h>
+#else
+// The fields of Core Audio's AudioTimeStamp that the engine reads. Host ticks are
+// platform-defined; a2a_host_ticks_to_ns converts them (100 ns units on Windows).
+typedef struct AudioTimeStamp {
+    double mSampleTime;
+    uint64_t mHostTime;
+    double mRateScalar;
+    uint64_t mWordClockTime;
+    uint32_t mFlags;
+    uint32_t mReserved;
+} AudioTimeStamp;
+enum {
+    kAudioTimeStampSampleTimeValid = 1u << 0,
+    kAudioTimeStampHostTimeValid = 1u << 1,
+    kAudioTimeStampRateScalarValid = 1u << 2,
+};
+#endif
+
+#if !defined(__clang__)
+#define _Nullable
+#define _Nonnull
+#endif
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+#if defined(__clang__)
 #pragma clang assume_nonnull begin
+#endif
 
 // MARK: Time
 
@@ -145,14 +174,18 @@ void a2a_engine_process(a2a_engine *engine,
                         const float *_Nullable in, uint32_t in_frames, const AudioTimeStamp *_Nullable in_time,
                         float *_Nullable out, uint32_t out_frames, const AudioTimeStamp *_Nullable out_time);
 
+#if defined(__APPLE__)
 /// RT. AudioDeviceIOProc entry point; `client` is the engine. Converts buffer lists
 /// (Float32, interleaved or not) to engine channels and calls a2a_engine_process.
 OSStatus a2a_engine_ioproc(AudioObjectID device, const AudioTimeStamp *_Nonnull now,
                            const AudioBufferList *_Nonnull input, const AudioTimeStamp *_Nonnull input_time,
                            AudioBufferList *_Nonnull output, const AudioTimeStamp *_Nonnull output_time,
                            void *_Nullable client);
+#endif
 
+#if defined(__clang__)
 #pragma clang assume_nonnull end
+#endif
 
 #ifdef __cplusplus
 }

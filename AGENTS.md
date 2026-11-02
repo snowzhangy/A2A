@@ -50,15 +50,18 @@ Every ticket states its DoD as a runnable command. Run it before you call the wo
 | Module | Owns | Must not |
 | --- | --- | --- |
 | `A2ACore` | Types, commit policy, state machine, playout gate, `SessionPipeline` reducer, trace event values | Do I/O, import Apple media frameworks, or call models. Clocks and events are injected. |
-| `A2ARTShim` (C) | SPSC rings, timing records, the IOProc, the two-bus mixer | Allocate, lock, log, or call Swift/ObjC on the callback path |
+| `A2ARTShim` (C) | SPSC rings, timing records, the IOProc, the original/translated mixer and the optional background bus | Allocate, lock, log, or call Swift/ObjC on the callback path |
 | `A2ATrace` | JSONL writer, draining RT records into trace events | Run on an RT thread |
 | `A2AAudio` | Process taps, the private aggregate device, source resolution, `TapSession` | Make policy decisions (those belong in `A2ACore`) |
 | `A2AMedia` | WAV, resampling, signal measurements | Run on an RT thread |
 | `A2AModels` | Adapters: fixture fakes and Apple frameworks (third-party models are added per selected combination) | Download at runtime (D8) |
 | `A2AVideo` | Delayed picture of the chosen source window (ADR-0012): ScreenCaptureKit capture, hardware encode into a bounded memory ring, presentation on a host-clock timebase | Make playout decisions (slots belong in `A2ACore`), touch audio, or write frames anywhere |
+| `runtime/` (ADR-0007, experimental) | The portable Python port of the reducer, the same C rings and mixer built for WASAPI, and the Windows host | Be imported by the Mac product, or claim production equivalence: its own golden-parity test decides whether the port still follows `A2ACore` |
 | `Tools/*`, `Apps/*` | Drivers that execute `SessionPipeline` effects | Duplicate policy logic |
 
 The reducer pattern is the contract. Drivers feed inputs with their event time into `SessionPipeline.handle`, then execute the returned effects. Golden tests, replay, and the live host therefore exercise identical decisions.
+
+Two hosts build from one set of C sources (ADR-0007): the Apple IOProc here and a WASAPI engine under `runtime/native`, so a change in `A2ARTShim` is a change on both. A change in `A2ACore` has to be mirrored in `runtime/a2a_runtime/core`, or `runtime/tests/test_golden.py` fails on the host that runs it — that test compares the Swift golden traces byte for byte and is the port's only claim to equivalence.
 
 ## Real-time rules (review checklist)
 

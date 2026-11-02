@@ -4,7 +4,7 @@ This records the earlier complete-phrase default. The user's subsequent feedback
 supersedes it: see [restored soundtrack and reduced delay](SOUNDTRACK-AND-DELAY.md).
 
 The user's priority is complete, accurate speech before low delay, while retaining
-live processing. The app now defaults to **Prioritize complete phrases** (ADR-0007).
+live processing. The app now defaults to **Prioritize complete phrases** (ADR-0014).
 The same reducer and adapters serve the app, file-paced replay, and real process taps.
 
 `--quality-first` waits until each phrase has finished synthesis before admitting its

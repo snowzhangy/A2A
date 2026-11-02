@@ -41,8 +41,8 @@ def main() -> None:
     with wave.open(str(args.reference), "rb") as f:
         if f.getframerate() < 24000 or not 3 <= reference_seconds <= 10:
             raise ValueError("Use a full-band 3–10 second reference")
-    reference_text = args.reference_text.read_text().strip()
-    text = args.text.read_text().strip()
+    reference_text = args.reference_text.read_text(encoding="utf-8").strip()
+    text = args.text.read_text(encoding="utf-8").strip()
     if not reference_text or not text:
         raise ValueError("Reference and target text are required")
     start = time.perf_counter()
@@ -118,7 +118,7 @@ def main() -> None:
         "peak_mlx_allocation_bytes": mx.get_peak_memory(),
         "runs": runs,
     }
-    (args.out / "result.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+    (args.out / "result.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
