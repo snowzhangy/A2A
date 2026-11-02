@@ -1,0 +1,18 @@
+[project]
+name = "a2a-live-dub-lab"
+version = "0.1.0"
+description = "Experiments toward dub-quality live translation (research only; not product code)"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "mlx-audio==0.6.1",
+  "mlx-lm",
+  "sherpa-onnx",
+  "soundfile",
+  "numpy>=1.26.4",
+  "opencc",
+  "jiwer",
+  "pillow",
+]
+
+[tool.uv]
+package = false
