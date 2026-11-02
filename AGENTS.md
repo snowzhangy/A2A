@@ -42,6 +42,7 @@ These rules apply to people and coding agents. Routine local implementation and 
 | Back-transcription | `a2a-transcribe --input x.wav [--locale en-US]` (installed SpeechTranscriber locale) |
 | FixturePlayer app | `scripts/build_fixture_player.sh`, which produces `.local/apps/FixturePlayer.app` (`dev.a2a.FixturePlayer`) |
 | Model manifest | `uv run --project harness python scripts/fetch_models.py --check\|--list\|--models ID\|--notices` |
+| Portable runtime (ADR-0007, experimental) | `uv run --project runtime python runtime/native/build.py`, then `uv run --project runtime python -m pytest runtime/tests` on the host it builds for (Windows). On macOS the pure-policy tests also run as `PYTHONPATH=runtime uv run --project harness python -m pytest runtime/tests` (119 passed, 23 skipped on 2 November). [runtime/README.md](runtime/README.md) owns setup and limits |
 
 Every ticket states its DoD as a runnable command. Run it before you call the work done, and report failures with their output.
 
