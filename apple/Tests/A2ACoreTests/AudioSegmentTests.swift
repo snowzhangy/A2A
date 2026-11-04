@@ -10,6 +10,45 @@ import Testing
         #expect(p.process(events: [], frontier: 400_000).isEmpty)
     }
 
+    // ADR-0017: under a picture delay a sentence stays one unit, and a cut lands in a breath.
+    @Test func sentenceUnitsGrowWithThePictureDelayWithinBounds() {
+        let second = Int64(canonicalSampleRate)
+        #expect(AudioSegmentPolicy.sentences(presentationDelaySeconds: 8).maxSamples == 9 * second / 2)
+        #expect(AudioSegmentPolicy.sentences(presentationDelaySeconds: 4).maxSamples == 3 * second)
+        #expect(AudioSegmentPolicy.sentences(presentationDelaySeconds: 20).maxSamples == 6 * second)
+        let p = AudioSegmentPolicy.sentences(presentationDelaySeconds: 8)
+        #expect(p.streamLimitSamples == p.maxSamples - second)
+        // The live default streams up to its fixed cut.
+        #expect(AudioSegmentPolicy().streamLimitSamples == AudioSegmentPolicy().maxSamples)
+    }
+
+    @Test func aLongSentenceIsCutAtTheQuietestFrameBeforeTheMaximum() {
+        var p = AudioSegmentPolicy(maxSeconds: 5, minSeconds: 0.25, dipWindowSeconds: 1)
+        let frame = Int64(960)   // 20 ms
+        var closed: [SourceSpan] = []
+        var at: Int64 = 0
+        _ = p.process(events: [.speechStart(0)], frontier: 0)
+        while closed.isEmpty, at < 6 * 48_000 {
+            let span = SourceSpan(start: at, end: at + frame)
+            // A breath 4.40–4.42 s, and a quieter frame outside the window that must not count.
+            let db: Float = span.start == 211_200 ? -50 : (span.start == 96_000 ? -70 : -20)
+            closed = p.process(events: [], frontier: span.end, level: (span, db))
+            at += frame
+        }
+        #expect(closed == [SourceSpan(start: 0, end: 211_680)])
+        #expect(p.openStart == 211_680)
+        #expect(p.capCloses == 1 && p.pauseCloses == 0)
+        // A pause closes the rest as usual.
+        #expect(p.process(events: [.speechEnd(300_000)], frontier: 310_000) == [SourceSpan(start: 211_680, end: 300_000)])
+        #expect(p.pauseCloses == 1)
+    }
+
+    @Test func withoutFrameLevelsTheCutIsTheMaximum() {
+        var p = AudioSegmentPolicy(maxSeconds: 5, minSeconds: 0.25, dipWindowSeconds: 1)
+        _ = p.process(events: [.speechStart(0)], frontier: 0)
+        #expect(p.process(events: [], frontier: 240_000) == [SourceSpan(start: 0, end: 240_000)])
+    }
+
     @Test func directAudioUsesSourceTimeForValidationAndNeverRequiresTranscript() {
         var c = PipelineConfig(session: "audio")
         c.directAudioTranslation = true
@@ -100,5 +139,47 @@ import Testing
         var fresh = AudioStreamFeed(maxSamples: max)
         let span = SourceSpan(start: 0, end: 24_000)
         #expect(fresh.update(closed: [span], openStart: nil, voicedEnd: nil) == [.append(span), .close(span)])
+    }
+}
+
+@Suite struct AdaptiveSpeechThresholdTests {
+    private func feed(_ t: inout AdaptiveSpeechThreshold, _ levels: [Float], from start: inout Int64) -> Float {
+        var last: Float = 0
+        for db in levels {
+            last = t.update(span: SourceSpan(start: start, end: start + 960), db: db)
+            start += 960
+        }
+        return last
+    }
+
+    @Test func pausesOverResidueFallBelowTheThreshold() {
+        // Speech at -20 dB with pauses where a loud scene leaves residue at -36 dB.
+        var t = AdaptiveSpeechThreshold(floorDB: -45)
+        var at: Int64 = 0
+        var threshold: Float = 0
+        for _ in 0..<6 { threshold = feed(&t, Array(repeating: -20, count: 50) + Array(repeating: -36, count: 25), from: &at) }
+        #expect(threshold > -36 && threshold < -20)
+        #expect(abs(threshold - -28) <= 1)
+    }
+
+    @Test func quietOrFlatSignalsKeepTheFixedFloor() {
+        var t = AdaptiveSpeechThreshold(floorDB: -45)
+        var at: Int64 = 0
+        // Clean speech over silence: the midpoint would be far below the floor.
+        #expect(feed(&t, Array(repeating: -25, count: 100) + Array(repeating: -120, count: 50), from: &at) == -45)
+        // No contrast (a steady bed): nothing to split on, so the floor stands.
+        var flat = AdaptiveSpeechThreshold(floorDB: -45)
+        var at2: Int64 = 0
+        #expect(feed(&flat, Array(repeating: -33, count: 400), from: &at2) == -45)
+        #expect(feed(&flat, [-Float.infinity, .nan], from: &at2) == -45)
+    }
+
+    @Test func onlyTheLastFewSecondsCount() {
+        var t = AdaptiveSpeechThreshold(floorDB: -45, windowSeconds: 1)
+        var at: Int64 = 0
+        _ = feed(&t, Array(repeating: -10, count: 200), from: &at)
+        // One second later the loud past is gone: speech at -20 over residue at -36.
+        let threshold = feed(&t, Array(repeating: -20, count: 34) + Array(repeating: -36, count: 16), from: &at)
+        #expect(abs(threshold - -28) <= 1)
     }
 }

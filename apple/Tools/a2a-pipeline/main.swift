@@ -75,7 +75,7 @@ struct Options {
     var asrScript: String?
     var mt = "dictionary"
     var mtDictionary: String?
-    var hyServer = "http://10.0.1.29:8082"
+    var hyServer = "http://127.0.0.1:8082"
     var hyWorker: String?
     var hyModel: String?
     var qwenCloud = false
@@ -93,6 +93,10 @@ struct Options {
     var referenceTranscriber: String?
     var cloneFake = false
     var dualClone = false
+    var isolateReferences = true
+    var sentenceUnits = true
+    var passthrough = true
+    var lidModel: String?
     var trace = "trace.jsonl"
     var out: String?
     var stems: String?
@@ -221,6 +225,10 @@ struct Options {
             case "--reference-transcriber": o.referenceTranscriber = value()
             case "--clone-fake": o.cloneFake = true
             case "--dual-clone": o.dualClone = true
+            case "--no-reference-isolation": o.isolateReferences = false
+            case "--no-sentence-units": o.sentenceUnits = false
+            case "--no-passthrough": o.passthrough = false
+            case "--lid-model": o.lidModel = value()
             case "--trace": o.trace = value()
             case "--out": o.out = value()
             case "--stems": o.stems = value()
@@ -348,7 +356,7 @@ let usage = """
                         [--speaker-carry S (seconds an unlabeled piece may inherit the previous speaker inside one uninterrupted turn; 0 off)]
                         [--speaker-carry-pause S (…and how close after a pause a brief unlabeled piece may inherit them; default 3)]
                         [--speaker-carry-piece S (…and the longest piece that may inherit across a pause; default 1)]
-                        [--no-shorten (drop an over-long target instead of cutting it to its source time)]
+                        [--no-shorten (speak the full target when it passes the hard length limit)]
                         [--no-filler-silence (count empty or filler answers as failed translations)]
                         [--asr scripted|audio --asr-script x.json] [--mt dictionary|hy|hy-local --mt-dictionary x.json]
                         [--tts tone|system|clone] [--profile-ready-ms N] --trace out.jsonl [--out out.wav] [--stems s.wav]
@@ -363,6 +371,9 @@ let usage = """
                         [--clone-python PATH --clone-worker PATH | --clone-fake]
                         [--reference-transcriber PATH (local transcript for Audio8/OmniVoice)]
                         [--dual-clone (experimental two-worker Qwen prefetch)]
+                        [--no-reference-isolation (audio-only clone: keep music and effects in the acquired reference)]
+                        [--no-sentence-units (direct audio with a picture delay: cut spans every 3 s on the mix, as before ADR-0017)]
+                        [--no-passthrough (ADR-0018: never put the actor's own voice back) [--lid-model DIR]]
                         [--session ID] [--research-text] [--tail-seconds S] [--vad-threshold-db DB]
                         [--captions-only | --translation-only] [--events-stdout (in-memory captions and state JSONL)]
                         [--playback original|translated] [--control-stdin (one playback mode per line)]
@@ -370,7 +381,7 @@ let usage = """
                         [--presentation-delay-ms D (with --fluent: phrases start at source start + D to match a delayed picture)]
                         [--no-turn-fill (with a picture delay: never slow a short line to end with its actor)]
                         [--adaptive-prebuffer (experimental throughput-based streaming reserve)]
-                        [--quality-first (complete phrases, 20-second debt/lag budget; continuously processes live audio)]
+                        [--quality-first (complete target and phrase when possible; 20-second debt/lag budget)]
                         [--background (experimental system sound isolation for music/effects) [--background-out FILE]]
                         [--speakers single|auto (dialogue: one voice per detected speaker)]
                         [--glossary terms.json (context MT)] [--pronounce words.json (spoken text only)]
@@ -611,6 +622,8 @@ enum DriverEvent: Sendable {
     /// Multi-speaker tone/system voice for a newly detected speaker.
     case voiceReady(PreparedVoice, prepareNs: UInt64)
     case voiceFailed(SpeakerID, String)
+    /// The language identifier's answer for one request (ADR-0018); nil when it failed.
+    case languageIdentified(Int, LanguageIdentifier.Verdict?)
 }
 
 struct Delivery {
@@ -665,6 +678,34 @@ final class Driver {
     let translatorLatency: LatencyModel
     var vad: EnergyVAD
     var audioSegments = AudioSegmentPolicy()
+    /// ADR-0017: the segmenter's own detector, on the voice the separator isolates (its spans moved
+    /// back by the separator's latency) so pauses under music count; nil keeps the session's detector.
+    var segmentVAD: EnergyVAD?
+    var segmentThreshold: AdaptiveSpeechThreshold?
+    var voiceTo16k: StreamingResampler?
+    var voiceLagSamples: Int64 = 0
+    /// The isolated voice of the current capture chunk, when the separator produced one.
+    var voiceChunk: [Float]?
+    var segmentFrontier: Int64 = 0
+    /// Recently closed direct-audio spans, for the silence that follows a unit (ADR-0018).
+    var recentSegments: [SourceSpan] = []
+    var unitSpans: [UnitID: SourceSpan] = [:]
+    /// ADR-0018 same-language passthrough. The separated bed is held `bedHoldNs` before it is
+    /// written to the delayed background bus, so a span found to be in the target language (or
+    /// answered with nothing) can be written as bed + its own isolated voice: the original sound,
+    /// since both come from the same render, on the delayed picture by construction.
+    var restoresVoice = false
+    var languageIdentifier: LanguageIdentifier?
+    var lidRequests: [Int: SourceSpan] = [:]
+    var nextLIDRequest = 1
+    var restoreSpans: [SourceSpan] = []
+    var bedHold: [(bed: [Float], voice: [Float], at: UInt64)] = []
+    var bedHoldNs: UInt64 = 0
+    /// Separator output samples already written to the background bus.
+    var bedOut: Int64 = 0
+    /// The isolated voice on the source timeline (separator latency removed), last 30 s.
+    var voiceHistory: [Float] = []
+    var voiceHistoryStart: Int64 = 0
     /// The local Hy worker hears each span while it is spoken (direct audio, --mt hy-local), so a
     /// committed span waits only for its last turn.
     let hyStreaming: HyLocalTranslator?
@@ -754,7 +795,10 @@ final class Driver {
         virtual = options.clock == "virtual"
         hyStreaming = options.asr == "audio" && options.hyStream && options.clock != "virtual"
             && hyLocal?.info?.streamsSpans == true ? hyLocal : nil
-        audioFeed = AudioStreamFeed(maxSamples: audioSegments.maxSamples)
+        if options.asr == "audio", options.sentenceUnits, options.presentationDelayMs > 0 {
+            audioSegments = .sentences(presentationDelaySeconds: Double(options.presentationDelayMs) / 1_000)
+        }
+        audioFeed = AudioStreamFeed(maxSamples: audioSegments.streamLimitSamples)
         var config = PipelineConfig(session: options.session, direction: options.direction)
         config.directAudioTranslation = options.asr == "audio"
         config.traceText = options.researchText
@@ -788,12 +832,24 @@ final class Driver {
         config.presentationDelaySeconds = Double(options.presentationDelayMs) / 1_000
         config.turnFillEnabled = options.turnFill
         config.cloneDeliveryLine = options.cloneDelivery == "line"
+        // ADR-0018: the actor's own voice can come back only where the separator isolates it and
+        // the picture delay leaves room to hold the bed while each line is decided.
+        restoresVoice = options.passthrough && options.asr == "audio" && options.background
+            && options.tts == "clone" && options.presentationDelayMs >= 4_000
+        config.restoresOriginalVoice = restoresVoice
+        if restoresVoice {
+            // Decide before the oldest part of a unit leaves the held bed. The margin covers
+            // driver ticks, separator buffering and scheduling jitter; never guess a voice.
+            config.originalVoiceDecisionDeadlineSeconds = max(0.1, min(6, config.presentationDelaySeconds - 1.5) - 0.7)
+        }
         if let k = options.maxUnitKeys { config.commit.maxUnitKeys = k }
         if let s = options.maxUnitSeconds { config.commit.maxUnitSourceSeconds = s }
         if let c = options.speakerCarry { config.unlabeledSpeakerCarrySeconds = c }
         if let c = options.speakerCarryPause { config.unlabeledSpeakerCarryAfterPauseSeconds = c }
         if let c = options.speakerCarryPiece { config.unlabeledSpeakerCarryMaxPieceSeconds = c }
-        config.validator.shortensOverBudgetTargets = options.shorten
+        // Quality-first must preserve the words as well as wait for complete PCM. The hard
+        // validation cap remains in force for implausible model output.
+        config.validator.shortensOverBudgetTargets = options.shorten && !options.qualityFirst
         config.validator.silencesFillers = options.fillerSilence
         if let path = options.glossary { config.glossary = try loadTerms(path) }
         if let path = options.pronounce { pronunciation = TermMap(try loadTerms(path), ignoresCase: true) }
@@ -890,17 +946,48 @@ final class Driver {
             }
             let separator = try BackgroundSeparator()
             backgroundSeparator = separator
+            if options.asr == "audio", options.sentenceUnits, options.presentationDelayMs > 0 {
+                // Music is gone from the isolated voice, so a slightly lower threshold still
+                // ignores it and keeps quiet lines (ADR-0017).
+                segmentVAD = EnergyVAD(thresholdDB: options.vadThresholdDB - 5)
+                segmentThreshold = AdaptiveSpeechThreshold(floorDB: options.vadThresholdDB - 5)
+                voiceTo16k = StreamingResampler(inputRate: canonicalRate, outputRate: 16_000)
+                voiceLagSamples = Int64((separator.latencySeconds * Double(canonicalRate)).rounded())
+            }
             if delaySeconds > 0, let ring = a2a_engine_background_ring(engine) {
                 // Picture delay: the bed is a FIFO drained at the device rate the tap fills it at,
                 // so D seconds of silence queued before callbacks start keep it D behind the
                 // capture for the session. The separator already lags its input by its own latency.
-                let frames = Int((max(0, delaySeconds - separator.latencySeconds) * Double(outRate)).rounded())
+                // ADR-0018: part of the delay holds the bed while each line is decided.
+                if restoresVoice { bedHoldNs = UInt64(min(6, delaySeconds - 1.5) * 1e9) }
+                let queued = delaySeconds - separator.latencySeconds - Double(bedHoldNs) / 1e9
+                let frames = Int((max(0, queued) * Double(outRate)).rounded())
                 let silence = [Float](repeating: 0, count: frames)
                 let written = silence.withUnsafeBufferPointer { a2a_ring_write(ring, $0.baseAddress!, UInt32(frames)) }
                 guard Int(written) == frames else { throw AdapterError.unsupported("background delay allocation failed") }
                 backgroundDelayFrames = frames
             }
             backgroundResampler = StreamingResampler(inputRate: canonicalRate, outputRate: outRate)
+            if restoresVoice {
+                voiceLagSamples = Int64((separator.latencySeconds * Double(canonicalRate)).rounded())
+                if let python = options.clonePython, let worker = options.cloneWorker,
+                   let model = options.lidModel ?? Self.defaultLIDModel(nearWorker: worker) {
+                    let script = URL(fileURLWithPath: worker).deletingLastPathComponent()
+                        .appendingPathComponent("lid_worker.py").path
+                    do {
+                        let lid = try LanguageIdentifier(python: python, worker: script, model: model)
+                        let load = try await lid.ready()
+                        let inbox = self.inbox
+                        lid.onResult = { id, verdict in inbox.post(.languageIdentified(id, verdict)) }
+                        languageIdentifier = lid
+                        log("language identifier ready: load \(load) s")
+                    } catch {
+                        log("language identifier failed: \(error); lines in the target language are translated")
+                    }
+                } else {
+                    log("language identifier not found; lines in the target language are translated")
+                }
+            }
             if let path = options.backgroundOut {
                 backgroundWriter = try WAVStreamWriter(url: URL(fileURLWithPath: path), sampleRate: canonicalRate, channels: 1)
             }
@@ -1002,12 +1089,28 @@ final class Driver {
         guard !memoryPreparing.contains(speaker), !memoryReused.contains(speaker) else { return }
         var policy = referencePolicies[speaker] ?? liveReferencePolicy(for: speaker)
         guard !policy.isComplete else { return }
-        guard let pcm = historySlice(span) else {
+        guard var pcm = historySlice(span) else {
             stats["reference_rejected_expired", default: 0] += 1
             return
         }
+        let clipped = clippedFraction(pcm)
+        var voiceShareDB: Float?
+        if policy.config.minVoiceShareDB != nil {
+            // ADR-0016: an audio-only reference is the isolated voice of its segment, and a segment
+            // that is mostly music or effects is not a voice at all. Half a second of the audio
+            // before the segment warms the unit up. Failure keeps the mix, ungated, and is counted.
+            let warm = SourceSpan(start: max(historyStart, span.start - Int64(canonicalRate / 2)), end: span.end)
+            if let context = historySlice(warm),
+               let vocals = try? BackgroundSeparator.isolateVoice(context, preroll: context.count - pcm.count),
+               vocals.count == pcm.count {
+                voiceShareDB = Signal.dbfs(Signal.rms(vocals)) - Signal.dbfs(Signal.rms(pcm))
+                pcm = vocals
+            } else {
+                stats["reference_isolation_failed", default: 0] += 1
+            }
+        }
         let result = policy.offer(span: span, text: text, levelDB: Signal.dbfs(Signal.rms(pcm)),
-                                  clippedFraction: clippedFraction(pcm))
+                                  clippedFraction: clipped, voiceShareDB: voiceShareDB)
         referencePolicies[speaker] = policy
         publishVoiceProgress(speaker, state: "collecting", seconds: policy.acceptedSeconds)
         switch result {
@@ -1029,6 +1132,8 @@ final class Driver {
         var config = ReferencePolicyConfig()
         config.allowUpgrade = !pipeline.config.pinSpeakerProfiles
         config.allowEmptyText = o.asr == "audio" && o.cloneMode == .xvector
+        // Without a transcript nothing says a segment holds speech; its isolated voice does.
+        if config.allowEmptyText, o.isolateReferences { config.minVoiceShareDB = -10 }
         return ReferencePolicy(speaker: speaker, config: config)
     }
 
@@ -1148,15 +1253,145 @@ final class Driver {
         }
     }
 
+    /// The fetched language-ID model beside a repository checkout: research/<worker> lives two
+    /// levels below the root, and models under .local/models/<id>/<revision> (ADR-0018).
+    static func defaultLIDModel(nearWorker worker: String) -> String? {
+        let root = URL(fileURLWithPath: worker).deletingLastPathComponent().deletingLastPathComponent()
+        let base = root.appendingPathComponent(".local/models/ecapa-voxlingua107-lid-mlx")
+        guard let revisions = try? FileManager.default.contentsOfDirectory(atPath: base.path) else { return nil }
+        return revisions.sorted().map { base.appendingPathComponent($0).path }
+            .first { FileManager.default.fileExists(atPath: $0 + "/config.json") }
+    }
+
+    /// Seconds of silence after `span` as far as the segmenter knows now: up to the next span that
+    /// closed or opened since, else up to everything heard so far (ADR-0018).
+    func silenceAfter(_ span: SourceSpan) -> Double {
+        let next = recentSegments.first { $0.start >= span.end }?.start ?? audioSegments.openStart ?? segmentFrontier
+        return Double(max(0, next - span.end)) / Double(canonicalRate)
+    }
+
+    /// The isolated voice of `span` on the source timeline, as far as it has been separated.
+    func voiceSlice(_ span: SourceSpan) -> [Float] {
+        let a = Int(max(span.start, voiceHistoryStart) - voiceHistoryStart)
+        let b = Int(min(span.end, voiceHistoryStart + Int64(voiceHistory.count)) - voiceHistoryStart)
+        return a < b ? Array(voiceHistory[a..<b]) : []
+    }
+
+    /// Asks the language identifier about one closed unit's isolated voice (ADR-0018).
+    func requestLanguage(_ span: SourceSpan) {
+        guard let lid = languageIdentifier, span.durationSeconds >= 1 else { return }
+        let voice = voiceSlice(span)
+        guard voice.count >= canonicalRate / 2 else { return }
+        let resampler = StreamingResampler(inputRate: canonicalRate, outputRate: 16_000)
+        let id = nextLIDRequest
+        nextLIDRequest += 1
+        lidRequests[id] = span
+        if lidRequests.count > 64, let oldest = lidRequests.keys.min() { lidRequests[oldest] = nil }
+        lid.identify(id: id, samples16k: resampler.process(voice))
+    }
+
+    /// Writes the held bed that is older than the hold to the delayed background bus. A span
+    /// marked for its own voice is written as bed + voice (with 10 ms ramps), the original sound.
+    func flushBed(now: UInt64) throws {
+        guard let ring = a2a_engine_background_ring(engine) else { bedHold.removeAll(); return }
+        if backgroundDelayFrames > 0 {
+            // The bed normally sits D (less a few chunks of processing) ahead of the mixer.
+            // A pause the device rendered through without capture drained it; refill the
+            // gap with silence so music and effects stay with the delayed picture.
+            let readable = Int(a2a_ring_readable(ring))
+            if readable < backgroundDelayFrames - outRate / 4 {
+                let silence = [Float](repeating: 0, count: backgroundDelayFrames - outRate / 25 - readable)
+                _ = silence.withUnsafeBufferPointer { a2a_ring_write(ring, $0.baseAddress!, UInt32(silence.count)) }
+            }
+        }
+        while let first = bedHold.first, now >= first.at + bedHoldNs {
+            bedHold.removeFirst()
+            var mixed = first.bed
+            let start = bedOut - voiceLagSamples   // source sample of mixed[0]
+            let end = start + Int64(mixed.count)
+            let ramp: Int64 = 480
+            let touching = restoreSpans.filter { $0.end + ramp > start && $0.start - ramp < end }
+            if !touching.isEmpty {
+                // Adjacent restored spans share their ramps: the voice comes back once, not twice.
+                var gain = [Float](repeating: 0, count: mixed.count)
+                for span in touching {
+                    for i in 0..<mixed.count {
+                        let inside = min(start + Int64(i) - (span.start - ramp), (span.end + ramp) - start - Int64(i))
+                        if inside > 0 { gain[i] = max(gain[i], Float(min(ramp, inside)) / Float(ramp)) }
+                    }
+                }
+                for i in 0..<mixed.count where gain[i] > 0 {
+                    mixed[i] = max(-1, min(1, mixed[i] + gain[i] * first.voice[i]))
+                }
+            }
+            bedOut += Int64(mixed.count)
+            let pcm = backgroundResampler?.process(mixed) ?? []
+            if !pcm.isEmpty {
+                let count = pcm.withUnsafeBufferPointer { a2a_ring_write(ring, $0.baseAddress!, UInt32(pcm.count)) }
+                backgroundFrames += UInt64(count)
+                if Int(count) != pcm.count { throw AdapterError.unsupported("background bus overflow") }
+            }
+        }
+        if let oldest = restoreSpans.first, oldest.end + 48_000 < bedOut - voiceLagSamples { restoreSpans.removeFirst() }
+    }
+
+    func failBackground() {
+        // Separation failure mutes only this bus; never substitute original audio.
+        backgroundFailed = true
+        voiceChunk = nil
+        bedHold.removeAll()
+        restoreSpans.removeAll()
+        if segmentVAD != nil {
+            // Back to the mix, as the session's detector hears it; its samples run ahead
+            // of the voice's, so the segmenter's timeline only moves forward.
+            segmentVAD = EnergyVAD(thresholdDB: o.vadThresholdDB)
+            segmentThreshold = AdaptiveSpeechThreshold(floorDB: o.vadThresholdDB)
+            voiceTo16k = nil
+            voiceLagSamples = 0
+        }
+        backgroundGainTarget = 0
+        a2a_engine_set_background_gain(engine, 0, UInt32(outRate / 100))
+        log("background separation failed; music/effects muted")
+    }
+
+    /// Closed spans for direct audio translation. With sentence units (ADR-0017) the segmenter has
+    /// its own detector: on the isolated voice while the separator runs (a synthetic pause frame is
+    /// silence there too), on the mix otherwise. The voice lags its input by the separator's
+    /// latency, so its frames are placed that much earlier on the source timeline.
+    func segmentSpans(mix frame16: AudioFrame16k, mixEvents: [VADEvent], samples: Int) -> [SourceSpan] {
+        guard var detector = segmentVAD else {
+            return audioSegments.process(events: mixEvents, frontier: frame16.span.end)
+        }
+        var frame = frame16
+        if let resampler = voiceTo16k {
+            let voice = voiceChunk ?? [Float](repeating: 0, count: samples)
+            let span = SourceSpan(start: max(0, frame16.span.start - voiceLagSamples),
+                                  end: max(0, frame16.span.end - voiceLagSamples))
+            frame = AudioFrame16k(span: span, samples: resampler.process(voice))
+        }
+        voiceChunk = nil
+        let level = frame.samples.isEmpty || frame.span.isEmpty
+            ? nil : (span: frame.span, db: Signal.dbfs(Signal.rms(frame.samples)))
+        if let level, var threshold = segmentThreshold {
+            detector.thresholdDB = threshold.update(span: level.span, db: level.db)
+            segmentThreshold = threshold
+        }
+        let events = frame.span.isEmpty ? [] : detector.process(frame)
+        segmentVAD = detector
+        segmentFrontier = max(segmentFrontier, frame.span.end)
+        return audioSegments.process(events: events, frontier: frame.span.end, level: level)
+    }
+
     /// Streams the span being spoken to the local Hy worker and closes spans as the segmenter does.
     func feedHy(_ hy: HyLocalTranslator, closed: [SourceSpan]) {
-        for action in audioFeed.update(closed: closed, openStart: audioSegments.openStart, voicedEnd: vad.voicedEnd) {
+        let voicedEnd = segmentVAD.map { $0.voicedEnd } ?? vad.voicedEnd
+        for action in audioFeed.update(closed: closed, openStart: audioSegments.openStart, voicedEnd: voicedEnd) {
             switch action {
             case .append(let span):
                 guard let pcm = historySlice(span), pcm.count == Int(span.end - span.start) else {
                     // Not expected (history holds 30 s): withdraw the span; its request sends it whole.
                     hy.discard()
-                    audioFeed = AudioStreamFeed(maxSamples: audioSegments.maxSamples)
+                    audioFeed = AudioStreamFeed(maxSamples: audioSegments.streamLimitSamples)
                     return
                 }
                 hy.stream(pcm)
@@ -1222,7 +1457,12 @@ final class Driver {
                     FileHandle.standardOutput.write(Data((caption.jsonLine() + "\n").utf8))
                 }
             case .requestFinalize: recognizer.requestFinalize()
-            case .translate(let req): startTranslation(req)
+            case .translate(let req):
+                if let span = req.sourceSpan, o.asr == "audio" {
+                    unitSpans[req.unitID] = span
+                    if unitSpans.count > 128, let oldest = unitSpans.keys.min() { unitSpans[oldest] = nil }
+                }
+                startTranslation(req)
             case .synthesize(let job):
                 if virtual { startSynthesis(job) } else { synthesisQueue.append(job) }
             case .cancelTranslation(let unit):
@@ -1241,7 +1481,7 @@ final class Driver {
                     switch d.event {
                     case .chunk(let j, _), .finished(let j), .failed(let j, _): j.unit == unit
                     case .input, .prepared, .prepareFailed, .voiceReady, .voiceFailed,
-                         .rememberedVoiceReady, .rememberedVoiceFailed: false
+                         .rememberedVoiceReady, .rememberedVoiceFailed, .languageIdentified: false
                     }
                 }
             case .holdPCM(let header):
@@ -1263,6 +1503,13 @@ final class Driver {
             case .backgroundGain(let gain, let ms):
                 backgroundGainTarget = backgroundFailed ? 0 : gain
                 a2a_engine_set_background_gain(engine, backgroundGainTarget, UInt32(ms * outRate / 1_000))
+            case .restoreOriginalVoice(let span):
+                guard restoresVoice, backgroundSeparator != nil, !backgroundFailed else { break }
+                restoreSpans.append(span)
+                restoreSpans.sort { $0.start < $1.start }
+                stats["voice_restored_units", default: 0] += 1
+                // Bed already written for the start of the span: that part stays without its voice.
+                if span.start + voiceLagSamples < bedOut { stats["voice_restored_late", default: 0] += 1 }
             case .flushTranslatedBus:
                 a2a_engine_flush_translated(engine)
                 plays.removeAll()
@@ -1357,13 +1604,15 @@ final class Driver {
         }
     }
 
-    /// For dual-worker mode, the back slot starts only once the front is playing;
-    /// this preserves order and keeps at most one future phrase buffered.
+    /// For dual-worker mode without a picture delay, the back slot starts only once the front is
+    /// playing; this preserves order and keeps at most one future phrase buffered, since a phrase
+    /// plays as soon as it is ready. With a picture delay every phrase waits for its own slot, so
+    /// both workers synthesize ahead as soon as one is free (ADR-0017).
     var canStartSynthesis: Bool {
         if virtual { return true }
         let capacity = o.dualClone ? 2 : 1
         guard activeSynthesis.count < capacity else { return false }
-        if o.dualClone {
+        if o.dualClone && o.presentationDelayMs == 0 {
             guard plays.count < 2 else { return false }
             if !plays.isEmpty && !plays.values.contains(where: { $0.started }) { return false }
         }
@@ -1444,8 +1693,21 @@ final class Driver {
     func deliver(_ event: DriverEvent) {
         switch event {
         case .input(let input):
-            if case .translation(let id, _) = input { translationTasks[id] = nil }
+            if case .translation(let id, _) = input {
+                translationTasks[id] = nil
+                // ADR-0018: budget the line into the silence after it, not into the next line.
+                if o.asr == "audio", audioSegments.dipWindowSamples > 0, let span = unitSpans.removeValue(forKey: id) {
+                    send(.followingSilence(span, seconds: silenceAfter(span)))
+                }
+            }
             send(input)
+        case .languageIdentified(let id, let verdict):
+            guard let span = lidRequests.removeValue(forKey: id) else { return }
+            guard let verdict else { stats["lid_failed", default: 0] += 1; return }
+            let target = o.direction.target == .mandarin ? "zh" : "en"
+            let matches = verdict.language == target && verdict.probability >= 0.8
+            stats[matches ? "lid_same_language" : "lid_translate", default: 0] += 1
+            send(.sourceLanguage(span, matchesTarget: matches))
         case .chunk(let job, let audio):
             // A canceled or completed unit has no play record. This also rejects
             // late task messages without retaining every canceled ID for the session.
@@ -1723,30 +1985,23 @@ final class Driver {
         let samples = chunk ?? [Float](repeating: 0, count: frames)
         if !synthetic, let separator = backgroundSeparator, !backgroundFailed {
             do {
-                let bed = try separator.process(samples)
+                let (bed, voice) = try separator.separate(samples)
+                voiceChunk = voice
                 backgroundWriter?.append(bed)
-                let pcm = backgroundResampler?.process(bed) ?? []
-                if backgroundDelayFrames > 0, let ring = a2a_engine_background_ring(engine) {
-                    // The bed normally sits D (less a few chunks of processing) ahead of the mixer.
-                    // A pause the device rendered through without capture drained it; refill the
-                    // gap with silence so music and effects stay with the delayed picture.
-                    let readable = Int(a2a_ring_readable(ring))
-                    if readable < backgroundDelayFrames - outRate / 4 {
-                        let silence = [Float](repeating: 0, count: backgroundDelayFrames - outRate / 25 - readable)
-                        _ = silence.withUnsafeBufferPointer { a2a_ring_write(ring, $0.baseAddress!, UInt32(silence.count)) }
+                if restoresVoice {
+                    // Voice output i is source sample i - latency.
+                    if voiceHistory.isEmpty { voiceHistoryStart = bedOut + Int64(bedHold.reduce(0) { $0 + $1.bed.count }) - voiceLagSamples }
+                    voiceHistory += voice
+                    let keep = canonicalRate * 30
+                    if voiceHistory.count > keep + canonicalRate * 10 {
+                        voiceHistoryStart += Int64(voiceHistory.count - keep)
+                        voiceHistory.removeFirst(voiceHistory.count - keep)
                     }
                 }
-                if !pcm.isEmpty, let ring = a2a_engine_background_ring(engine) {
-                    let count = pcm.withUnsafeBufferPointer { a2a_ring_write(ring, $0.baseAddress!, UInt32(pcm.count)) }
-                    backgroundFrames += UInt64(count)
-                    if Int(count) != pcm.count { throw AdapterError.unsupported("background bus overflow") }
-                }
+                bedHold.append((bed, voice, now))
+                try flushBed(now: now)
             } catch {
-                // Separation failure mutes only this bus; never substitute original audio.
-                backgroundFailed = true
-                backgroundGainTarget = 0
-                a2a_engine_set_background_gain(engine, 0, UInt32(outRate / 100))
-                log("background separation failed; music/effects muted")
+                failBackground()
             }
         }
         srcFrames += Int64(frames)
@@ -1792,11 +2047,14 @@ final class Driver {
             noteSpeaker(event)
         }
         if o.asr == "audio" {
-            let segments = audioSegments.process(events: vadEvents, frontier: span.end)
+            let segments = segmentSpans(mix: frame16, mixEvents: vadEvents, samples: samples.count)
             // Before the reducer commits them, so each closed span's answer is already under way.
             if let hyStreaming { feedHy(hyStreaming, closed: segments) }
             for segment in segments {
                 send(.audioSegment(segment))
+                recentSegments.append(segment)
+                if recentSegments.count > 32 { recentSegments.removeFirst() }
+                requestLanguage(segment)
                 if acquiresReference { deferredAudioReferences.append((segment, now)) }
             }
             if !deferredAudioReferences.isEmpty { offerAudioReferences() }
@@ -1863,6 +2121,10 @@ final class Driver {
         while let first = deliveries.first, first.at <= now {
             deliveries.removeFirst()
             deliver(first.event)
+        }
+        // ADR-0018: the held bed keeps its wall-clock delay through a pause.
+        if bedHoldNs > 0, backgroundSeparator != nil, !backgroundFailed {
+            do { try flushBed(now: now) } catch { failBackground() }
         }
         // The device renders on its own; a file replay renders the same span of output.
         render(nil, frames: tap == nil ? frames : 0)
@@ -1955,6 +2217,7 @@ final class Driver {
         (synthesizer as? CloneVoiceSynthesizer)?.shutdown()
         (synthesizer as? DualCloneVoiceSynthesizer)?.shutdown()
         (translator as? ContextualTranslator)?.shutdown()
+        languageIdentifier?.shutdown()
         if tap != nil { settleGains(timeoutMs: pipeline.config.health.rampMs + 50) }
         // Freeze the producer before the final monitor drain so every rendered frame
         // has exactly one sample in the diagnostic file, with no callback race at close.
@@ -2017,6 +2280,15 @@ final class Driver {
             "max_source_lag_seconds": pipeline.config.health.maxSourceLagSeconds,
             "max_unit_keys": pipeline.config.commit.maxUnitKeys,
             "max_unit_seconds": pipeline.config.commit.maxUnitSourceSeconds,
+            "passthrough": ["enabled": restoresVoice, "identifier": languageIdentifier != nil,
+                            "hold_seconds": Double(bedHoldNs) / 1e9,
+                            "same_language": stats["lid_same_language", default: 0],
+                            "translated": stats["lid_translate", default: 0], "failed": stats["lid_failed", default: 0],
+                            "voice_restored_units": stats["voice_restored_units", default: 0],
+                            "voice_restored_late": stats["voice_restored_late", default: 0]] as [String: Any],
+            "audio_units": ["max_seconds": Double(audioSegments.maxSamples) / Double(canonicalRate),
+                            "detector": segmentVAD == nil ? "session" : (voiceTo16k == nil ? "mix" : "voice"),
+                            "pause_closes": audioSegments.pauseCloses, "cap_closes": audioSegments.capCloses] as [String: Any],
             "word_cuts": options.wordCuts,
             "speaker_carry_seconds": pipeline.config.unlabeledSpeakerCarrySeconds,
             "speaker_carry_after_pause_seconds": pipeline.config.unlabeledSpeakerCarryAfterPauseSeconds,
@@ -2130,6 +2402,7 @@ func cloneWorkerCommand(_ o: Options) -> (URL, [String]) {
     }
     if o.cloneFake { arguments.append("--fake") }
     if o.fluent, o.cloneModel == .qwen { arguments += ["--temperature", "0.6"] }
+    if o.qualityFirst { arguments.append("--longer-speech-budget") }
     if o.researchText { arguments.append("--research-text") }
     return (URL(fileURLWithPath: python), arguments)
 }

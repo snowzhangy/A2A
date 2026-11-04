@@ -89,6 +89,15 @@ public struct PipelineConfig: Sendable {
     /// it is model work on a busy machine). `a2a-pipeline --clone-delivery line`.
     public var cloneDeliveryLine = false
 
+    /// Same-language passthrough (ADR-0018): the host can put a span's own isolated voice back
+    /// under its delayed picture. A unit already spoken in the target language, and one the
+    /// translator answered with nothing or a filler, then plays the actor instead of silence.
+    public var restoresOriginalVoice = false
+    /// Age of a source span's start at which the host must decide whether to restore it,
+    /// before its delayed background has left the host's hold buffer. Zero disables the
+    /// deadline; the host sets it only when it can actually restore the isolated voice.
+    public var originalVoiceDecisionDeadlineSeconds = 0.0
+
     public init(session: String, direction: TranslationDirection = .chineseToEnglish) {
         self.session = session
         self.direction = direction
@@ -96,7 +105,9 @@ public struct PipelineConfig: Sendable {
         if direction.source == .english {
             commit.preferWordBoundaries = true
             estimatedSecondsPerSourceChar = 1.0 / 15.0
-            estimatedSecondsPerTargetChar = 0.25
+            // The cloned Mandarin voice's measured native pace: 182-214 ms per character (median of
+            // five live and replay sessions, ADR-0017). 0.25 shortened over half of all lines.
+            estimatedSecondsPerTargetChar = 0.2
         }
         // The spoken budget and the debt estimate must agree about how fast the target talks.
         validator.spokenCharactersPerSecond = 1 / estimatedSecondsPerTargetChar
@@ -122,6 +133,12 @@ public enum PipelineInput: Hashable, Sendable {
     case speaker(SpeakerEvent)
     case hypothesis(ASRHypothesis)
     case audioSegment(SourceSpan)
+    /// Direct audio: seconds of silence known to follow `span` when its translation arrives. A
+    /// line may run past its span into that silence (plus a little), not into the next line
+    /// (ADR-0018). Without it the validator's fixed grace applies.
+    case followingSilence(SourceSpan, seconds: Double)
+    /// Direct audio: a language identifier's verdict on the span's speech (ADR-0018).
+    case sourceLanguage(SourceSpan, matchesTarget: Bool)
     case profileReady(SpeakerID, version: Int)
     case translation(UnitID, TranslationOutcome)
     case pcm(PCMChunkHeader, frames: Int)
@@ -178,6 +195,8 @@ public enum PipelineEffect: Hashable, Sendable {
     case rampGains(BusGains, durationMs: Int)
     case backgroundGain(Float, durationMs: Int)
     case flushTranslatedBus
+    /// Put the span's own isolated voice back under its delayed picture (ADR-0018).
+    case restoreOriginalVoice(SourceSpan)
     case teardown
 }
 
@@ -222,6 +241,8 @@ public struct SessionPipeline: Sendable {
         var scheduled = false
         var handoff = false
         var playbackSuppressed = false
+        /// Silence known to follow the span when its translation arrived (ADR-0018).
+        var followingSilence: Double?
     }
 
     public let config: PipelineConfig
@@ -411,6 +432,18 @@ public struct SessionPipeline: Sendable {
             nextAudioUnit += 1
             out += commitOutputs([.commit(unit)])
 
+        case .followingSilence(let span, let seconds):
+            if let id = unit(spanning: span), seconds.isFinite { units[id]?.followingSilence = max(0, seconds) }
+
+        case .sourceLanguage(let span, let matchesTarget):
+            // Only a unit that is not voiced yet changes course; once synthesis has started, the
+            // translation plays, so the line is never heard twice.
+            guard matchesTarget, let id = unit(spanning: span), let r = units[id],
+                  r.stage == .translating || r.stage == .awaitingSpeaker || r.stage == .awaitingVoice else { break }
+            if r.stage == .translating { out.append(.cancelTranslation(id)) }
+            out += finish(id, as: .originalOnly, reason: "same_language")
+            if config.restoresOriginalVoice { out.append(.restoreOriginalVoice(span)) }
+
         case .profileReady(let spk, let version):
             if config.pinSpeakerProfiles, profileVersions[spk] != nil { break }
             out.append(trace(.profileReady, [.speaker(spk), .int("prof", version)]))
@@ -434,6 +467,7 @@ public struct SessionPipeline: Sendable {
             gate.cancel(id)
             out += [.cancelSynthesis(id), .discardHeld(id)]
             out += finish(id, as: .originalOnly, reason: "tts_failed")
+            if !r.scheduled, canRestoreBeforeDeadline(r.source.span) { out.append(.restoreOriginalVoice(r.source.span)) }
             out += missingUnitFallback()
 
         case .playStarted(let id, let outSample):
@@ -564,7 +598,8 @@ public struct SessionPipeline: Sendable {
             }
             let verdict = config.validator.evaluate(candidate, source: r.source.text, previousTarget: lastTarget,
                                                     sourceDurationSeconds: config.directAudioTranslation ? r.source.span.durationSeconds : nil,
-                                                    wordSegmenter: targetWordSegmenter)
+                                                    wordSegmenter: targetWordSegmenter,
+                                                    graceSeconds: r.followingSilence.map { min(config.validator.spokenBudgetGraceSeconds, $0 + 0.2) })
             switch verdict {
             case .rejected(let rejection):
                 return [trace(.mtResult, [.unit(id), .bool("ok", false), .string("reason", rejection.rawValue)])]
@@ -575,9 +610,16 @@ public struct SessionPipeline: Sendable {
                 // speech, and the unit stops holding debt the moment it is dismissed.
                 return [trace(.mtResult, [.unit(id), .bool("ok", true), .string("silence", silence.rawValue)] + workerFields(candidate))]
                     + finish(id, as: .silence, reason: silence.rawValue)
+                    // A filler or an unanswered phrase is still the actor's sound: put it back.
+                    + (config.restoresOriginalVoice ? [.restoreOriginalVoice(r.source.span)] : [])
             case .accepted(let text):
                 var out: [PipelineEffect] = [trace(.mtResult, [.unit(id), .bool("ok", true)] + workerFields(candidate))]
-                if config.emitCaptions { out.append(.caption(kind: "target.final", id: id.description, text: text)) }
+                // Keep the complete validated translation visible even when the voice must
+                // use a shorter prefix to fit its slot. The spoken text and context remain
+                // the accepted (possibly shortened) version.
+                if config.emitCaptions {
+                    out.append(.caption(kind: "target.final", id: id.description, text: candidate.text.trimmingWhitespace()))
+                }
                 // The tracker may have labeled more of the unit's span since it was committed.
                 if config.multiSpeaker { r.speaker = speaker(for: r.source.span) }
                 var fields: [TraceEvent.Field] = [.unit(id), .speaker(r.speaker), .span(r.source.span)]
@@ -591,8 +633,8 @@ public struct SessionPipeline: Sendable {
                 }
                 r.target = text
                 lastTarget = text
-                // Context and captions carry what the listener is actually told, which after a
-                // deletion is shorter than what the model returned.
+                // Context carries what the listener is actually told, which after a deletion
+                // is shorter than what the model returned.
                 context.append(CommittedPair(source: r.source.text, target: text))
                 if context.count > config.contextPairs { context.removeFirst(context.count - config.contextPairs) }
                 if !hasSpeakerAttribution(for: r.source.span) {
@@ -732,7 +774,10 @@ public struct SessionPipeline: Sendable {
     }
 
     private mutating func rejectTranslation(_ id: UnitID, reason: String) -> [PipelineEffect] {
-        finish(id, as: .originalOnly, reason: reason) + missingUnitFallback()
+        let span = units[id]?.source.span
+        return finish(id, as: .originalOnly, reason: reason)
+            + (config.restoresOriginalVoice ? span.map { [.restoreOriginalVoice($0)] } ?? [] : [])
+            + missingUnitFallback()
     }
 
     /// A unit that will never play. When the original bus can be heard, fall back so the
@@ -812,7 +857,10 @@ public struct SessionPipeline: Sendable {
         // One chunk gives no evidence about sustained generation speed. Both native
         // whole-phrase adapters and short streams release on synthesisFinished.
         guard r.pcmChunks >= 2, let first = r.firstPCMAt, let last = r.lastPCMAt else { return false }
-        let elapsed = Double(last - first) / 1e9
+        // Include time since the most recent chunk. In a delayed-picture session the worker
+        // can stop producing while its audio waits for the slot; a rate measured only up to
+        // the last chunk would still call that stalled stream fast when playback starts.
+        let elapsed = Double(max(now, last) - first) / 1e9
         guard elapsed > 0 else { return r.bufferedSeconds >= reserve }
         let rate = (r.bufferedSeconds - r.firstPCMSeconds) / elapsed
         guard rate > 0 else { return false }
@@ -898,6 +946,8 @@ public struct SessionPipeline: Sendable {
     private mutating func cancel(_ id: UnitID, disposition: SourceDisposition, reason: String) -> [PipelineEffect] {
         guard var r = units[id] else { return [] }
         let wasSynth = r.stage.synthesisStarted
+        let restore = reason != "stop" && reason != "discontinuity" && !r.scheduled
+            && canRestoreBeforeDeadline(r.source.span)
         r.stage = .canceled
         units[id] = r
         gate.cancel(id)
@@ -906,8 +956,21 @@ public struct SessionPipeline: Sendable {
         else { out.append(.cancelTranslation(id)) }
         out.append(trace(.sourceDisposition, [.unit(id), .span(r.source.span),
                                               .string("disposition", disposition.rawValue), .string("reason", reason)]))
+        if restore { out.append(.restoreOriginalVoice(r.source.span)) }
         prune()
         return out
+    }
+
+    /// A not-yet-heard unit may safely be restored only while its whole source span is still
+    /// in the held bed. The margin configured by the host accounts for ticks and jitter.
+    private func canRestoreBeforeDeadline(_ span: SourceSpan) -> Bool {
+        config.restoresOriginalVoice && config.originalVoiceDecisionDeadlineSeconds > 0 && !anchors.isEmpty
+            && sourceAgeSeconds(of: span.start) < config.originalVoiceDecisionDeadlineSeconds
+    }
+
+    /// The unit committed for exactly this source span, if it is still known.
+    private func unit(spanning span: SourceSpan) -> UnitID? {
+        order.last { units[$0]?.source.span == span }
     }
 
     private mutating func finish(_ id: UnitID, as disposition: SourceDisposition, reason: String) -> [PipelineEffect] {
@@ -956,11 +1019,25 @@ public struct SessionPipeline: Sendable {
             }
         default: break
         }
-        // Attribution and voice acquisition are bounded by the same source-lag limit.
+        // Preserve the original voice before the held bed passes a stalled translation. This
+        // cancels the request first, so a late result cannot speak over the restored voice.
+        if config.restoresOriginalVoice, config.originalVoiceDecisionDeadlineSeconds > 0, !anchors.isEmpty {
+            for id in order {
+                guard let r = units[id], r.stage == .translating,
+                      sourceAgeSeconds(of: r.source.span.start) >= config.originalVoiceDecisionDeadlineSeconds else { continue }
+                out.append(.cancelTranslation(id))
+                out += finish(id, as: .originalOnly, reason: "mt_timeout_restore")
+                out.append(.restoreOriginalVoice(r.source.span))
+            }
+        }
+        // Attribution and voice acquisition are bounded by the source-lag and bed deadlines.
         for id in order {
-            guard let r = units[id], r.stage == .awaitingVoice || r.stage == .awaitingSpeaker,
-                  lateness(of: r.source.span.end) > config.health.maxSourceLagSeconds else { continue }
+            guard let r = units[id], r.stage == .awaitingVoice || r.stage == .awaitingSpeaker else { continue }
+            let restoreDeadline = config.restoresOriginalVoice && config.originalVoiceDecisionDeadlineSeconds > 0
+                && !anchors.isEmpty && sourceAgeSeconds(of: r.source.span.start) >= config.originalVoiceDecisionDeadlineSeconds
+            guard restoreDeadline || lateness(of: r.source.span.end) > config.health.maxSourceLagSeconds else { continue }
             out += finish(id, as: .originalOnly, reason: r.stage == .awaitingSpeaker ? "no_speaker" : "no_profile")
+            if restoreDeadline { out.append(.restoreOriginalVoice(r.source.span)) }
         }
         var (pressure, pending) = queuePressure()
         out.append(trace(.queueDepth, [.int("debt_ms", Int((pressure.debt * 1000).rounded())),

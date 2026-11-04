@@ -114,4 +114,35 @@ private func seconds(_ s: Double, at start: Double = 0) -> SourceSpan {
         let v1 = try #require(try policy.offer(span: seconds(3.5), text: "二。", levelDB: -20, clippedFraction: 0).get())
         #expect(v1.speaker == SpeakerID("S2") && v1.version == 1)
     }
+
+    /// ADR-0016: an audio-only reference (no transcript) is gated on its isolated voice. Live, a
+    /// first segment of music and effects became the pinned voice, and most takes cloned from it
+    /// mumbled until their token cap.
+    @Test func audioOnlySegmentsThatAreMostlyNotVoiceNeverBecomeTheReference() throws {
+        var config = ReferencePolicyConfig()
+        config.allowEmptyText = true
+        config.minVoiceShareDB = -10
+        var policy = ReferencePolicy(speaker: SpeakerID("S1"), config: config)
+        #expect(policy.offer(span: seconds(3), text: "", levelDB: -30, clippedFraction: 0, voiceShareDB: -35) == .failure(.notVoice))
+        #expect(policy.offer(span: seconds(3, at: 3), text: "", levelDB: -30, clippedFraction: 0, voiceShareDB: -.infinity) == .failure(.notVoice))
+        #expect(policy.offer(span: seconds(3, at: 6), text: "", levelDB: -30, clippedFraction: 0, voiceShareDB: .nan) == .failure(.notVoice))
+        #expect(policy.acceptedSeconds == 0 && !policy.hasIssuedProfile)
+        let v1 = try #require(try policy.offer(span: seconds(3, at: 9), text: "", levelDB: -30, clippedFraction: 0, voiceShareDB: -1.7).get())
+        #expect(v1.version == 1 && v1.segments.map(\.span) == [seconds(3, at: 9)])
+    }
+
+    @Test func voiceShareGatesOnlyWhenConfiguredAndMeasured() throws {
+        var config = ReferencePolicyConfig()
+        config.allowEmptyText = true
+        // Not configured: a measurement changes nothing.
+        var ungated = ReferencePolicy(speaker: SpeakerID("S1"), config: config)
+        #expect(try ungated.offer(span: seconds(3), text: "", levelDB: -30, clippedFraction: 0, voiceShareDB: -40).get() != nil)
+        // Configured but not measured (isolation unavailable): the segment is judged as before.
+        config.minVoiceShareDB = -10
+        var unmeasured = ReferencePolicy(speaker: SpeakerID("S1"), config: config)
+        #expect(try unmeasured.offer(span: seconds(3), text: "", levelDB: -30, clippedFraction: 0).get() != nil)
+        // The threshold itself passes.
+        var edge = ReferencePolicy(speaker: SpeakerID("S1"), config: config)
+        #expect(try edge.offer(span: seconds(3), text: "", levelDB: -30, clippedFraction: 0, voiceShareDB: -10).get() != nil)
+    }
 }

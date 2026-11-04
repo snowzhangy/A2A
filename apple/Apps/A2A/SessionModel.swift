@@ -1,10 +1,12 @@
 import A2AAudio
 import A2ACore
+import A2AMedia
 import A2AModels
 import A2AVideo
 import AppKit
 import Darwin
 import Observation
+import Synchronization
 
 struct AudioSource: Identifiable {
     let id: String
@@ -22,10 +24,6 @@ struct CaptionLine: Identifiable {
     var text: String
 }
 
-enum TranslationBackend: String, CaseIterable {
-    case local, qwenCloud
-}
-
 private struct VoiceLearningProgress {
     let state: String
     let seconds: Double
@@ -40,11 +38,8 @@ private struct VoiceLearningProgress {
     var stopping = false
     var checking = false
     var languagesReady = false
-    var backend: TranslationBackend = CommandLine.arguments.contains("--qwen-cloud") ? .qwenCloud : .local
-    var cloudAPIKey = ""
-    var cloudRegion = "ap-southeast-1"
     var languageDetail = "Check the Hy-SimulMT server."
-    var hyServer = UserDefaults.standard.string(forKey: "hyServer") ?? "http://10.0.1.29:8080" {
+    var hyServer = UserDefaults.standard.string(forKey: "hyServer") ?? "http://127.0.0.1:8082" {
         didSet {
             UserDefaults.standard.set(hyServer, forKey: "hyServer")
             if hyServer != oldValue, !hyOnThisMac { languagesReady = false; languageDetail = "Check the Hy-SimulMT server."; languageCheck = UUID() }
@@ -69,10 +64,17 @@ private struct VoiceLearningProgress {
             error = nil
         }
     }
-    /// Experimental: speak the target language in the source speaker's voice (research-only).
-    var originalVoice = true
     var qualityFirst = false
     var keepBackground = true
+    /// Use one pinned voice unless the listener explicitly selects dialogue tracking.
+    var multipleSpeakers = UserDefaults.standard.object(forKey: "multipleSpeakers") as? Bool ?? false {
+        didSet {
+            if !CommandLine.arguments.contains("--smoke-output") { UserDefaults.standard.set(multipleSpeakers, forKey: "multipleSpeakers") }
+            if multipleSpeakers { voiceReferenceURL = nil }
+        }
+    }
+    /// Optional explicit reference for one speaker; it is not persisted or copied by the app.
+    var voiceReferenceURL: URL?
     /// ADR-0012: show the chosen window's picture D seconds late and give every translated
     /// phrase, the original audio and the separated background the same delay, so speech lands
     /// on its picture instead of trailing it by a varying amount.
@@ -99,7 +101,7 @@ private struct VoiceLearningProgress {
     var rememberedVoiceCount = 0
     private var voiceLearning: [String: VoiceLearningProgress] = [:]
     var voiceLearningDetail: String {
-        guard originalVoice, running, !voiceLearning.isEmpty else { return "" }
+        guard running, !voiceLearning.isEmpty else { return "" }
         return voiceLearning.keys.sorted().compactMap { speaker in
             guard let p = voiceLearning[speaker] else { return nil }
             switch p.state {
@@ -109,28 +111,16 @@ private struct VoiceLearningProgress {
             }
         }.joined(separator: " · ")
     }
-    var voiceModel = ExperimentalVoiceModel.qwen {
-        didSet {
-            guard voiceModel != oldValue, !installingVoiceModel else { return }
-            voiceSetupDetail = ""
-            error = nil
-        }
-    }
     var voiceInstallations: [ExperimentalVoiceInstallation] = []
     var checkingVoiceModels = false
-    var installingVoiceModel = false
-    var voiceSetupDetail = "Checking experimental models…"
+    var settingUp = false
+    var setupDetail = ""
+    var voiceSetupDetail = "Checking voice model…"
     var selectedVoiceInstallation: ExperimentalVoiceInstallation? {
-        voiceInstallations.first { $0.key == voiceModel.rawValue }
+        voiceInstallations.first { $0.key == ExperimentalVoiceModel.qwen.rawValue }
     }
-    var voiceReady: Bool { backend == .qwenCloud || !originalVoice || selectedVoiceInstallation?.installed == true }
-    var languageReadyForSession: Bool {
-        if backend == .local { return languagesReady }
-        let key = cloudAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        return !key.isEmpty && key.utf8.count <= 4096 && !key.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0) })
-    }
-    /// Optional user-supplied dictionaries remain in their chosen files.
-    var pronunciationURL: URL?
+    var voiceReady: Bool { selectedVoiceInstallation?.installed == true && cloneWorker != nil }
+    var languageReadyForSession: Bool { languagesReady }
     var playbackMode: PlaybackMode = .translated {
         didSet {
             guard playbackMode != oldValue else { return }
@@ -140,11 +130,13 @@ private struct VoiceLearningProgress {
     let repository = SessionModel.findRepository()
     /// The model the last check found; sessions pass it so they need not look again.
     private var hyLocalModel: URL?
-    let cloneWorker = SessionModel.findCloneWorker()
+    var cloneWorker: (python: String, script: String)? { SessionModel.findCloneWorker() }
     private var process: Process?
     private var outputPipe: Pipe?
     private var errorPipe: Pipe?
     private var controlPipe: Pipe?
+    private var setupProcess: Process?
+    private var setupCancelled = false
     private var pending = Data()
     private var generation = UUID()
     private var traceURL: URL?
@@ -178,8 +170,8 @@ private struct VoiceLearningProgress {
     }
 
     func refreshVoiceModels() async {
-        guard let cloneWorker, !installingVoiceModel else {
-            voiceSetupDetail = "Prepare the research environment with uv sync --project research --locked."
+        guard let cloneWorker else {
+            voiceSetupDetail = "Use Set up models to prepare the voice environment."
             return
         }
         checkingVoiceModels = true
@@ -192,38 +184,64 @@ private struct VoiceLearningProgress {
         } catch { voiceSetupDetail = String(describing: error) }
     }
 
-    func installVoiceModel() async {
-        guard !running, !installingVoiceModel, let cloneWorker else { return }
-        let selected = voiceModel
-        installingVoiceModel = true
-        voiceSetupDetail = "Installing \(selected.name)…"
+    /// Explicit setup only: the session itself never downloads models. The script verifies and
+    /// installs the selected local artifacts and keeps the large Hy model off server-only Macs.
+    func setupModels(serverOnlyOverride: Bool? = nil) async {
+        guard !running, !settingUp, let repository else { return }
+        let serverOnly = serverOnlyOverride ?? !hyOnThisMac
+        settingUp = true
+        setupCancelled = false
         error = nil
-        defer { installingVoiceModel = false }
-        do {
-            let script = URL(fileURLWithPath: cloneWorker.script).deletingLastPathComponent()
-                .appendingPathComponent("voice_models.py").path
-            voiceInstallations = try await ExperimentalVoiceSetup.run(python: cloneWorker.python, script: script, install: selected)
-            voiceSetupDetail = "\(selected.name) installed."
-        } catch { self.error = String(describing: error); voiceSetupDetail = "Model installation failed. You can retry to resume." }
+        setupDetail = "Preparing models. This can take a while…"
+        defer { settingUp = false; setupProcess = nil }
+        let process = Process()
+        // A separate process group lets Cancel stop both setup and its download/build children.
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = ["-c", "import os,sys; os.setsid() if os.getpgrp() != os.getpid() else None; os.execv('/bin/bash', ['/bin/bash'] + sys.argv[1:])",
+                             repository.appendingPathComponent("scripts/setup.sh").path] + (serverOnly ? ["--server"] : [])
+        process.currentDirectoryURL = repository
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
+        process.environment = environment
+        let output = Pipe()
+        let bytes = Mutex(Data())
+        output.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty { handle.readabilityHandler = nil; return }
+            bytes.withLock {
+                $0.append(data)
+                if $0.count > 8_192 { $0.removeFirst($0.count - 8_192) }
+            }
+        }
+        process.standardOutput = output
+        process.standardError = output
+        process.standardInput = FileHandle.nullDevice
+        defer { output.fileHandleForReading.readabilityHandler = nil }
+        do { try process.run() }
+        catch { setupDetail = "Setup could not start."; self.error = String(describing: error); return }
+        setupProcess = process
+        let result = await Task.detached { () -> (Bool, String) in
+            process.waitUntilExit()
+            return (process.terminationStatus == 0, bytes.withLock { String(decoding: $0, as: UTF8.self) })
+        }.value
+        if setupCancelled {
+            setupDetail = "Setup canceled. You can retry."
+        } else if result.0 {
+            setupDetail = "Setup complete."
+            await checkLanguages()
+            await refreshVoiceModels()
+        } else {
+            setupDetail = "Setup could not finish. You can retry."
+            let detail = result.1.trimmingCharacters(in: .whitespacesAndNewlines)
+            error = detail.isEmpty ? "Model setup failed." : String(detail.suffix(2_000))
+        }
     }
 
-    func installReferenceSpeech() async {
-        guard !running, !checking else { return }
-        let helper = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/a2a-transcribe")
-        let locale = direction.source.speechLocaleIdentifier
-        checking = true
-        voiceSetupDetail = "Preparing local speech assets for voice references…"
-        defer { checking = false }
-        let success = await Task.detached {
-            let process = Process()
-            process.executableURL = helper
-            process.arguments = ["--install-assets", "--locale", locale]
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            do { try process.run(); process.waitUntilExit(); return process.terminationStatus == 0 }
-            catch { return false }
-        }.value
-        voiceSetupDetail = success ? "Reference speech assets are ready." : "Could not install reference speech assets. Check macOS language settings and try again."
+    func cancelSetup() {
+        guard settingUp, let process = setupProcess, process.isRunning else { return }
+        setupCancelled = true
+        setupDetail = "Stopping setup…"
+        if kill(-process.processIdentifier, SIGTERM) != 0 { process.terminate() }
     }
 
     func checkLanguages() async {
@@ -240,7 +258,8 @@ private struct VoiceLearningProgress {
             guard languageCheck == token, hyOnThisMac else { return }
             hyLocalModel = model
             languagesReady = missing == nil
-            languageDetail = missing ?? "Hy-SimulMT runs on this Mac. Each session loads it in a few seconds; it uses about 19 GB of memory."
+            languageDetail = missing == nil ? "Hy-SimulMT is ready on this Mac." :
+                (repository == nil ? "Keep A2A inside its source folder to set it up." : "Hy-SimulMT is not set up on this Mac.")
             return
         }
         let server = hyServer
@@ -291,9 +310,8 @@ private struct VoiceLearningProgress {
     }
 
     func start() {
-        guard process == nil, !choosingPicture, languageReadyForSession, voiceReady, !installingVoiceModel else { return }
-        // Qwen Cloud streams provider audio without local phrase slots, so it cannot follow a delayed picture.
-        guard matchPicture, backend == .local else {
+        guard process == nil, !choosingPicture, languageReadyForSession, voiceReady, !settingUp else { return }
+        guard matchPicture else {
             sessionPictureDelayMs = 0
             launchPipeline()
             return
@@ -364,19 +382,23 @@ private struct VoiceLearningProgress {
     }
 
     /// Why a session cannot start, checked before the helper takes over audio.
-    private func preflightFailure() -> String? {
+    func preflightFailure() -> String? {
         guard FileManager.default.isExecutableFile(atPath: pipelineExecutable.path) else {
             return "The translation helper is missing. Build the app with scripts/build_app.sh."
         }
-        // A dictionary may have been changed or deleted since it was selected.
-        for url in [pronunciationURL].compactMap({ $0 }) {
+        if let reference = voiceReferenceURL {
             do {
-                let data = try Data(contentsOf: url)
-                _ = try JSONDecoder().decode([String: String].self, from: data)
-            } catch {
-                return "Cannot read \(url.lastPathComponent). Choose a JSON object of terms and replacements."
-            }
+                let values = try reference.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+                guard values.isRegularFile == true, let size = values.fileSize, size > 0, size <= 32_000_000 else {
+                    return "Choose a WAV reference smaller than 32 MB."
+                }
+                let audio = try WAV.read(reference)
+                guard audio.sampleRate > 0, (1...15).contains(audio.durationSeconds) else {
+                    return "Choose a WAV reference between 1 and 15 seconds long."
+                }
+            } catch { return "Could not read the voice reference. Choose a valid WAV file." }
         }
+        guard cloneWorker != nil else { return "Set up the voice environment with: uv sync --project research --locked" }
         return nil
     }
 
@@ -427,8 +449,6 @@ private struct VoiceLearningProgress {
                 guard let self, self.generation == token else { return }
                 let message = String(decoding: data.suffix(8_192), as: UTF8.self)
                 if message.contains("denied") || message.contains("assets not installed") || message.contains("stalled")
-                    || (message.contains("Qwen Cloud") && message.contains("failed"))
-                    || message.contains("Qwen Cloud reported") || message.contains("Qwen Cloud returned")
                     || message.contains("Audio capture fell behind") || message.contains("Translated audio could not keep up")
                     || message.contains("voice worker failed") || message.contains("voice worker stopped")
                     || message.contains("Hy-SimulMT worker failed")
@@ -454,9 +474,6 @@ private struct VoiceLearningProgress {
         do {
             try child.run()
             try? control.fileHandleForReading.close()
-            if backend == .qwenCloud {
-                try control.fileHandleForWriting.write(contentsOf: Data((cloudAPIKey.trimmingCharacters(in: .whitespacesAndNewlines) + "\n").utf8))
-            }
             running = true
             status = "Preparing translation…"
         } catch {
@@ -467,22 +484,9 @@ private struct VoiceLearningProgress {
     }
 
     func pipelineArguments(source: AudioSource, trace: URL) -> [String] {
-        if backend == .qwenCloud {
-            return source.arguments + ["--qwen-cloud", "--cloud-region", cloudRegion, "--direction", direction.rawValue,
-                "--translation-only", "--playback", playbackMode.rawValue, "--control-stdin", "--events-stdout",
-                "--trace", trace.path, "--parent-pid", "\(getpid())"]
-        }
-        var voice = ["--tts", "system"]
-        if originalVoice, let cloneWorker {
-            voice = ["--tts", "clone", "--clone-model", voiceModel.rawValue,
-                     "--clone-python", cloneWorker.python, "--clone-worker", cloneWorker.script]
-            voice += ["--clone-mode", "xvector"]
-            if voiceModel == .qwen { voice.append("--dual-clone") }
-            if voiceModel == .audio8 || voiceModel == .omnivoice {
-                let helper = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/a2a-transcribe")
-                voice += ["--reference-transcriber", helper.path]
-            }
-        }
+        var voice = ["--tts", "clone", "--clone-model", "qwen", "--clone-mode", "xvector", "--dual-clone"]
+        if let cloneWorker { voice += ["--clone-python", cloneWorker.python, "--clone-worker", cloneWorker.script] }
+        if !multipleSpeakers, let voiceReferenceURL { voice += ["--voice-ref", voiceReferenceURL.path] }
         var translation = ["--mt", "hy", "--hy-server", hyServer]
         if hyOnThisMac {
             translation = ["--mt", "hy-local"]
@@ -491,16 +495,15 @@ private struct VoiceLearningProgress {
             }
         }
         var arguments = source.arguments + ["--asr", "audio"] + translation + ["--direction", direction.rawValue] + voice + [
-            "--translation-only", "--fluent", "--speakers", "auto", "--playback", playbackMode.rawValue, "--control-stdin",
+            "--translation-only", "--fluent", "--speakers", multipleSpeakers ? "auto" : "single", "--playback", playbackMode.rawValue, "--control-stdin",
             "--events-stdout", "--trace", trace.path, "--parent-pid", "\(getpid())"]
         if qualityFirst { arguments.append("--quality-first") }
         // With a delayed picture the lag limit counts from each phrase's slot: a phrase more than
         // 2 s off its picture is skipped rather than pushing the following ones late too.
         else { arguments.append(contentsOf: ["--adaptive-prebuffer", "--max-debt-seconds", "8", "--max-source-lag-seconds",
-                                             sessionPictureDelayMs > 0 ? "2" : (originalVoice ? "20" : "8")]) }
+                                             sessionPictureDelayMs > 0 ? "2" : "20"]) }
         if sessionPictureDelayMs > 0 { arguments.append(contentsOf: ["--presentation-delay-ms", "\(sessionPictureDelayMs)"]) }
         if keepBackground { arguments.append("--background") }
-        if let pronunciationURL { arguments.append(contentsOf: ["--pronounce", pronunciationURL.path]) }
         return arguments
     }
 
@@ -577,7 +580,7 @@ private struct VoiceLearningProgress {
                 } else if event["ev"] as? String == "state.change", let to = event["to"] as? String {
                     // Translation-only sessions are silent until the voice is ready and while catching up.
                     if to.hasPrefix("acquiring_voice") {
-                        status = originalVoice ? "Learning the speakers’ voices…" : "Preparing voices…"
+                        status = "Learning the speakers’ voices…"
                     } else if to.hasPrefix("translating") {
                         status = "Translating"
                     } else if to == "degraded" {

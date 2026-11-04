@@ -23,6 +23,10 @@ public struct ReferencePolicyConfig: Sendable {
     public var maxClippedFraction = 0.002
     /// Audio-only speaker conditioning does not require a transcript.
     public var allowEmptyText = false
+    /// Lowest level of a segment's isolated voice relative to the segment itself, in dB, when
+    /// the driver measured it (ADR-0016). Without a transcript nothing else says a segment is
+    /// speech: a voice cloned from music or effects mumbles until its token cap. nil: no gate.
+    public var minVoiceShareDB: Float?
 
     public init() {}
 }
@@ -53,6 +57,7 @@ public enum ReferenceRejection: String, Error, Sendable {
     case tooLong = "too_long"
     case quiet
     case clipped
+    case notVoice = "not_voice"
     case complete
 }
 
@@ -122,15 +127,19 @@ public struct ReferencePolicy: Sendable {
     }
 
     /// Offer one measured, finalized utterance. Returns the plan for a new profile version
-    /// when this segment makes one due.
+    /// when this segment makes one due. `voiceShareDB` is the segment's isolated-voice level
+    /// relative to the segment, when measured; `minVoiceShareDB` gates on it.
     public mutating func offer(span: SourceSpan, text: String, levelDB: Float,
-                               clippedFraction: Double) -> Result<ReferencePlan?, ReferenceRejection> {
+                               clippedFraction: Double, voiceShareDB: Float? = nil) -> Result<ReferencePlan?, ReferenceRejection> {
         if isComplete { return .failure(.complete) }
         let trimmed = text.trimmingWhitespace()
         guard config.allowEmptyText || !trimmed.isEmpty else { return .failure(.empty) }
         guard span.durationSeconds >= config.minSegmentSeconds else { return .failure(.tooShort) }
         guard levelDB.isFinite, levelDB >= config.minLevelDB else { return .failure(.quiet) }
         guard clippedFraction <= config.maxClippedFraction else { return .failure(.clipped) }
+        if let minimum = config.minVoiceShareDB, let share = voiceShareDB, !(share >= minimum) {
+            return .failure(.notVoice)
+        }
         guard acceptedSeconds + span.durationSeconds <= config.maxSeconds else {
             // After the first version, a segment that cannot fit ends acquisition with what
             // was gathered (an upgrade only when it adds audio).

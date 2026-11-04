@@ -822,6 +822,43 @@ entries:
         sha256: "b426b0a4d3709b20313bed1bb6eca9842ca1ad7bcfa347b0c97b8e053bd77849"
         size: 20189
 
+  - id: ecapa-voxlingua107-lid-mlx
+    stage: lid
+    status: verified
+    enabled: true
+    verified_by: "Claude (agent session for ADR-0018)"
+    verified_on: "2026-11-03"
+    research_only: true
+    upstream:
+      repo: "https://huggingface.co/speechbrain/lang-id-voxlingua107-ecapa"
+      revision: "0253049ae131d6a4be1c4f0d8b0ff483a0f8c8e9"
+      license: Apache-2.0
+      license_evidence: "https://huggingface.co/api/models/speechbrain/lang-id-voxlingua107-ecapa (cardData.license apache-2.0 at 0253049a, checked 2026-11-03)"
+    converted:
+      repo: "https://huggingface.co/beshkenadze/lang-id-voxlingua107-ecapa-mlx"
+      revision: "ea8995c21cc571117f2dcddee39ac3b22f7fde83"
+      license: Apache-2.0
+      license_evidence: "https://huggingface.co/beshkenadze/lang-id-voxlingua107-ecapa-mlx/blob/ea8995c21cc571117f2dcddee39ac3b22f7fde83/README.md (license: apache-2.0; base_model speechbrain/lang-id-voxlingua107-ecapa)"
+      note: "MLX safetensors conversion by a third party; parity with the SpeechBrain checkpoint is not measured here. Used only to tell whether a line is already in the target language (ADR-0018)."
+    runtime: "mlx-audio 0.6.1 lid.ecapa_tdnn (research/uv.lock); offline local directory only"
+    native_format: {sample_rate: 16000, channels: 1}
+    streaming: {audio_input: "one closed unit at a time"}
+    backend: "GPU (MLX)"
+    open_question: "Accuracy on 1-4 s film dialogue under isolation residue; GPU contention next to Hy and two voices"
+    files:
+      - path: "README.md"
+        url: "https://huggingface.co/beshkenadze/lang-id-voxlingua107-ecapa-mlx/resolve/ea8995c21cc571117f2dcddee39ac3b22f7fde83/README.md"
+        sha256: "6b996a4d095618a96afdd0ae0e34434e0c59b3cfcf9d949ef4594be6718189ff"
+        size: 1891
+      - path: "config.json"
+        url: "https://huggingface.co/beshkenadze/lang-id-voxlingua107-ecapa-mlx/resolve/ea8995c21cc571117f2dcddee39ac3b22f7fde83/config.json"
+        sha256: "ca968b86e19541847dc7b1e7ca53e2aa5084818edf7def82ac9e407e596fb71f"
+        size: 3024
+      - path: "ecapa_tdnn_lid107.safetensors"
+        url: "https://huggingface.co/beshkenadze/lang-id-voxlingua107-ecapa-mlx/resolve/ea8995c21cc571117f2dcddee39ac3b22f7fde83/ecapa_tdnn_lid107.safetensors"
+        sha256: "bae5627c78e942e6ca15af87cbfd582915ead6ae2d8f839ad225504c946ddbc8"
+        size: 85172012
+
 # System frameworks: no bundled weights. Language assets are installed by the OS setup path and
 # tracked here separately from bundled models. Observations come from a2a-preflight.
 system:

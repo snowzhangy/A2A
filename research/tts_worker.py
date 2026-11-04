@@ -272,9 +272,9 @@ def speech_budget_seconds(text: str, language: str = "english") -> float:
     return characters / MIN_CHARS_PER_SECOND.get(language, 11.0) + SPEECH_TAIL_SECONDS
 
 
-def max_tokens_for(text: str, language: str = "english") -> int:
+def max_tokens_for(text: str, language: str = "english", budget_multiplier: float = 1.0) -> int:
     """Token cap that enforces `speech_budget_seconds` (missed EOS cannot run past it)."""
-    return max(25, min(500, math.ceil(speech_budget_seconds(text, language) * TOKENS_PER_SECOND)))
+    return max(25, min(500, math.ceil(speech_budget_seconds(text, language) * budget_multiplier * TOKENS_PER_SECOND)))
 
 
 def take_seed(voice_seed: int, attempt: int) -> int:
@@ -392,7 +392,9 @@ class ModelBackend:
         if self.model_key == "qwen":
             # Deterministic per voice and attempt: a retry of a failed take samples differently.
             mx.random.seed(take_seed(voice.sampling_seed, attempt))
-        for result in self.adapter.generate(voice, text, interval, max_tokens_for(text, voice.language), self.temperature):
+        budget_multiplier = getattr(self, "speech_budget_multiplier", 1.0)
+        for result in self.adapter.generate(voice, text, interval,
+                                            max_tokens_for(text, voice.language, budget_multiplier), self.temperature):
             mx.eval(result.audio)
             samples = self.np.asarray(result.audio, dtype=self.np.float32).reshape(-1)
             if result.sample_rate != RATE:
@@ -639,7 +641,7 @@ class Worker:
             compactor = None
             speed = 1.0
             native_speed = getattr(self.backend, "native_speed", False)
-            budget_s = speech_budget_seconds(text, voice.language)
+            budget_s = speech_budget_seconds(text, voice.language) * getattr(self.backend, "speech_budget_multiplier", 1.0)
             if header.get("target_s") is not None and audio_pacing.available:
                 estimate = getattr(self.backend, "estimated_duration", None)
                 predicted = estimate(voice, text) if estimate else None
@@ -693,6 +695,9 @@ class Worker:
                 if not silent or self.is_canceled(job):
                     break
             canceled = self.is_canceled(job)
+            # Reaching the budget means the cap stopped generation, not the model: the line was
+            # truncated. It is reported rather than hidden, so a run can be read correctly.
+            truncated = not canceled and generated_samples / RATE >= budget_s - 0.05
             if not canceled and pacing is not None:
                 tail = pacing.process(compactor.process([], final=True), final=True)
                 if len(tail):
@@ -700,19 +705,18 @@ class Worker:
                         first = time.perf_counter() - started
                     emitted += len(tail)
                     self.channel.send({"ev": "chunk", "id": job, "rate": RATE}, tail.tobytes())
-                if generated_samples and native_samples:
+                if generated_samples and native_samples and not truncated:
                     # Pace of the model's own audio, silence trim included: the estimate the next
                     # unit's speed-up is chosen from. A take with no speech says nothing about
                     # pace; counting its cap-length silence would speed up the following lines.
+                    # Nor does a take the cap stopped: its length is the cap's, not the voice's,
+                    # and learning it pinned every later line at the fastest speed (ADR-0016).
                     observed = generated_samples / RATE / max(1, len(text))
                     voice.seconds_per_character = 0.7 * voice.seconds_per_character + 0.3 * observed
-            elif not canceled and model_speed > 1.0 and native_samples:
+            elif not canceled and model_speed > 1.0 and native_samples and not truncated:
                 # Natively paced audio ran at `model_speed`: learn the voice's unhurried pace.
                 observed = native_samples * model_speed / RATE / max(1, len(text))
                 voice.seconds_per_character = 0.7 * voice.seconds_per_character + 0.3 * observed
-            # Reaching the budget means the cap stopped generation, not the model: the line was
-            # truncated. It is reported rather than hidden, so a run can be read correctly.
-            truncated = not canceled and generated_samples / RATE >= budget_s - 0.05
             if not canceled:
                 gain = shaper.unit_gain()
                 if gain:
@@ -746,6 +750,8 @@ def main() -> None:
     parser.add_argument("--reference-locale", default="zh-CN")
     parser.add_argument("--interval", type=float, default=0.32, help="streaming chunk interval in seconds")
     parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--longer-speech-budget", action="store_true",
+                        help="allow longer takes for complete-phrase playback; generation remains bounded")
     parser.add_argument("--research-text", action="store_true", help="include error text in messages")
     parser.add_argument("--backend", choices=("mlx", "torch"), default="mlx",
                         help="mlx on Apple silicon (default); torch for CUDA, MPS, or CPU (ADR-0007)")
@@ -763,6 +769,7 @@ def main() -> None:
         backend = TorchBackend(args.model, args.temperature, args.device)
     else:
         backend = ModelBackend(args.model, args.temperature, args.reference_transcriber, args.reference_locale)
+    backend.speech_budget_multiplier = 1.5 if args.longer_speech_budget else 1.0
     started = time.perf_counter()
     try:
         if not args.fake and args.model in ("audio8", "omnivoice"):

@@ -119,7 +119,7 @@ let package = Package(
 
         .testTarget(name: "A2ACoreTests", dependencies: ["A2ACore"], exclude: ["Golden"]),
         .executableTarget(
-            name: "A2AApp", dependencies: ["A2ACore", "A2AAudio", "A2AModels", "A2AVideo"],
+            name: "A2AApp", dependencies: ["A2ACore", "A2AAudio", "A2AMedia", "A2AModels", "A2AVideo"],
             path: "Apps/A2A", exclude: ["Info.plist"], linkerSettings: sdkVersionStamp()
         ),
         .testTarget(name: "A2ATraceTests", dependencies: ["A2ATrace", "A2ACore"]),

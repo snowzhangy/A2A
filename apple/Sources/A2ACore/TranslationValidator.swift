@@ -59,13 +59,17 @@ public struct TranslationValidator: Sendable {
     }
 
     /// Characters of target text that fit the source span's own playback time.
-    public func spokenBudgetCharacters(sourceDurationSeconds: Double) -> Int {
-        max(2, Int((max(0, sourceDurationSeconds) + spokenBudgetGraceSeconds) * spokenCharactersPerSecond))
+    /// `graceSeconds` replaces `spokenBudgetGraceSeconds` for one line, e.g. the silence known to
+    /// follow it (ADR-0018).
+    public func spokenBudgetCharacters(sourceDurationSeconds: Double, graceSeconds: Double? = nil) -> Int {
+        let grace = max(0, graceSeconds ?? spokenBudgetGraceSeconds)
+        return max(2, Int((max(0, sourceDurationSeconds) + grace) * spokenCharactersPerSecond))
     }
 
     public func evaluate(_ candidate: TranslationCandidate, source: String, previousTarget: String?,
                          sourceDurationSeconds: Double? = nil,
-                         wordSegmenter: (any WordSegmenter)? = nil) -> TranslationVerdict {
+                         wordSegmenter: (any WordSegmenter)? = nil,
+                         graceSeconds: Double? = nil) -> TranslationVerdict {
         let text = candidate.text.trimmingWhitespace()
         if text.isEmpty { return silencesFillers ? .silent(.empty) : .rejected(.empty) }
         if !candidate.complete { return .rejected(.incomplete) }
@@ -87,7 +91,7 @@ public struct TranslationValidator: Sendable {
             return .rejected(.duplicate)
         }
         if let sourceDurationSeconds, shortensOverBudgetTargets {
-            let budget = spokenBudgetCharacters(sourceDurationSeconds: sourceDurationSeconds)
+            let budget = spokenBudgetCharacters(sourceDurationSeconds: sourceDurationSeconds, graceSeconds: graceSeconds)
             if text.count > budget,
                let shortened = TargetShortener.shorten(text, to: budget, wordSegmenter: wordSegmenter) {
                 return .accepted(shortened)

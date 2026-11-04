@@ -42,6 +42,8 @@ def test_token_cap_follows_the_budget_and_stays_bounded():
     # A two-character acknowledgement still gets a whole short utterance, and nothing runs long.
     assert max_tokens_for("OK", "english") >= 25
     assert max_tokens_for("word " * 500, "english") == 500
+    assert max_tokens_for(text, "chinese", 1.5) > max_tokens_for(text, "chinese")
+    assert max_tokens_for("字" * 500, "chinese", 1.5) == 500
 
 
 class Channel:
@@ -122,6 +124,9 @@ def test_the_budget_reaches_the_model_as_its_token_cap():
     assert backend.adapter.caps == [max_tokens_for(text, "chinese")]
     # 7.3 s of audio at most: the 21-character line cannot run to the 10 s it took.
     assert backend.adapter.caps[0] / TOKENS_PER_SECOND < 7.5
+    backend.speech_budget_multiplier = 1.5
+    list(backend.generate(reference, text, 0.32))
+    assert backend.adapter.caps[-1] == max_tokens_for(text, "chinese", 1.5)
 
 
 def test_a_line_at_the_normal_pace_is_never_cut():
@@ -129,6 +134,17 @@ def test_a_line_at_the_normal_pace_is_never_cut():
     assert done["truncated"] is False
     assert done["audio_s"] > 0
     assert done["generated_s"] < done["budget_s"]
+
+
+def test_longer_budget_is_reported_consistently_by_the_worker():
+    backend = Backend(0.22)
+    backend.speech_budget_multiplier = 1.5
+    channel = Channel()
+    worker = Worker(backend, channel, 0.5, False)
+    worker.voices["v1"] = Voice(array.array("f", [0.1] * RATE), "", "xvector", "chinese")
+    text = "一二三四五六七八九十"
+    worker.synthesize({"id": 1, "voice": "v1", "text": text})
+    assert channel.done()["budget_s"] == pytest.approx(1.5 * speech_budget_seconds(text, "chinese"))
 
 
 class SilentStartBackend:
@@ -231,3 +247,37 @@ def test_a_silent_take_does_not_teach_the_voice_a_slower_pace():
     assert channel.done()["audio_s"] == 0
     # Cap-length silence would otherwise read as 0.7 s per character and speed up later lines.
     assert voice.seconds_per_character == before
+
+
+def paced_voice_after(seconds_per_character: float, text: str) -> tuple[float, float, dict]:
+    """The voice's pace estimate before and after one paced take at the given model speed."""
+    channel = Channel()
+    worker = Worker(Backend(seconds_per_character), channel, 0.5, False)
+    voice = Voice(array.array("f", (0.1 * math.sin(i / 40) for i in range(RATE))), "", "xvector", "chinese")
+    worker.voices["v1"] = voice
+    before = voice.seconds_per_character
+    worker.synthesize({"id": 1, "voice": "v1", "text": text, "target_s": 2.0})
+    return before, voice.seconds_per_character, channel.done()
+
+
+def test_a_take_the_cap_stopped_does_not_teach_the_voice_a_slower_pace():
+    # Live en→zh with a reference cloned from music: most takes ran on until the cap, each one
+    # taught the voice about 0.38 s per character, and every later line went out at the fastest
+    # speed-up (ADR-0016). A run-on take's length is the cap's, not the voice's.
+    import audio_pacing
+
+    if not audio_pacing.available:
+        pytest.skip("audio pacing dependencies are not installed")
+    before, after, done = paced_voice_after(1.0, "我们今天要讨论这个计划")
+    assert done["truncated"] is True
+    assert after == before
+
+
+def test_a_take_that_ends_by_itself_still_teaches_the_voice_its_pace():
+    import audio_pacing
+
+    if not audio_pacing.available:
+        pytest.skip("audio pacing dependencies are not installed")
+    before, after, done = paced_voice_after(0.18, "我们今天要讨论这个计划")
+    assert done["truncated"] is False
+    assert after < before

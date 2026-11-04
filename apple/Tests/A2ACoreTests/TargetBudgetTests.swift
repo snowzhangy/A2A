@@ -71,8 +71,8 @@ private struct AudioSession {
         #expect(zh.validator.spokenBudgetCharacters(sourceDurationSeconds: 3) == 60)
         let en = PipelineConfig(session: "en", direction: .englishToChinese)
         // Mandarin targets are budgeted in Han characters, not Latin ones.
-        #expect(en.validator.spokenCharactersPerSecond == 4)
-        #expect(en.validator.spokenBudgetCharacters(sourceDurationSeconds: 3) == 16)
+        #expect(en.validator.spokenCharactersPerSecond == 5)
+        #expect(en.validator.spokenBudgetCharacters(sourceDurationSeconds: 3) == 20)
     }
 
     @Test func shorteningKeepsWholeClausesThenWholeWords() {
@@ -129,11 +129,12 @@ private struct AudioSession {
         var plain = AudioSession(direction: .englishToChinese)
         plain.piece(at: 1)
         plain.translate(line, at: 1.4)
-        #expect(plain.synthesizedText()?.count == 16)   // 3 s of speech at 4 Han characters a second
+        #expect(plain.synthesizedText()?.count == 20)   // 3 s of speech, plus 1 s grace, at 5 Han characters a second
         var segmented = AudioSession(direction: .englishToChinese, targetSegmenter: FixedSegmenter())
         segmented.piece(at: 1)
         segmented.translate(line, at: 1.4)
-        #expect(segmented.synthesizedText() == String(Array(line.prefix(15))))
+        // The segmenter's boundary at 18 ends on 是, a dangling function word, so one more goes.
+        #expect(segmented.synthesizedText() == String(Array(line.prefix(17))))
         // A cut that would land on a dangling function word gives one character back.
         #expect(TargetShortener.shorten("我们下周开会讨论这个方案的成本和价格", to: 16) == "我们下周开会讨论这个方案的成本")
     }
@@ -150,6 +151,17 @@ private struct AudioSession {
         #expect(target?.value("shortened") == .bool(true))
         #expect(target?.value("mt_chars") == .int(Int64(line.count)))
         #expect(s.disposition() == nil || s.disposition()!.0 != .string("original_only"))   // the line still plays
+    }
+
+    @Test func captionsKeepTheFullTranslationWhenSpeechIsShortened() {
+        var s = AudioSession(tune: { $0.emitCaptions = true })
+        s.piece(at: 1)
+        let line = "The good news is that the price is final, and we can start on Monday morning."
+        let effects = s.translate(line, at: 1.4)
+        #expect(effects.contains(.caption(kind: "target.final", id: "u1", text: line)))
+        #expect(s.synthesizedText() != line)
+        // Full captions remain in memory and are absent from normal diagnostics.
+        #expect(!s.traces(.commitTarget).contains { $0.jsonLine().contains(line) })
     }
 
     @Test func anEmptyAnswerIsSilenceRatherThanAFailedTranslation() {

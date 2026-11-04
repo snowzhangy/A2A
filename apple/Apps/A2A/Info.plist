@@ -8,7 +8,6 @@
   <key>CFBundleShortVersionString</key><string>0.2.0</string>
   <key>CFBundleVersion</key><string>2</string>
   <key>LSMinimumSystemVersion</key><string>26.0</string>
-  <key>NSAudioCaptureUsageDescription</key><string>A2A captures the selected app's audio to translate between Mandarin and English.</string>
-  <key>NSSpeechRecognitionUsageDescription</key><string>A2A transcribes short voice references locally for selected voice models.</string>
+  <key>NSAudioCaptureUsageDescription</key><string>A2A captures this Mac's output audio to translate between Mandarin and English.</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict></plist>

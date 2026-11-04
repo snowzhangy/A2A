@@ -110,6 +110,16 @@ def test_english_to_chinese_replay_produces_captions_and_audio(synthetic_fixture
     assert all("text" not in e for e in events), "captions must remain in memory"
 
 
+def test_quality_first_preserves_complete_translation_targets(synthetic_fixture, pipeline_binary, tmp_path):
+    fx = load(synthetic_fixture)
+    summary = subprocess.run([
+        str(pipeline_binary), "--input", str(fx.audio), "--asr", "scripted",
+        "--asr-script", str(fx.asr_script), "--mt", "dictionary", "--mt-dictionary", str(fx.mt_dictionary),
+        "--quality-first", "--trace", str(tmp_path / "quality.jsonl"),
+    ], capture_output=True, text=True, encoding="utf-8", timeout=30, check=True)
+    assert json.loads(summary.stdout.splitlines()[-1])["shorten_targets"] is False
+
+
 @pytest.mark.parametrize("value", ["auto", "en-en", "zh-fr"])
 def test_unknown_direction_fails_before_audio_startup(pipeline_binary, value):
     result = subprocess.run([str(pipeline_binary), "--stdin", "--direction", value],

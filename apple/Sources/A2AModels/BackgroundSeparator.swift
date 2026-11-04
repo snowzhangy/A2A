@@ -58,18 +58,49 @@ public final class BackgroundSeparator {
         let latency = voice.unit.auAudioUnit.latency
         return latency.isFinite && latency > 0 ? latency : 0
     }
+    /// The voice alone in `samples` (48 kHz mono), for a speaker reference (ADR-0016). A fresh
+    /// unit per call, so the result depends only on its input; the unit's latency is flushed
+    /// with silence and removed, so output sample i is the voice of input sample i. The first
+    /// `preroll` samples only warm the unit up and are not returned.
+    public static func isolateVoice(_ samples: [Float], preroll: Int = 0) throws -> [Float] {
+        guard preroll >= 0, preroll < samples.count else { throw AdapterError.unsupported("empty voice isolation input") }
+        guard samples.allSatisfy(\.isFinite) else { throw AdapterError.unsupported("non-finite voice isolation input") }
+        let path = try Path(wet: 100)
+        let reported = path.unit.auAudioUnit.latency
+        let latency = reported.isFinite && reported > 0 ? Int((reported * 48_000).rounded()) : 0
+        let padded = samples + [Float](repeating: 0, count: latency)
+        var vocals: [Float] = []
+        vocals.reserveCapacity(padded.count)
+        for start in stride(from: 0, to: padded.count, by: 4096) {
+            vocals += try path.render(padded[start..<min(padded.count, start + 4096)])
+        }
+        let voice = vocals[(latency + preroll)...]
+        guard voice.allSatisfy(\.isFinite) else { throw AdapterError.unsupported("non-finite voice isolation output") }
+        return voice.map { max(-1, min(1, $0)) }
+    }
     public func process(_ samples: [Float]) throws -> [Float] {
+        try separate(samples).bed
+    }
+
+    /// The bed and the voice the unit isolated from `samples`, both lagging the input by
+    /// `latencySeconds`. The voice finds pauses that music under dialogue hides (ADR-0017).
+    public func separate(_ samples: [Float]) throws -> (bed: [Float], voice: [Float]) {
         guard samples.allSatisfy(\.isFinite) else { throw AdapterError.unsupported("non-finite background input") }
-        var result: [Float] = []
-        result.reserveCapacity(samples.count)
+        var bed: [Float] = []
+        var voiceOut: [Float] = []
+        bed.reserveCapacity(samples.count)
+        voiceOut.reserveCapacity(samples.count)
         for start in stride(from: 0, to: samples.count, by: 4096) {
             let block = samples[start..<min(samples.count, start + 4096)]
             let vocals = try voice.render(block)
             let original = try dry.render(block)
-            let bed = zip(original, vocals).map { $0 - $1 }
-            guard bed.allSatisfy(\.isFinite) else { throw AdapterError.unsupported("non-finite background output") }
-            result += bed.map { max(-1, min(1, $0)) }
+            let rest = zip(original, vocals).map { $0 - $1 }
+            guard rest.allSatisfy(\.isFinite), vocals.allSatisfy(\.isFinite) else {
+                throw AdapterError.unsupported("non-finite background output")
+            }
+            bed += rest.map { max(-1, min(1, $0)) }
+            voiceOut += vocals.map { max(-1, min(1, $0)) }
         }
-        return result
+        return (bed, voiceOut)
     }
 }

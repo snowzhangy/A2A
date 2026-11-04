@@ -16,7 +16,7 @@ private struct Session {
     var effects: [PipelineEffect] = []
     private var captured: Int64 = 0
 
-    init(delay: Double, maxDebt: Double = 3, maxLag: Double = 4, maxPending: Int = 8) {
+    init(delay: Double, maxDebt: Double = 3, maxLag: Double = 4, maxPending: Int = 8, adaptive: Bool = false) {
         var config = PipelineConfig(session: "picture-delay")
         config.finishPhraseBeforeCatchUp = true
         config.originalAudioEnabled = false
@@ -24,6 +24,8 @@ private struct Session {
         config.health.maxSourceLagSeconds = maxLag
         config.maxPendingUnits = maxPending
         config.presentationDelaySeconds = delay
+        config.adaptiveStreamingPrebuffer = adaptive
+        if adaptive { config.health.prebufferSeconds = 0.24 }
         p = SessionPipeline(config: config)
         run(0, .arm)
         run(0, .armSucceeded)
@@ -107,6 +109,19 @@ private struct Session {
         #expect(abs((released ?? 0) - 8.0) <= 0.021)
         #expect(s.p.state == .translating(speaker))
         #expect((s.lateMs(1) ?? 999) >= 0 && (s.lateMs(1) ?? 999) <= 20)
+    }
+
+    @Test func stalledChunksAreNotMistakenForAHealthyStreamAtTheSlot() {
+        var s = Session(delay: 8, adaptive: true)
+        s.commit(1, from: 0, to: 3, at: 3.1)
+        let header = PCMChunkHeader(unitID: UnitID(1), speakerID: speaker, profileVersion: 1, sessionEpoch: 1,
+                                    playoutGeneration: 1, format: PCMFormat(sampleRate: 24_000, channelCount: 1),
+                                    span: SourceSpan(start: 0, end: 0), isLast: false)
+        s.run(4.0, .pcm(header, frames: 7_200))
+        s.run(4.1, .pcm(header, frames: 7_200))
+        #expect(!s.tick(8.0).contains(.releaseHeld(UnitID(1))))
+        // A finished phrase is safe to release even if no more PCM arrives.
+        #expect(s.run(8.1, .synthesisFinished(UnitID(1), generation: 1)).contains(.releaseHeld(UnitID(1))))
     }
 
     @Test func aLaterPhraseWaitsForItsSlotEvenWhenTheBusIsFree() {

@@ -31,7 +31,7 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--seconds", type=float, default=120)
     ap.add_argument("--source-offset", type=float, default=0, help="Original media time of excerpt sample zero")
-    ap.add_argument("--hy-server", default="http://10.0.1.29:8082", help="Hy-SimulMT server URL")
+    ap.add_argument("--hy-server", default="http://127.0.0.1:8082", help="Hy-SimulMT server URL")
     ap.add_argument("--captions-only", action="store_true")
     ap.add_argument("--player", choices=("fixture", "ffplay"), default="fixture")
     args = ap.parse_args()

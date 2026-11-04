@@ -10,7 +10,7 @@ the two branches merged on 2 November. Nothing in the decision changed.
 Update: [ADR-0008](0008-separated-background-and-live-delay.md) restores a streaming
 default after the user rejected the measured delay. Complete-phrase mode remains opt-in.
 
-The macOS app defaults to **Prioritize complete phrases**. It passes `--quality-first`
+When the user selects **Prioritize complete phrases**, the macOS app passes `--quality-first`
 to the same pipeline used for process taps and paced file replay. The reducer admits
 each phrase only when synthesis has completed; capture, recognition and translation
 continue during this wait. This prevents a healthy but slow streaming model from
@@ -22,6 +22,14 @@ debt/source lag and at most 16 pending units. The existing catch-up policy can s
 skip unheard work beyond those limits. This is deliberately bounded: it does not
 promise that all dialogue will be retained when sustained synthesis or English speech
 duration exceeds incoming speech. Explicit CLI debt/lag overrides remain available.
+
+Follow-up, 3 November: this mode also disables automatic shortening of validated target text.
+Previously it waited for complete synthesized audio while already having cut the translation
+before synthesis. The hard length cap still rejects implausibly long outputs. The TTS worker gets
+a 1.5× speech budget, still capped at 500 tokens: a short synthetic replay reached the ordinary
+limit in both modes. A take can still be cut, and a complete line may overrun the picture or be
+skipped under sustained load, so the UI describes the tradeoff. The normal streaming mode keeps
+its previous budget; no unverified semantic rewrite is inserted.
 
 The source is still live. There is no whole-file recognition, future transcript or
 pre-rendered audio in the live host. Source-app audio ownership, private taps, callback
