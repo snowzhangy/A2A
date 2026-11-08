@@ -39,7 +39,7 @@ def test_dictionary_covers_every_clause_combination(synthetic_fixture):
 
 def test_merged_utterances_grow_across_sentences_and_finalize_once(tmp_path):
     path = generate(tmp_path / "long", SynthConfig(sentences=4, utterance_sentences=2, fixture_id="long"))
-    script = json.loads((path.parent / "long.asr.json").read_text())["hypotheses"]
+    script = json.loads((path.parent / "long.asr.json").read_text(encoding="utf-8"))["hypotheses"]
     by: dict[int, list[dict]] = {}
     for h in script:
         by.setdefault(h["utt"], []).append(h)

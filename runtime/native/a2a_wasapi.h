@@ -97,6 +97,8 @@ typedef struct a2a_session_info {
     float volume;
     char display_name[128];
     char endpoint[128];
+    // IAudioSessionControl2::GetSessionIdentifier, UTF-8. Stable identity for targeted restore.
+    char session_id[256];
 } a2a_session_info;
 
 /// Render-session inventory over every active render endpoint. Returns the number of
@@ -111,6 +113,10 @@ int32_t a2a_wasapi_set_session_mute(const uint32_t *pids, int32_t count, int32_t
 /// Sets the session volume (ISimpleAudioVolume, 0–1) of every render session owned by one
 /// of `pids`. Returns the number of sessions set, or a negative HRESULT.
 int32_t a2a_wasapi_set_session_volume(const uint32_t *pids, int32_t count, float level);
+
+/// Target exactly one enumerated audio session, never every session that happens to reuse its PID.
+int32_t a2a_wasapi_set_session_volume_by_id(const char *session_id, float level);
+int32_t a2a_wasapi_set_session_mute_by_id(const char *session_id, int32_t mute);
 
 /// UTF-8 endpoint ID of the current default render device ("" when none). Returns its length.
 int32_t a2a_wasapi_default_render_id(char *out, int32_t capacity);

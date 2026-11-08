@@ -76,7 +76,7 @@ def test_long_utterances_close_at_the_source_time_budget(pipeline_binary, tmp_pa
     assert cut["metrics"]["translation_coverage"] >= held["metrics"]["translation_coverage"]
     # Nothing spoken twice and nothing lost, even though the recognizer adds sentence
     # terminators only in its final result.
-    finals = "".join(h["text"] for h in json.loads((fx.parent / "long.asr.json").read_text())["hypotheses"]
+    finals = "".join(h["text"] for h in json.loads((fx.parent / "long.asr.json").read_text(encoding="utf-8"))["hypotheses"]
                      if h["final"])
     for events in (commits, [e for e in held_events if e["ev"] == "commit.source"]):
         assert normalize("".join(e["text"] for e in events)) == normalize(finals)

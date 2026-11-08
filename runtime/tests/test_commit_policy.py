@@ -1,8 +1,12 @@
 """Port of apple/Tests/A2ACoreTests/CommitPolicyTests.swift."""
 
+import sys
+
+import pytest
+
 from a2a_runtime.core.commit_policy import (Abandoned, Commit, CommitPolicy, CommitPolicyConfig, CommitReason, Hold,
                                             RequestFinalizeOut, RevisionBehindFrontier)
-from a2a_runtime.core.text import char_count, unsafe_ending
+from a2a_runtime.core.text import CommitLexicon, NormalizedText, char_count, graphemes, unsafe_ending
 from a2a_runtime.core.types import ASRHypothesis, ASRToken, SourceSpan, UnitID
 
 MS = 1_000_000
@@ -14,6 +18,161 @@ def hyp(text, utt=1, final=False, frontier=48_000):
 
 def commits(outputs):
     return [o.unit for o in outputs if isinstance(o, Commit)]
+
+
+def content_only(text):
+    """Spoken content only: recognizer punctuation carries no audio."""
+    return "".join(k for k in NormalizedText.of(text).keys if k not in CommitLexicon.punctuation)
+
+
+class DictionarySegmenter:
+    """A segmenter over a fixed vocabulary, standing in for the host's system tokenizer: no
+    cut may fall strictly inside one of the listed words."""
+
+    def __init__(self, words):
+        self.words = words
+
+    def splits_word(self, text, offset):
+        chars = graphemes(text)
+        for word in self.words:
+            w = graphemes(word)
+            if len(w) <= 1 or not 0 < offset < len(chars):
+                continue
+            for start in range(0, len(chars) - len(w) + 1):
+                if chars[start:start + len(w)] == w and start < offset < start + len(w):
+                    return True
+        return False
+
+
+def test_only_but_compound_does_not_become_two_unrelated_clauses():
+    for streaming in (False, True):
+        p = CommitPolicy(CommitPolicyConfig(streaming_clauses=streaming))
+        text = "他们只不过多看了几眼"
+        p.process(hyp(text), 0)
+        assert commits(p.process(hyp(text), 100 * MS)) == []
+        assert commits(p.process(hyp(text), 1_000 * MS)) == []
+        final = commits(p.process(hyp(text, final=True), 1_100 * MS))
+        assert [u.text for u in final] == [text]
+
+
+def test_late_punctuation_never_speaks_committed_content_twice():
+    p = CommitPolicy(CommitPolicyConfig(max_unit_source_seconds=3))
+    # Partials arrive unpunctuated, and the final result adds a period inside content that was
+    # already committed. Nothing may be spoken twice or dropped.
+    partial = "我们下周开会讨论这个方案"
+    p.process(hyp(partial, frontier=4 * 48_000), 0)
+    first = commits(p.process(hyp(partial, frontier=4 * 48_000), 100 * MS))
+    assert first[0].reason == CommitReason.LENGTH_CLAUSE
+    rest = commits(p.process(hyp("我们下周开会。讨论这个方案。", final=True, frontier=5 * 48_000), 200 * MS))
+    assert content_only("".join(u.text for u in first + rest)) == content_only(partial)
+
+
+def test_inserted_comma_does_not_shift_the_frontier_without_the_budget():
+    p = CommitPolicy(CommitPolicyConfig(max_unit_keys=8))
+    partial = "我们下周开会讨论这个方案"
+    p.process(hyp(partial), 0)
+    first = commits(p.process(hyp(partial), 100 * MS))
+    assert [u.text for u in first] == ["我们下周开会讨论"]
+    assert first[0].reason == CommitReason.FORCED_LENGTH
+    rest = commits(p.process(hyp("我们下周开会，讨论这个方案。", final=True), 200 * MS))
+    # Before re-alignment this committed "论这个方案。": the inserted comma moved the frontier
+    # back over a key that had already been spoken.
+    assert [u.text for u in rest] == ["这个方案。"]
+    assert content_only("".join(u.text for u in first + rest)) == content_only(partial)
+
+
+def test_long_unfinalized_utterance_closes_at_the_source_time_budget():
+    p = CommitPolicy()
+    text = "我们今天下午三点在会议室讨论下个季度的预算安排"
+    p.process(hyp(text, frontier=5 * 48_000), 0)
+    out = commits(p.process(hyp(text, frontier=5 * 48_000), 100 * MS))
+    assert len(out) == 1 and out[0].reason == CommitReason.LENGTH_CLAUSE
+    # Cut as late as the safety rules allow, leaving a splittable tail.
+    assert out[0].text == "我们今天下午三点在会议室讨论下个季度的预"
+    assert out[0].span == SourceSpan(0, 5 * 48_000) and out[0].timing_estimated
+    # The tail waits for its own evidence, and its estimated span starts where the length
+    # clause ended, so coverage never double-counts source.
+    rest = commits(p.process(hyp(text, final=True, frontier=6 * 48_000), 200 * MS))
+    assert [u.text for u in rest] == ["算安排"]
+    assert rest[0].reason == CommitReason.FINALIZED
+    assert rest[0].span == SourceSpan(5 * 48_000, 6 * 48_000)
+
+
+def test_length_budget_waits_for_the_key_floor():
+    p = CommitPolicy()
+    text = "我们今天下午三点开会"
+    p.process(hyp(text, frontier=10 * 48_000), 0)
+    # 10 keys is below the floor: a frontier that runs ahead of the text (VAD held open over
+    # music) must not turn a short clause into a committed unit.
+    assert commits(p.process(hyp(text, frontier=10 * 48_000), 100 * MS)) == []
+
+
+def test_length_budget_cuts_earlier_rather_than_end_on_a_number():
+    p = CommitPolicy()
+    text = "我们讨论一二三四五六七八九十"
+    p.process(hyp(text, frontier=6 * 48_000), 0)
+    out = commits(p.process(hyp(text, frontier=6 * 48_000), 100 * MS))
+    assert [u.text for u in out] == ["我们讨论"] and out[0].reason == CommitReason.LENGTH_CLAUSE
+
+
+def test_length_budget_holds_when_no_boundary_is_safe():
+    p = CommitPolicy()
+    text = "一二三四五六七八九十一二"
+    p.process(hyp(text, frontier=6 * 48_000), 0)
+    assert commits(p.process(hyp(text, frontier=6 * 48_000), 100 * MS)) == []
+    # Still reported as waiting, with the same reason the reconsider window uses.
+    out = p.process(hyp(text, frontier=6 * 48_000), 1_000 * MS)
+    assert Hold(1, "number", 12, 900 * MS) in out
+
+
+def test_length_budget_disabled_waits_for_finalization():
+    p = CommitPolicy(CommitPolicyConfig(max_unit_source_seconds=0))
+    text = "我们今天下午三点在会议室讨论下个季度的预算安排"
+    p.process(hyp(text, frontier=8 * 48_000), 0)
+    assert commits(p.process(hyp(text, frontier=8 * 48_000), 100 * MS)) == []
+    assert len(commits(p.process(hyp(text, final=True, frontier=8 * 48_000), 200 * MS))) == 1
+
+
+def test_length_budget_respects_word_boundaries_when_configured():
+    p = CommitPolicy(CommitPolicyConfig(prefer_word_boundaries=True))
+    text = "we will discuss the budget tomorrow afternoon"
+    p.process(hyp(text, frontier=6 * 48_000), 0)
+    out = commits(p.process(hyp(text, frontier=6 * 48_000), 100 * MS))
+    assert out[0].text == "we will discuss the budget tomorrow"
+    assert out[0].reason == CommitReason.LENGTH_CLAUSE
+
+
+def test_length_budget_never_cuts_inside_a_word_the_segmenter_knows():
+    # Per-character keys hide Mandarin words: the cut after 预 above would speak half of
+    # 度的预算. Only the host's segmenter can see it, so the rule obeys it and cuts earlier.
+    p = CommitPolicy(word_segmenter=DictionarySegmenter(["度的预算"]))
+    text = "我们今天下午三点在会议室讨论下个季度的预算安排"
+    p.process(hyp(text, frontier=5 * 48_000), 0)
+    out = commits(p.process(hyp(text, frontier=5 * 48_000), 100 * MS))
+    assert out[0].reason == CommitReason.LENGTH_CLAUSE
+    assert out[0].text == "我们今天下午三点在会议室讨论下个季"
+    # The rest of the word is not lost: the tail carries it to the next unit.
+    rest = commits(p.process(hyp(text, final=True, frontier=6 * 48_000), 200 * MS))
+    assert [u.text for u in rest] == ["度的预算安排"]
+    assert content_only("".join(u.text for u in out + rest)) == content_only(text)
+
+
+def test_successive_length_clauses_stay_disjoint():
+    p = CommitPolicy()
+    p.speech_started(48_000)
+    first = "我们今天下午三点在会议室讨论下个季度的预算安排问题"
+    p.process(hyp(first, frontier=5 * 48_000), 0)
+    a = commits(p.process(hyp(first, frontier=5 * 48_000), 100 * MS))
+    # The second half of the utterance keeps growing, and a second budget cut follows.
+    second = first + "并且需要各位提前准备材料"
+    b = commits(p.process(hyp(second, frontier=10 * 48_000), 200 * MS))
+    c = commits(p.process(hyp(second, frontier=10 * 48_000), 300 * MS))
+    units = a + b + c
+    assert len(units) >= 2
+    assert len({u.id for u in units}) == len(units)
+    for x, y in zip(units, units[1:]):
+        assert x.span.end <= y.span.start
+    assert units[0].span.start == 48_000
 
 
 def test_single_partial_is_not_stable():
@@ -167,3 +326,19 @@ def test_streaming_clause_splits_at_a_timed_pause():
     out = commits(p.process(h, 100 * MS))
     assert [u.text for u in out] == ["我们下周开会"] and out[0].reason == CommitReason.PROSODIC_PAUSE
     assert out[0].span == SourceSpan(0, 72_000) and not out[0].timing_estimated
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows.Data.Text segmenter")
+def test_the_windows_segmenter_keeps_a_length_cut_off_han_words():
+    from a2a_runtime.models.word_segmenter import WindowsWordSegmenter
+
+    # The same line as the dictionary-segmenter test, with the system's own word data: the cut
+    # backs off 预算 and the dangling 的 and lands after 季度, a whole word.
+    p = CommitPolicy(word_segmenter=WindowsWordSegmenter("zh-Hans"))
+    text = "我们今天下午三点在会议室讨论下个季度的预算安排"
+    p.process(hyp(text, frontier=5 * 48_000), 0)
+    out = commits(p.process(hyp(text, frontier=5 * 48_000), 100 * MS))
+    assert out[0].reason == CommitReason.LENGTH_CLAUSE
+    assert out[0].text == "我们今天下午三点在会议室讨论下个季度"
+    rest = commits(p.process(hyp(text, final=True, frontier=6 * 48_000), 200 * MS))
+    assert content_only("".join(u.text for u in out + rest)) == content_only(text)

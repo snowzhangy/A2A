@@ -37,10 +37,10 @@ def test_dual_clone_prefetches_one_phrase_without_reordering(pipeline_binary, tm
          "tokens": [{"text": "第二句话。", "start": 48000, "end": 72000}]},
         {"at_sample": 96000, "utt": 3, "text": "第三句话。", "final": True,
          "tokens": [{"text": "第三句话。", "start": 72000, "end": 96000}]},
-    ]}))
+    ]}), encoding="utf-8")
     dictionary = tmp_path / "mt.json"
     dictionary.write_text(json.dumps({"第一句话。": "The first sentence.", "第二句话。": "The second sentence.",
-                                      "第三句话。": "The third sentence."}))
+                                      "第三句话。": "The third sentence."}), encoding="utf-8")
     fake = tmp_path / "slow_worker.py"
     fake.write_text(textwrap.dedent(f"""
         import array, math, sys, time
@@ -52,14 +52,14 @@ def test_dual_clone_prefetches_one_phrase_without_reordering(pipeline_binary, tm
                 yield array.array('f', (0.1 * math.sin(i / 10) for i in range(7680)))
         tts_worker.FakeBackend.generate = generate
         tts_worker.main()
-    """))
+    """), encoding="utf-8")
     cmd = [str(pipeline_binary), "--input", str(source), "--clock", "host", "--pace", "realtime",
            "--asr", "scripted", "--asr-script", str(script), "--mt", "dictionary", "--mt-dictionary", str(dictionary),
            "--tts", "clone", "--clone-fake", "--clone-python", PYTHON, "--clone-worker", str(fake),
-           "--clone-mode", "xvector", "--voice-ref", str(source), "--fluent", "--dual-clone",
+           "--clone-mode", "xvector", "--voice-ref", str(source), "--fluent", "--dual-clone", "--clone-model", "qwen",
            "--max-debt-seconds", "60", "--max-source-lag-seconds", "120", "--tail-seconds", "15",
            "--trace", str(tmp_path / "trace.jsonl")]
-    done = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=60)
     assert done.returncode == 0, done.stderr[-2000:]
     summary = json.loads(done.stdout.strip().splitlines()[-1])
     assert summary["clone"]["workers"] == 2
@@ -188,9 +188,9 @@ def test_pronunciation_map_changes_spoken_text_and_traces_pacing(synthetic_fixtu
     samples, rate = read_wav(fx.audio)
     write_wav(reference, samples[: rate * 4], rate)
     reference_text = tmp_path / "reference.txt"
-    reference_text.write_text("Synthetic reference.")
+    reference_text.write_text("Synthetic reference.", encoding="utf-8")
     pronounce = tmp_path / "pronounce.json"
-    pronounce.write_text(json.dumps({"the": "thuh", "we": "wee"}))   # in most fixture translations
+    pronounce.write_text(json.dumps({"the": "thuh", "we": "wee"}), encoding="utf-8")   # in most fixture translations
     cmd = [str(pipeline_binary), "--input", str(fx.audio), "--clock", "host", "--pace", "asap",
            "--asr", "scripted", "--asr-script", str(fx.asr_script),
            "--mt", "dictionary", "--mt-dictionary", str(fx.mt_dictionary),
@@ -200,7 +200,7 @@ def test_pronunciation_map_changes_spoken_text_and_traces_pacing(synthetic_fixtu
            # --pace asap outruns real time; generous limits let synthesis finish instead of falling back.
            "--max-debt-seconds", "60", "--max-source-lag-seconds", "120",
            "--trace", str(tmp_path / "trace.jsonl"), "--out", str(tmp_path / "out.wav")]
-    done = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=180)
     assert done.returncode == 0, done.stderr[-2000:]
     events = trace.load(tmp_path / "trace.jsonl")
     finished = [e for e in events if e["ev"] == "tts.done"]
@@ -237,7 +237,7 @@ def test_a_phrase_that_plays_in_a_slot_is_filled_out_to_the_actors_time(syntheti
         out.mkdir(parents=True)
         done = subprocess.run(common + list(extra) + ["--trace", str(out / "trace.jsonl"),
                                                       "--out", str(out / "out.wav")],
-                              capture_output=True, text=True, timeout=240)
+                              capture_output=True, text=True, encoding="utf-8", timeout=240)
         assert done.returncode == 0, done.stderr[-2000:]
         events = trace.load(out / "trace.jsonl")
         return events, metrics.compute(events, fx)

@@ -4,6 +4,10 @@ A2A translates Mandarin ↔ English audio playing on an Apple silicon Mac. It us
 Hy-SimulMT for speech translation and Qwen3-TTS for an experimental voice matched
 to the speaker. A2A is an **early source release**: voice identity, translation
 coverage, signing and distribution are not yet qualified for production.
+The native application below targets macOS. An experimental Windows desktop preview is
+under `runtime/`; it has not passed live-audio lifecycle or voice-quality acceptance.
+See [the portable runtime guide](runtime/README.md) for setup, measured results, and
+current limitations. `python scripts/check.py` runs the deterministic checks on either platform.
 
 The app captures the **whole system output mix**, including other apps, and excludes
 its own playback. In local mode, inference runs on the Mac; choosing a Hy server

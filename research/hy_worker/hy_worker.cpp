@@ -53,7 +53,17 @@
 #include "mtmd-helper.h"
 #include <nlohmann/json.hpp>
 
+#ifdef _WIN32
+#define _USE_MATH_DEFINES
+#include <io.h>
+#include <fcntl.h>
+#define read _read
+#define write _write
+#define dup _dup
+#define dup2 _dup2
+#else
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -71,6 +81,7 @@ using json = nlohmann::ordered_json;
 namespace {
 
 constexpr int kRate = 16000;
+constexpr double kPi = 3.14159265358979323846;
 constexpr int kFirstTurn = kRate * 1600 / 1000;
 constexpr int kTurn = kRate * 800 / 1000;
 constexpr llama_token kEOT = 120008;  // <｜hy_EOT｜>: end of one answer
@@ -94,7 +105,9 @@ double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+#ifndef _WIN32
 void say(const char * fmt, ...) __attribute__((format(printf, 1, 2)));
+#endif
 void say(const char * fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -120,8 +133,8 @@ std::vector<double> lowpass(int rate) {
     double sum = 0;
     for (int i = 0; i < kTaps; i++) {
         const double t = i - kHalf;
-        const double sinc = t == 0 ? 1.0 : std::sin(2 * M_PI * cutoff * t) / (2 * M_PI * cutoff * t);
-        const double w = 0.42 - 0.5 * std::cos(2 * M_PI * i / (kTaps - 1)) + 0.08 * std::cos(4 * M_PI * i / (kTaps - 1));
+        const double sinc = t == 0 ? 1.0 : std::sin(2 * kPi * cutoff * t) / (2 * kPi * cutoff * t);
+        const double w = 0.42 - 0.5 * std::cos(2 * kPi * i / (kTaps - 1)) + 0.08 * std::cos(4 * kPi * i / (kTaps - 1));
         h[i] = 2 * cutoff * sinc * w;
         sum += h[i];
     }
@@ -732,7 +745,7 @@ int g_out = -1;
 bool read_exact(int fd, void * buf, size_t n) {
     auto * p = static_cast<unsigned char *>(buf);
     while (n > 0) {
-        const ssize_t r = read(fd, p, n);
+        const auto r = read(fd, p, n);
         if (r < 0 && errno == EINTR) continue;
         if (r <= 0) return false;
         p += r;
@@ -750,7 +763,7 @@ void send(const json & header) {
     memcpy(&frame[8], h.data(), h.size());
     size_t off = 0;
     while (off < frame.size()) {
-        const ssize_t w = write(g_out, frame.data() + off, frame.size() - off);
+        const auto w = write(g_out, frame.data() + off, frame.size() - off);
         if (w < 0 && errno == EINTR) continue;
         if (w <= 0) _exit(0);  // host gone
         off += size_t(w);
@@ -987,6 +1000,11 @@ int main(int argc, char ** argv) {
     // The protocol owns the original stdout; anything a library prints goes to stderr.
     g_out = dup(1);
     dup2(2, 1);
+#ifdef _WIN32
+    // Framed PCM/JSON must not see Ctrl-Z or CRLF translation on Windows.
+    _setmode(0, _O_BINARY);
+    _setmode(g_out, _O_BINARY);
+#endif
     Options opt;
     std::string test_wav, spans_arg, direction = "zh-en";
     double cuts = 0, from = 0, to = -1, stream_ms = 0;

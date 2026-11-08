@@ -144,6 +144,20 @@ class TranslationRequest:
     uncommitted_source: str
     # Prefix within this unit; empty for v0 closed-unit mode.
     committed_target_prefix: str = ""
+    # Audio corresponding to this committed source unit, in canonical sample time.
+    source_span: SourceSpan | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TranslationWorkerStats:
+    """What a streaming speech translator spent on one span, numbers only (`mt.result` `worker_*`)."""
+
+    # Worker time after the span closed: what the answer still cost once its audio was complete.
+    after_close_ms: int
+    # Conversation turns the span was fed as.
+    turns: int
+    # Unanswered speech went through whole-segment translation at the close.
+    sentence_fallback: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +166,8 @@ class TranslationCandidate:
     text: str
     # True when the adapter reports the generation completed rather than hitting a cap.
     complete: bool = True
+    # Timing a resident translation worker reported for this answer; None for other adapters.
+    worker_stats: TranslationWorkerStats | None = None
 
 
 # MARK: Voice profiles and synthesis
@@ -187,13 +203,6 @@ class PreparedVoice:
     speaker_id: SpeakerID
     profile_version: int
     handle: int
-
-
-@dataclass(frozen=True, slots=True)
-class TextChunk:
-    unit_id: UnitID
-    text: str
-    is_last: bool
 
 
 @dataclass(frozen=True, slots=True)

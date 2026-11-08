@@ -51,6 +51,41 @@ def test_caption_and_voice_session_commands_preserve_control_and_privacy(tmp_pat
         pipeline_command(SessionOptions(0), tmp_path / "bad.jsonl")
 
 
+def test_system_audio_session_matches_the_mac_app(tmp_path):
+    from a2a_runtime.cli import parse
+
+    mix = pipeline_command(SessionOptions(0, global_mix=True), tmp_path / "mix.jsonl")
+    assert mix[4] == "--tap-global" and "--tap-pid" not in mix
+    assert "--fluent" in mix and mix[mix.index("--speakers") + 1] == "auto"
+    assert "--adaptive-prebuffer" in mix and mix[mix.index("--max-source-lag-seconds") + 1] == "20"
+    options = parse(mix[4:])
+    assert options.tap_global and options.is_tap and options.fluent
+    system = pipeline_command(SessionOptions(0, global_mix=True, voice="system", quality_first=True),
+                              tmp_path / "system.jsonl")
+    assert system[system.index("--tts") + 1] == "system" and "--clone-model" not in system
+    assert "--quality-first" in system and "--adaptive-prebuffer" not in system
+    assert parse(system[4:]).fluent
+    with pytest.raises(ValueError):
+        pipeline_command(SessionOptions(0, global_mix=True, voice="robot"), tmp_path / "bad.jsonl")
+
+
+def test_delayed_picture_session_uses_slots_and_requires_a_window(tmp_path):
+    from a2a_runtime.cli import parse
+
+    command = pipeline_command(SessionOptions(0, global_mix=True, picture_delay_ms=8_000, video_hwnd=42),
+                               tmp_path / "picture.jsonl")
+    assert command[command.index("--presentation-delay-ms") + 1] == "8000"
+    options = parse(command[4:])
+    assert options.presentation_delay_ms == 8_000 and options.fluent
+    with_background = pipeline_command(SessionOptions(0, global_mix=True, background=True), tmp_path / "bed.jsonl")
+    assert "--background" in with_background and parse(with_background[4:]).background
+    with pytest.raises(ValueError, match="source window"):
+        pipeline_command(SessionOptions(0, global_mix=True, picture_delay_ms=8_000), tmp_path / "bad.jsonl")
+    with pytest.raises(ValueError, match="source window"):
+        pipeline_command(SessionOptions(0, global_mix=True, captions_only=True,
+                                        picture_delay_ms=8_000, video_hwnd=42), tmp_path / "bad.jsonl")
+
+
 def test_caption_controls_allow_stop_but_ignore_playback_changes():
     from a2a_runtime.driver import PlaybackControls
 
@@ -68,6 +103,7 @@ def test_caption_controls_allow_stop_but_ignore_playback_changes():
 def test_voice_progress_explains_why_audio_is_waiting():
     assert "1.5 / 3.0" in voice_progress_text({"voice_status": "collecting", "seconds": 1.5, "required_seconds": 3})
     assert "one speaker" in voice_progress_text({"voice_status": "collecting", "reason": "mixed_speakers"})
+    assert "Keep music and effects" in voice_progress_text({"voice_status": "collecting", "reason": "not_voice"})
     assert "Preparing" in voice_progress_text({"voice_status": "preparing"})
 
 
@@ -101,8 +137,10 @@ def test_pipeline_stop_while_voice_worker_loads(tmp_path):
     # A worker that never sends `ready` makes cancellation independent of GPUs and models.
     worker = tmp_path / "waiting.py"
     worker.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+    script = tmp_path / "asr.json"  # recognition loads (cheaply) before the voice worker
+    script.write_text('{"hypotheses": []}', encoding="utf-8")
     cmd = [sys.executable, "-u", "-m", "a2a_runtime.cli", "--input", "unused.wav", "--clock", "host",
-           "--asr-script", "unused.json", "--tts", "clone", "--clone-fake", "--clone-worker", str(worker),
+           "--asr-script", str(script), "--tts", "clone", "--clone-fake", "--clone-worker", str(worker),
            "--control-stdin", "--trace", str(tmp_path / "trace.jsonl")]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             cwd=REPO_ROOT, creationflags=0x08000000 if os.name == "nt" else 0)
@@ -156,3 +194,27 @@ def test_ui_process_reads_captions_and_sends_playback_and_stop(monkeypatch, tmp_
         if session.poll() is None:
             session.process.kill()
             session.process.wait()
+
+
+def test_loading_status_names_every_stage_still_loading():
+    from a2a_runtime.ui_session import LoadingStages
+
+    stages = LoadingStages()
+    assert stages.text == "Loading local models"
+    for line in ("starting the speech recognition worker (faster-whisper-large-v3, device auto)",
+                 "starting the translation worker (qwen3-4b-instruct-2507, device auto)",
+                 "starting the omnivoice voice worker (torch, icl)"):
+        assert stages.update(line)
+    assert stages.text == "Loading speech recognition, translation, and voice models"
+    assert stages.update("translator ready: cuda (ctranslate2 int8_bfloat16 stored)")
+    assert stages.text == "Loading speech recognition and voice models"
+    stages.update("recognizer ready: cuda (int8_float16)")
+    assert stages.text == "Loading voice model"
+    stages.update("voice worker ready: omnivoice-0.6b-torch@c5fdb5ccb189, load 9.1 s, warm-up 1.3 s")
+    assert stages.text == "Starting audio"
+    assert not stages.update("tapping System audio, output SPDIF")
+    system = LoadingStages()
+    system.update("starting the Windows system voice (plumbing; speaker identity is not preserved)")
+    assert system.text == "Loading voice model"
+    system.update("system voice ready: 3 voices")
+    assert system.text == "Starting audio"

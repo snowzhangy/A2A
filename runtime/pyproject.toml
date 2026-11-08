@@ -25,6 +25,10 @@ gpu = [
     "omnivoice>=0.2.1",
     "soundfile>=0.12",
 ]
+video = [
+    "pillow>=12.3.0 ; sys_platform == 'win32'",
+    "windows-capture>=2.0.1 ; sys_platform == 'win32'",
+]
 
 [project.scripts]
 a2a-pipeline-portable = "a2a_runtime.cli:entry"

@@ -858,6 +858,50 @@ entries:
         url: "https://huggingface.co/beshkenadze/lang-id-voxlingua107-ecapa-mlx/resolve/ea8995c21cc571117f2dcddee39ac3b22f7fde83/ecapa_tdnn_lid107.safetensors"
         sha256: "bae5627c78e942e6ca15af87cbfd582915ead6ae2d8f839ad225504c946ddbc8"
         size: 85172012
+  - id: rnnoise-0.4.5-windows
+    stage: separator
+    status: verified
+    enabled: true
+    verified_by: "Kimi (agent session for the Windows portable separator)"
+    verified_on: "2026-11-06"
+    research_only: true
+    upstream:
+      repo: "https://github.com/pengzhendong/pyrnnoise"
+      revision: "fe603b252ccc7d3bacadb77d6ab766c48acc6fce"
+      license: Apache-2.0
+      license_evidence: "pyrnnoise-0.4.5.dist-info/licenses/LICENSE in the SHA-verified wheel (Apache License 2.0, checked 2026-11-06)"
+    converted: {repo: null, revision: null, license: null, license_evidence: null}
+    runtime: "pyrnnoise 0.4.5 (runtime/separator/uv.lock); resident worker, offline package only"
+    native_format: {sample_rate: 48000, channels: 1}
+    streaming: {audio_input: "causal 10 ms frames; 10 ms cold-start latency removed by the host"}
+    backend: "CPU (bundled rnnoise.dll)"
+    open_question: "Voice isolation and residual soundtrack quality versus AUSoundIsolation are unmeasured; residual subtraction artifacts and conversational speech suppression"
+    files:
+      - path: "pyrnnoise-0.4.5-py3-none-win_amd64.whl"
+        url: "https://files.pythonhosted.org/packages/20/8d/0e19fbae841a4933c4ba783cf4466dfd24c70305fab9bc0c8674aa19ebc6/pyrnnoise-0.4.5-py3-none-win_amd64.whl"
+        sha256: "f46015e5a58212d2883bf8e5a2cafb3c6b115176d8039f8340132cb24866b7da"
+        size: 13263766
+
+# Derived artifacts (ADR-0007): local, offline conversions of a verified entry above. Nothing is
+# downloaded. `a2a_runtime.models.derive` re-verifies the source's SHA-256s, converts, and writes
+# a stamp (source revision, tool version, options, output SHA-256s) that loaders check against
+# this list; a conversion from another revision or with other options is refused.
+derived:
+  - id: qwen3-4b-instruct-2507-ct2
+    from: qwen3-4b-instruct-2507
+    tool: ctranslate2
+    # bfloat16 storage; the worker loads it as bfloat16 (8.3 GB), or quantizes it to
+    # int8_bfloat16 at load time (4.2 GB) when GPU memory is short and the int8 conversion
+    # below is absent.
+    options: ["--quantization", "bfloat16"]
+    why: "Eager PyTorch decoding is launch-bound under Windows WDDM (112 ms/token); CTranslate2 translates a clause in 0.16-0.26 s on an RTX 4090 with identical bf16 output on the test sentences."
+  - id: qwen3-4b-instruct-2507-ct2-int8
+    from: qwen3-4b-instruct-2507
+    tool: ctranslate2
+    # Optional. int8 weights stored, for the worker's int8 path when GPU memory is short: it
+    # loads without quantizing the bfloat16 conversion on the CPU at every start.
+    options: ["--quantization", "int8_bfloat16"]
+    why: "Quantizing the bfloat16 conversion at load took 37.2 s against 9.0-9.6 s for a bfloat16 load (RTX 4090, Windows, 6 November 2026), and int8 is the path a 24 GB card takes when other applications hold 7-11 GB."
 
 # System frameworks: no bundled weights. Language assets are installed by the OS setup path and
 # tracked here separately from bundled models. Observations come from a2a-preflight.

@@ -35,6 +35,26 @@ def load_asr_script(path: str | Path) -> list[dict]:
     return list(json.loads(Path(path).read_text(encoding="utf-8"))["hypotheses"])
 
 
+class NullRecognizer:
+    """Direct-audio sessions send spans to the speech translator, with no separate ASR stage."""
+
+    name = "audio"
+    pending = False
+    failure = None
+
+    def accept(self, frame):
+        pass
+
+    def request_finalize(self):
+        pass
+
+    def drain_hypotheses(self):
+        return []
+
+    def reset(self):
+        pass
+
+
 class ScriptedRecognizer:
     """Replays logged hypotheses once the accepted audio frontier reaches their time. It
     cannot emit a hypothesis for audio it has not received."""
@@ -159,6 +179,14 @@ class EnergyVAD:
         self._silence_run_ms = 0
         self._run_start = 0
         self._last_voiced = 0
+
+    @property
+    def last_voiced_sample(self) -> int:
+        return self._last_voiced
+
+    @property
+    def voiced_end(self) -> int | None:
+        return self._last_voiced if self._in_speech else None
 
     def process(self, frame: AudioFrame16k) -> list:
         samples = np.asarray(frame.samples, dtype=np.float32)

@@ -169,7 +169,7 @@ def test_units_come_from_the_trace_with_each_side_at_its_own_rate(tmp_path):
         json.dumps({"ev": "play.end", "unit": "u1", "out_sample": 50_400}),
         # A committed unit that never played has no take window and must not be scored.
         json.dumps({"ev": "commit.source", "unit": "u2", "span": [100_000, 120_000]}),
-    ]))
+    ]), encoding="utf-8")
     units = D.units_from_trace(trace, source_rate=48_000)
     assert [u["unit"] for u in units] == ["u1"]
     assert units[0]["src_start"] == 1.0 and units[0]["src_end"] == 2.0

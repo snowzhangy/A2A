@@ -15,10 +15,42 @@ from .model_paths import installed_model
 from .protocol import WorkerProcess
 
 
+def derived_translation(model_id: str, quantization: str | None = None, doc: dict | None = None):
+    """The verified CTranslate2 conversion of `model_id` (with `quantization`, the one stored
+    that way), or None when it was never converted (the worker then decodes with PyTorch, or
+    quantizes at load, and says so). A stale or modified conversion is an error: it must be
+    rebuilt rather than silently used."""
+    from ..models import derive
+
+    spec = derive.for_source(model_id, "ctranslate2", doc, quantization)
+    if spec is None:
+        return None
+    try:
+        return derive.check_stamp(spec, doc)
+    except FileNotFoundError:
+        return None
+    except ValueError as error:
+        raise AdapterError(str(error)) from None
+
+
+def derived_translations(model_id: str):
+    """(bfloat16 conversion, stored-int8 conversion or None). The int8 one is an optional
+    load-time shortcut, so it is only offered next to the bfloat16 one."""
+    from ..models import derive
+
+    doc = derive._manifest()
+    primary = derived_translation(model_id, None, doc)
+    return primary, derived_translation(model_id, "int8_bfloat16", doc) if primary is not None else None
+
+
 class _Worker:
-    def __init__(self, stage, model, device, source, target, ready_timeout=600, research_text=False, stop_event=None):
+    def __init__(self, stage, model, device, source, target, ready_timeout=600, research_text=False, stop_event=None,
+                 reserve_bytes=0, load_gate=None, sized_event=None):
+        """`load_gate` (MT): the worker starts now but sizes itself against free GPU memory
+        only once the gate is set; `sized_event` is set when it has (see cli.load_stages)."""
         path = installed_model(model, stage)
         self._ready = threading.Event()
+        self._sized_event = sized_event
         self._lock = threading.RLock()
         self._failure = None
         self.device = None
@@ -28,9 +60,22 @@ class _Worker:
                                       "--source", source, "--target", target]
         if research_text:
             argv.append("--debug-errors")
+        if reserve_bytes > 0:
+            argv += ["--reserve-mb", str(reserve_bytes // 1024**2)]
+        if load_gate is not None:
+            argv.append("--wait-load")
+        if stage == "mt":
+            derived, derived_int8 = derived_translations(model)
+            if derived is not None:
+                argv += ["--derived", str(derived)]
+            if derived_int8 is not None:
+                argv += ["--derived-int8", str(derived_int8)]
         self._worker = WorkerProcess(argv, self._event, self._exit)
         deadline = time.monotonic() + ready_timeout
         while not self._ready.wait(min(0.1, max(0, deadline - time.monotonic()))):
+            if load_gate is not None and load_gate.is_set():
+                self._worker.send({"op": "load"})
+                load_gate = None
             if stop_event is not None and stop_event.is_set():
                 self._exit("worker startup canceled")
                 break
@@ -50,7 +95,10 @@ class _Worker:
         return (self.device or "unknown device") + (f" ({self.note})" if self.note else "")
 
     def _event(self, event, payload):
-        if event.get("ev") == "ready":
+        if event.get("ev") == "sized":
+            if self._sized_event is not None:
+                self._sized_event.set()
+        elif event.get("ev") == "ready":
             self.device = event.get("device")
             self.note = event.get("note")
             self._ready.set()
@@ -78,7 +126,10 @@ class WhisperRecognizer(_Worker):
     # One active request and at most four completed utterances awaiting inference.
     MAX_FINALS = 4
     MAX_HYPOTHESES = 128
-    MAX_SAMPLES = 30 * 16_000
+    # Continuous speech (or speech over music that keeps VAD open) is split into utterances of
+    # at most this length at the quietest point of their last SPLIT_SEARCH samples.
+    MAX_SAMPLES = 20 * 16_000
+    SPLIT_SEARCH = 3 * 16_000
     PARTIAL_SAMPLES = 16_000
 
     def __init__(self, model, language, device="auto", research_text=False, fluent=False, stop_event=None):
@@ -94,8 +145,13 @@ class WhisperRecognizer(_Worker):
         self._partial = None
         self._hypotheses = collections.deque()
         self._since_partial = 0
+        self.dropped_finals = 0
+        self.forced_splits = 0
         super().__init__("asr", model, device, language.whisper_code, language.whisper_code, research_text=research_text,
                          stop_event=stop_event)
+        # Re-decode the growing utterance twice a second on a GPU; LocalAgreement-2 commits a
+        # key once two consecutive hypotheses agree on it, so cadence sets commit latency.
+        self.partial_samples = 8_000 if (self.device or "").startswith("cuda") else self.PARTIAL_SAMPLES
 
     @property
     def pending(self):
@@ -119,15 +175,14 @@ class WhisperRecognizer(_Worker):
             self._samples += len(audio)
             self._frontier = frame.span.end
             # Retain up to two seconds of silence before the next speech onset.
-            limit = self.MAX_SAMPLES if self._speech else 2 * 16_000
             if self._speech and self._samples > self.MAX_SAMPLES:
-                self._exit("speech utterance exceeds the 30-second recognition limit")
-                return
-            while self._samples > limit and self._chunks:
-                self._samples -= len(self._chunks.popleft())
+                self._split_long_utterance()
+            elif not self._speech:
+                while self._samples > 2 * 16_000 and self._chunks:
+                    self._samples -= len(self._chunks.popleft())
             if self._speech:
                 self._since_partial += len(audio)
-                if self._since_partial >= self.PARTIAL_SAMPLES:
+                if self._since_partial >= self.partial_samples:
                     self._since_partial = 0
                     self._partial = self._snapshot(False)
                     self._dispatch()
@@ -139,20 +194,44 @@ class WhisperRecognizer(_Worker):
         return {"id": self._next_id, "utterance": self._utterance, "frontier": self._frontier,
                 "start": start, "final": final, "audio": samples.tobytes()}
 
+    def _split_long_utterance(self):
+        """Finalize everything before the quietest 100 ms of the last three seconds and keep
+        the rest as the start of the next utterance, so no word is cut or repeated."""
+        samples = np.concatenate(tuple(self._chunks))
+        tail = samples[-self.SPLIT_SEARCH:]
+        hop = 1_600
+        energies = [float(np.mean(tail[i:i + hop] ** 2)) for i in range(0, len(tail) - hop + 1, hop // 2)]
+        cut = len(samples) - len(tail) + (int(np.argmin(energies)) * (hop // 2) + hop // 2 if energies else 0)
+        head, rest = samples[:cut], samples[cut:]
+        frontier = self._frontier
+        self._chunks = collections.deque([head])
+        self._samples = len(head)
+        self._frontier = frontier - len(rest) * 3
+        self._queue_final()
+        self._frontier = frontier
+        self._chunks = collections.deque([rest])
+        self._samples = len(rest)
+        self._has_speech = True
+        self.forced_splits += 1
+
+    def _queue_final(self):
+        if len(self._finals) >= self.MAX_FINALS:
+            # Falling behind loses the oldest queued utterance (reported), not the session.
+            self._finals.popleft()
+            self.dropped_finals += 1
+        self._finals.append(self._snapshot(True))
+        self._utterance += 1
+        self._chunks.clear()
+        self._samples = self._since_partial = 0
+        self._has_speech = False
+        self._partial = None
+        self._dispatch()
+
     def request_finalize(self):
         with self._lock:
             if not self._samples or not self._has_speech:
                 return
-            if len(self._finals) >= self.MAX_FINALS:
-                self._exit("recognition fell behind: final queue is full")
-                return
-            self._finals.append(self._snapshot(True))
-            self._utterance += 1
-            self._chunks.clear()
-            self._samples = self._since_partial = 0
-            self._has_speech = False
-            self._partial = None
-            self._dispatch()
+            self._queue_final()
 
     def _dispatch(self):
         if self._active or self._failure:
@@ -163,7 +242,7 @@ class WhisperRecognizer(_Worker):
         if job is self._partial:
             self._partial = None
         self._active = job
-        self._worker.send({"op": "transcribe", "id": job["id"]}, job["audio"])
+        self._worker.send({"op": "transcribe", "id": job["id"], "final": job["final"]}, job["audio"])
 
     def _result(self, event):
         with self._lock:
@@ -211,23 +290,42 @@ class LLMTranslator(_Worker):
     supports_prefix = False
     supports_context = True
 
-    def __init__(self, model, direction, device="auto", research_text=False, stop_event=None):
-        self._response = threading.Event()
-        self._result_value = None
+    def __init__(self, model, direction, device="auto", research_text=False, stop_event=None, reserve_bytes=0,
+                 load_gate=None, sized_event=None):
+        # One waiter per request: the driver may abandon a call (a cancelled unit) and start
+        # the next while the worker is still generating, so replies are matched by id and a
+        # reply nobody waits for any more is dropped rather than treated as a protocol error.
+        self._waiters: dict[int, list] = {}
+        self._unit_requests: dict = {}
         self._request_id = 0
         super().__init__("mt", model, device, direction.source.display_name, direction.target.display_name,
-                         research_text=research_text, stop_event=stop_event)
+                         research_text=research_text, stop_event=stop_event, reserve_bytes=reserve_bytes,
+                         load_gate=load_gate, sized_event=sized_event)
 
     def _wake(self):
-        self._response.set()
+        for waiter in list(self._waiters.values()):
+            waiter[0].set()
 
     def _result(self, event):
         with self._lock:
-            if event.get("id") != self._request_id:
-                self._exit("translation worker returned an unexpected response")
-            else:
-                self._result_value = event
-                self._response.set()
+            waiter = self._waiters.get(event.get("id"))
+        if waiter is not None:
+            waiter[1] = event
+            waiter[0].set()
+
+    def cancel(self, request_id: int) -> None:
+        """Tell the worker to skip a request it has not started (a cancelled unit)."""
+        with self._lock:
+            waiter = self._waiters.pop(request_id, None)
+        if waiter is not None:
+            self._worker.send({"op": "cancel", "id": request_id})
+            waiter[0].set()
+
+    def cancel_unit(self, unit) -> None:
+        with self._lock:
+            request_id = self._unit_requests.pop(unit, None)
+        if request_id is not None:
+            self.cancel(request_id)
 
     def translate(self, request, timeout=120):
         with self._lock:
@@ -236,15 +334,26 @@ class LLMTranslator(_Worker):
             if request.committed_target_prefix:
                 raise AdapterError("translation worker does not support target prefix continuation")
             self._request_id += 1
-            self._result_value = None
-            self._response.clear()
-            self._worker.send({"op": "translate", "id": self._request_id, "text": request.uncommitted_source,
-                               "context": [(p.source, p.target) for p in request.context], "glossary": list(request.glossary)})
-        if not self._response.wait(timeout):
-            self._exit("translation worker timed out")
+            request_id = self._request_id
+            waiter = [threading.Event(), None]
+            self._waiters[request_id] = waiter
+            self._unit_requests[request.unit_id] = request_id
+            self._worker.send({"op": "translate", "id": request_id, "text": request.uncommitted_source,
+                               "context": [(p.source, p.target) for p in request.context],
+                               "glossary": list(request.glossary)})
+        try:
+            if not waiter[0].wait(timeout):
+                self._exit("translation worker timed out")
+        finally:
+            with self._lock:
+                self._waiters.pop(request_id, None)
+                if self._unit_requests.get(request.unit_id) == request_id:
+                    del self._unit_requests[request.unit_id]
         if self.failure:
             raise AdapterError(self.failure)
-        result = self._result_value
+        result = waiter[1]
+        if result is None:
+            raise AdapterError("translation canceled")
         if result.get("ev") == "error":
             raise AdapterError("translation worker failed: " + str(result.get("message", "error")))
         return TranslationCandidate(request.unit_id, result.get("text", ""), result.get("complete", False))

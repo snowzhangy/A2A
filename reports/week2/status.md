@@ -1,5 +1,22 @@
 **Implementation status — 25 October 2026**
 
+6 November, Windows multiplatform slice. The Python reducer now includes ADR-0015 delivery,
+ADR-0016 isolated references, ADR-0017 sentence units/run-ahead, and ADR-0018 following-silence
+and original-voice restoration. The driver streams direct audio to the same Hy protocol, and
+`scripts/build_hy_local.py` produced the pinned CUDA worker; its no-model self-test and both
+fake-worker replay modes pass. Windows Graphics Capture has an in-memory delayed-picture host,
+RNNoise has a residual background bed, and the existing Whisper model supplies LID. These are
+replaceable backends, not claims of Mac model equivalence. Per-line delivery reaches the shared
+TTS worker with verdict/cost counters. Recovery now targets exact audio sessions and process
+creation times under a locked journal, and WASAPI no longer formats errors on its MMCSS thread.
+
+Verification on Windows: `python scripts/check.py` passed 265 runtime tests and 146 harness tests;
+`python scripts/check.py --models` also passed all four installed-model tests.
+the synthetic window capture/decode and real-model English/Mandarin LID smokes passed. The 19.7 GB
+Hy model is not installed, so real Hy inference is untested. Mac `scripts/check.sh`, expanded
+Swift-generated goldens, real A/V sync, soundtrack quality, crash/device acceptance, packaging,
+and other hardware remain open.
+
 2 November, delivery. A pinned speaker profile fixes the right problem for identity and the wrong one
 for acting: a profile is the average of how an actor sounds, so a shout and a murmur come out at the
 same register. dub-anything dubs every line with that line's own clip in the prompt, and its listeners
@@ -27,6 +44,36 @@ reason isolated references are next. Off by default, research-only like cloning 
 judge it. [ADR-0015](../../docs/adr/0015-per-line-delivery-conditioning.md),
 [the parity program](dub-parity.md). Tests: 11 instrument + 9 worker-capability (stub backend) + 4
 reducer permission.
+2 November, Windows. The portable runtime now makes the Mac pipeline's decisions on the reference
+Windows machine (RTX 4090), and `python scripts/check.py --models` passes there: manifest gate, native
+shim, 222 runtime tests (the five goldens byte for byte), the three real-model tests, and 122 harness
+tests against the Windows pipeline (10 had failed after the merge). Three things happened. The 28
+October Windows work in tracked files had been discarded by a reset before the pull; it was rebuilt
+from that session's record (CTranslate2 translation, CUDA-graph voice, the speech-worker fixes, the
+WinRT system voice), and every surviving untracked file it touched matched byte for byte. Then
+`A2ACore` since the import was ported with its Swift suites (11b4470 and 881e53d: clause length
+budget and re-alignment, speaker attribution, carry and pinned voices, target shortening and filler
+silence, ADR-0012 slots, ADR-0013 turn fill, quality-first, adaptive prebuffer), and the driver took
+`a2a-pipeline`'s flags, `tts.done`, dual-clone ordering, idle steps and `--simulate-capture-gap`.
+Windows' own `WordsSegmenter` stands in for NaturalLanguage to keep cuts off Han words, and
+`--tap-global` captures the whole mix (exclude-tree process loopback) while ducking every other app,
+which is the desktop app's default source now, as on the Mac. Two defects in shared code surfaced
+on the first real run: `TorchBackend.generate` lacked the `attempt` parameter the merge made common
+(a silent first take raised `TypeError`), and the worker demanded a reference transcriber for
+OmniVoice on the torch backend too, so every Windows clone session failed at load. Both are fixed
+with the MLX path unchanged; neither fix has run on a Mac.
+
+Live, the six-sentence two-speaker clip (synthetic WinRT speech, SPDIF output): the system voice
+played 6 of 6 at a 3.0 s median lag, WER 0.065. The cloned voice played 6 of 6 where 28 October
+played 4 — a line now waits for its own speaker's voice within the 20 s budget — but the second
+speaker's first line came after the first speaker's next one, which the reducer allows when a voice
+is not ready yet; the live check counts that order as WER 0.32. With an 8 s picture delay every
+phrase that played started 0–20 ms after its slot. One finding is Windows-specific: under WDDM a
+shared GPU pages instead of failing, and with bf16 translation the voice warm-up hung at 100% GPU
+for nine minutes. Translation now leaves 4.5 GiB per voice worker and quantizes to int8 when it must;
+that session then ran with 5 GB spare and translated in a 211 ms median instead of 430 ms. Still
+Mac-only: Hy-SimulMT direct speech translation, `--mt context`, Qwen LiveTranslate, the separated
+background bed, and the delayed picture window (runtime/README.md, *Parity with the Mac pipeline*).
 
 2 November, merge. GitHub's `main` had moved while this tree grew: the published branch carries
 *Add experimental Windows translation runtime and UI* (`runtime/`, with its own ADR-0007). The two

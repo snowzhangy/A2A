@@ -251,7 +251,7 @@ def units_from_trace(trace: Path, source_rate: int = CANONICAL_RATE) -> list[dic
     """
     rates = set()
     spans, start, end = {}, {}, {}
-    for line in trace.read_text().splitlines():
+    for line in trace.read_text(encoding="utf-8").splitlines():
         try:
             e = json.loads(line)
         except json.JSONDecodeError:
@@ -303,8 +303,8 @@ def main(argv=None) -> int:
         if not units.exists():
             source = root / "source.wav"
             source_x, source_rate = read_wav(root / "source.wav")
-            units.write_text(json.dumps(units_from_trace(root / "trace.jsonl", source_rate), indent=1))
-        runs.append({"units": json.loads(units.read_text()),
+            units.write_text(json.dumps(units_from_trace(root / "trace.jsonl", source_rate), indent=1), encoding="utf-8")
+        runs.append({"units": json.loads(units.read_text(encoding="utf-8")),
                      "source": root / "source.wav",
                      "takes": [root / "translated.wav"]})
     if args.source:
@@ -320,7 +320,7 @@ def main(argv=None) -> int:
         source, _ = _load(run["source"])
         # One units file shared by every variant, or one per variant: two runs of the same scene
         # render each line at a different length, so their take windows are not interchangeable.
-        units = [json.loads(u.read_text()) for u in run["units"]]
+        units = [json.loads(u.read_text(encoding="utf-8")) for u in run["units"]]
         pairs = [(take, units[0] if len(units) == 1 else units[n]) for n, take in enumerate(run["takes"])]
         if len(pairs) != len(run["takes"]):
             raise SystemExit("give --units once, or once per --takes file")
@@ -352,7 +352,7 @@ def main(argv=None) -> int:
             print(f"{v['name']:<28}{fmt(v['arousal_corr'])}{fmt(v['pitch_corr'])}{fmt(v['effort_corr'])}"
                   f"{fmt(v['level_corr'])}{fmt(v['dynamics'])}{fmt(v['shape_mae'])}{v['floor_db']:8.1f}")
     if args.json_out:
-        Path(args.json_out).write_text(json.dumps(report, indent=1))
+        Path(args.json_out).write_text(json.dumps(report, indent=1), encoding="utf-8")
     return 0
 
 

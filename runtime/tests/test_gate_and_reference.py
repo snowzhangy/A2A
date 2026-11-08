@@ -3,7 +3,7 @@
 import math
 
 from a2a_runtime.core.playout_gate import PlayoutGate
-from a2a_runtime.core.reference_policy import ReferencePolicy, Rejected
+from a2a_runtime.core.reference_policy import ReferencePlan, ReferencePolicy, ReferencePolicyConfig, Rejected
 from a2a_runtime.core.types import ASRHypothesis, ASRToken, PCMChunkHeader, PCMFormat, SourceSpan, SpeakerID, UnitID
 
 RATE = 48_000
@@ -52,6 +52,29 @@ def final(text, start, end, timed=True):
 
 def seconds(s, at=0.0):
     return SourceSpan(int(at * RATE), int((at + s) * RATE))
+
+
+def test_long_utterances_split_only_at_safe_timed_tokens():
+    policy = ReferencePolicy(SpeakerID("S1"))
+    tokens = tuple(ASRToken(str(i), seconds(1, at=i)) for i in range(12))
+    h = ASRHypothesis(1, tokens, True, 12 * RATE)
+    candidates = policy.reference_candidates(h)
+    assert [c.text for c in candidates] == ["012", "345", "678", "91011"]
+    assert all(policy.speech_span(c).duration_seconds <= policy.config.max_seconds for c in candidates)
+    coarse = ASRHypothesis(1, (ASRToken("whole", seconds(12)),), True, 12 * RATE)
+    assert policy.reference_candidates(coarse) == []
+    overlap = ASRHypothesis(1, (ASRToken("a", seconds(7)), ASRToken("b", seconds(7, at=5))), True, 12 * RATE)
+    assert policy.reference_candidates(overlap) == []
+
+
+def test_locked_reference_never_changes_when_an_actor_returns():
+    policy = ReferencePolicy(SpeakerID("actor-A"), ReferencePolicyConfig(allow_upgrade=False))
+    first = policy.offer(seconds(3.5), "第一句。", -20, 0)
+    assert isinstance(first, ReferencePlan) and first.version == 1 and policy.is_complete
+    assert policy.offer(seconds(6, at=20), "后面的台词。", -20, 0) == Rejected("complete")
+    assert policy.accepted_seconds == 3.5
+    policy.reset(SpeakerID("actor-B"))
+    assert not policy.is_complete and policy.accepted_seconds == 0
 
 
 def test_speech_span_pads_token_timing_and_needs_final_timed_results():
@@ -121,3 +144,24 @@ def test_reset_starts_over_for_a_new_speaker():
     assert policy.accepted_seconds == 0 and not policy.is_complete
     v1 = policy.offer(seconds(3.5), "二。", -20, 0)
     assert v1.speaker == SpeakerID("S2") and v1.version == 1
+
+
+def test_audio_only_segments_that_are_mostly_not_voice_never_become_reference():
+    config = ReferencePolicyConfig(allow_empty_text=True, min_voice_share_db=-10)
+    policy = ReferencePolicy(SpeakerID("S1"), config)
+    assert policy.offer(seconds(3), "", -30, 0, -35) == Rejected("not_voice")
+    assert policy.offer(seconds(3, 3), "", -30, 0, -math.inf) == Rejected("not_voice")
+    assert policy.offer(seconds(3, 6), "", -30, 0, math.nan) == Rejected("not_voice")
+    assert policy.accepted_seconds == 0 and not policy.has_issued_profile
+    plan = policy.offer(seconds(3, 9), "", -30, 0, -1.7)
+    assert plan.version == 1 and [segment.span for segment in plan.segments] == [seconds(3, 9)]
+
+
+def test_voice_share_gates_only_when_configured_and_measured():
+    ungated = ReferencePolicy(SpeakerID("S1"), ReferencePolicyConfig(allow_empty_text=True))
+    assert ungated.offer(seconds(3), "", -30, 0, -40) is not None
+    config = ReferencePolicyConfig(allow_empty_text=True, min_voice_share_db=-10)
+    unmeasured = ReferencePolicy(SpeakerID("S1"), config)
+    assert unmeasured.offer(seconds(3), "", -30, 0) is not None
+    edge = ReferencePolicy(SpeakerID("S1"), config)
+    assert edge.offer(seconds(3), "", -30, 0, -10) is not None

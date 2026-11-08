@@ -30,6 +30,15 @@ class SynthesisCapabilities:
 
 
 @dataclass(frozen=True)
+class DeliveryClip:
+    """One unit's in-memory source audio and recognized words for delivery conditioning."""
+
+    pcm: np.ndarray
+    sample_rate: int
+    source_text: str
+
+
+@dataclass(frozen=True)
 class SynthesizedAudio:
     """One block of synthesized mono or interleaved PCM in the model's native format."""
 

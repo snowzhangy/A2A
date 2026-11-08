@@ -43,14 +43,14 @@ def test_every_phrase_starts_in_its_own_slot(synthetic_fixture, pipeline_binary,
 
 def test_picture_delay_needs_fluent_playout(pipeline_binary):
     result = subprocess.run([str(pipeline_binary), "--stdin", "--presentation-delay-ms", "4000"],
-                            capture_output=True, text=True, timeout=30)
+                            capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert result.returncode != 0
     assert "--presentation-delay-ms requires --fluent" in result.stderr
 
 
 def test_picture_delay_is_bounded(pipeline_binary):
     result = subprocess.run([str(pipeline_binary), "--stdin", "--fluent", "--presentation-delay-ms", "45000"],
-                            capture_output=True, text=True, timeout=30)
+                            capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert result.returncode != 0
     assert "0–30000" in result.stderr
 

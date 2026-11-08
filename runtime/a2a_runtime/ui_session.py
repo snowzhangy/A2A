@@ -23,10 +23,17 @@ class SourceChoice:
     pid: int
     name: str
     active: bool
+    # The whole output mix except A2A itself: the Mac app's only source (`--tap-global`).
+    global_mix: bool = False
 
     @property
     def label(self) -> str:
+        if self.global_mix:
+            return "System audio  ·  everything this PC plays except A2A"
         return f"{self.name}  ·  PID {self.pid}" + ("  ·  active" if self.active else "")
+
+
+SYSTEM_AUDIO = SourceChoice(0, "System audio", True, global_mix=True)
 
 
 @dataclass(frozen=True)
@@ -43,6 +50,15 @@ class SessionOptions:
     output_id: str = ""
     playback: str = "translated"
     device: str = "auto"
+    global_mix: bool = False
+    # "clone": each speaker's own voice (research-only model); "system": a Windows voice per speaker.
+    voice: str = "clone"
+    # Whole phrases before playback, with a 20 s debt and lag budget (the Mac app's toggle).
+    quality_first: bool = False
+    # Delayed Windows Graphics Capture, in milliseconds; 0 disables the picture window.
+    picture_delay_ms: int = 0
+    video_hwnd: int | None = None
+    background: bool = False
 
 
 def choices_from_sessions(sessions, processes, own_pid: int) -> list[SourceChoice]:
@@ -71,7 +87,7 @@ def enumerate_devices() -> tuple[list[SourceChoice], list[OutputChoice]]:
     from .audio import windows as win
 
     sessions, processes = win.audio_sessions(), win.processes()
-    sources = choices_from_sessions(sessions, processes, os.getpid())
+    sources = [SYSTEM_AUDIO] + choices_from_sessions(sessions, processes, os.getpid())
     outputs = [OutputChoice("", "System default")]
     endpoints = win.endpoints()
     for e in endpoints:
@@ -81,13 +97,21 @@ def enumerate_devices() -> tuple[list[SourceChoice], list[OutputChoice]]:
     return sources, outputs
 
 
-def preflight(captions_only: bool) -> None:
+def preflight(captions_only: bool, voice: str = "clone", picture: bool = False, background: bool = False) -> None:
     if sys.platform != "win32":
         raise RuntimeError("This desktop interface requires Windows. On macOS, use the A2A app.")
     if not native.library_path().exists():
         raise RuntimeError("The Windows audio engine is not built. Run: uv run --project runtime python runtime/native/build.py")
+    if picture:
+        missing_video = [name for name in ("windows_capture", "cv2", "PIL") if importlib.util.find_spec(name) is None]
+        if missing_video:
+            raise RuntimeError("Missing delayed-picture dependencies: " + ", ".join(missing_video)
+                               + ". Run: uv sync --project runtime --locked --extra video")
+    if background and not (REPO_ROOT / "runtime" / "separator" / ".venv" / "Scripts" / "python.exe").is_file():
+        raise RuntimeError("Background audio needs: uv sync --project runtime/separator --locked")
     dependencies = ["torch", "faster_whisper", "ctranslate2", "transformers"]
-    if not captions_only:
+    clone = not captions_only and voice == "clone"
+    if clone:
         dependencies.append("omnivoice")
     missing = [name for name in dependencies if importlib.util.find_spec(name) is None]
     if missing:
@@ -96,29 +120,44 @@ def preflight(captions_only: bool) -> None:
     try:
         installed_model("faster-whisper-large-v3", "asr")
         installed_model("qwen3-4b-instruct-2507", "mt")
-        if not captions_only:
+        if clone:
             installed_model("omnivoice-0.6b-torch", "tts")
     except AdapterError as error:
         raise RuntimeError(str(error)) from error
 
 
 def pipeline_command(options: SessionOptions, trace_path: Path, parent_pid: int | None = None) -> list[str]:
-    if options.pid <= 0 or options.direction not in ("zh-en", "en-zh"):
+    if (not options.global_mix and options.pid <= 0) or options.direction not in ("zh-en", "en-zh"):
         raise ValueError("Select a valid audio source and translation direction")
     if options.device not in ("auto", "cuda", "cpu") or options.playback not in ("translated", "original"):
         raise ValueError("Invalid device or playback selection")
-    cmd = [sys.executable, "-u", "-m", "a2a_runtime.cli", "--tap-pid", str(options.pid),
+    if options.voice not in ("clone", "system"):
+        raise ValueError("Invalid voice selection")
+    if options.picture_delay_ms and (options.captions_only or not options.video_hwnd
+                                     or not 1_000 <= options.picture_delay_ms <= 30_000):
+        raise ValueError("Delayed picture needs a source window and a 1–30 second delay")
+    source = ["--tap-global"] if options.global_mix else ["--tap-pid", str(options.pid)]
+    cmd = [sys.executable, "-u", "-m", "a2a_runtime.cli", *source,
            "--direction", options.direction, "--asr", "whisper", "--mt", "llm", "--device", options.device,
            "--events-stdout", "--control-stdin", "--trace", str(trace_path), "--tail-seconds", "3",
            "--parent-pid", str(parent_pid if parent_pid is not None else os.getpid())]
     if options.captions_only:
         cmd += ["--captions-only", "--tts", "tone"]
+        return cmd
+    clone = options.voice == "clone"
+    # The Mac app's session (SessionModel.pipelineArguments), with this host's models.
+    cmd += (["--tts", "clone", "--clone-model", "omnivoice", "--clone-backend", "torch"] if clone else ["--tts", "system"])
+    cmd += ["--translation-only", "--fluent", "--speakers", "auto", "--playback", options.playback]
+    if options.picture_delay_ms:
+        cmd += ["--presentation-delay-ms", str(options.picture_delay_ms)]
+    if options.background:
+        cmd.append("--background")
+    if options.quality_first:
+        cmd.append("--quality-first")
     else:
-        cmd += ["--tts", "clone", "--clone-model", "omnivoice", "--clone-backend", "torch", "--fluent",
-                "--translation-only",
-                "--speakers", "auto", "--playback", options.playback]
-        if options.output_id:
-            cmd += ["--output-device", options.output_id]
+        cmd += ["--adaptive-prebuffer", "--max-debt-seconds", "8", "--max-source-lag-seconds", "20" if clone else "8"]
+    if options.output_id:
+        cmd += ["--output-device", options.output_id]
     return cmd
 
 
@@ -126,6 +165,50 @@ def trace_path() -> Path:
     path = REPO_ROOT / ".local" / "runs" / "windows-ui"
     path.mkdir(parents=True, exist_ok=True)
     return path / f"{uuid.uuid4().hex}.jsonl"
+
+
+class LoadingStages:
+    """Which models are still loading, from the pipeline's fixed start-up lines. The stages
+    load together, so the status names every stage still pending rather than the last one
+    that started."""
+
+    ORDER = ("speech recognition", "translation", "voice")
+    STARTS = (("starting the speech recognition worker", "speech recognition"),
+              ("starting the translation worker", "translation"), ("starting Hy-SimulMT worker", "translation"),
+              ("starting the Windows system voice", "voice"))
+    READY = (("recognizer ready", "speech recognition"), ("translator ready", "translation"),
+             ("Hy-SimulMT worker ready", "translation"), ("voice worker ready", "voice"),
+             ("system voice ready", "voice"))
+
+    def __init__(self) -> None:
+        self.pending: set[str] = set()
+        self.started = False
+
+    def update(self, message: str) -> bool:
+        """True when `message` was a start-up line."""
+        for prefix, stage in self.STARTS:
+            if message.startswith(prefix):
+                self.pending.add(stage)
+                self.started = True
+                return True
+        if message.startswith("starting the") and "voice worker" in message:
+            self.pending.add("voice")
+            self.started = True
+            return True
+        for prefix, stage in self.READY:
+            if message.startswith(prefix):
+                self.pending.discard(stage)
+                return True
+        return False
+
+    @property
+    def text(self) -> str:
+        names = [stage for stage in self.ORDER if stage in self.pending]
+        if not names:
+            return "Starting audio" if self.started else "Loading local models"
+        if len(names) == 1:
+            return f"Loading {names[0]} model"
+        return "Loading " + ", ".join(names[:-1]) + (", and " if len(names) > 2 else " and ") + names[-1] + " models"
 
 
 def voice_progress_text(event: dict) -> str:
@@ -141,6 +224,7 @@ def voice_progress_text(event: dict) -> str:
         "mixed_speakers": "waiting for one speaker at a time",
         "unlabeled": "waiting for a clear speaker match",
         "expired": "recognition is behind; waiting for a newer phrase",
+        "not_voice": "isolated speech is unavailable; try turning off Keep music and effects",
         "quiet": "waiting for clearer audio",
         "clipped": "audio is clipped; lower the source volume",
         "too_long": "waiting for a shorter phrase",

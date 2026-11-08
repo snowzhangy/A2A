@@ -10,7 +10,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from .ui_session import PipelineProcess, SessionOptions, enumerate_devices, preflight, voice_progress_text
+from .ui_session import LoadingStages, PipelineProcess, SessionOptions, enumerate_devices, preflight, voice_progress_text
 
 BG = "#0e1421"
 INK = "#e9eef8"
@@ -26,8 +26,8 @@ class A2AWindow:
     def __init__(self, root: tk.Tk, *, enumerate_on_start: bool = True) -> None:
         self.root = root
         self.root.title("A2A — Live translation")
-        self.root.geometry("960x770")
-        self.root.minsize(820, 660)
+        self.root.geometry("960x900")
+        self.root.minsize(820, 760)
         self.root.configure(bg=BG)
         self.root.option_add("*TCombobox*Listbox.background", CONTROL)
         self.root.option_add("*TCombobox*Listbox.foreground", INK)
@@ -40,10 +40,17 @@ class A2AWindow:
         self.mode = tk.StringVar(value="voice")
         self.playback = tk.StringVar(value="translated")
         self.device = tk.StringVar(value="Automatic")
-        self.status = tk.StringVar(value="Choose an application that is playing audio.")
+        self.status = tk.StringVar(value="Choose System audio or an application that is playing audio.")
+        self.quality_first = tk.BooleanVar(value=False)
+        self.background = tk.BooleanVar(value=False)
+        self.picture = tk.BooleanVar(value=False)
+        self.picture_delay = tk.StringVar(value="8")
+        self.video_var = tk.StringVar()
+        self.video_choices = []
+        self.picture_window = None
         self.mode_hint = tk.StringVar()
         self.loading_started: float | None = None
-        self.loading_phase = ""
+        self.loading = LoadingStages()
         self.sources = []
         self.outputs = []
         self.session: PipelineProcess | None = None
@@ -98,7 +105,9 @@ class A2AWindow:
         self._label(heading, "LIVE TRANSLATION", size=9, color=ACCENT, weight="bold", bg=BG).pack(side="left", padx=12, pady=(8, 0))
         self._label(heading, "Windows preview", size=9, color=MUTED, bg=BG).pack(side="right")
 
-        source = self._section(outer, "Audio source", "Play audio in an app, then choose its session below.")
+        source = self._section(outer, "Audio source",
+                               "System audio translates everything this PC plays except A2A; an application "
+                               "session translates only that app.")
         line = tk.Frame(source, bg=CARD)
         line.pack(fill="x", pady=(10, 0))
         self.source_box = ttk.Combobox(line, state="readonly", textvariable=self.source_var)
@@ -125,21 +134,49 @@ class A2AWindow:
 
         row2 = tk.Frame(settings, bg=CARD)
         row2.pack(fill="x", pady=(12, 0))
-        self.voice_radio = tk.Radiobutton(row2, text="Translated voice", variable=self.mode, value="voice",
-                                          command=self._update_controls, bg=CARD, fg=INK, activebackground=CARD,
-                                          selectcolor=CARD, disabledforeground=MUTED,
-                                          font=("Segoe UI", 10), highlightthickness=0)
+        radio = dict(variable=self.mode, command=self._update_controls, bg=CARD, fg=INK, activebackground=CARD,
+                     selectcolor=CARD, disabledforeground=MUTED, font=("Segoe UI", 10), highlightthickness=0)
+        self.voice_radio = tk.Radiobutton(row2, text="Original voices", value="voice", **radio)
         self.voice_radio.pack(side="left")
-        self.caption_radio = tk.Radiobutton(row2, text="Captions only", variable=self.mode, value="captions",
-                                            command=self._update_controls, bg=CARD, fg=INK, activebackground=CARD,
-                                            selectcolor=CARD, disabledforeground=MUTED,
-                                            font=("Segoe UI", 10), highlightthickness=0)
+        self.system_radio = tk.Radiobutton(row2, text="System voice", value="system", **radio)
+        self.system_radio.pack(side="left", padx=(15, 0))
+        self.caption_radio = tk.Radiobutton(row2, text="Captions only", value="captions", **radio)
         self.caption_radio.pack(side="left", padx=15)
         self._label(row2, "Compute", size=9, color=MUTED).pack(side="left", padx=(20, 7))
         self.device_box = ttk.Combobox(row2, state="readonly", width=12, textvariable=self.device,
                                      values=("Automatic", "NVIDIA GPU", "CPU"))
         self.device_box.pack(side="left")
+        self.quality_check = tk.Checkbutton(settings, text="Prioritize complete phrases (more delay, fewer skipped lines)",
+                                            variable=self.quality_first, bg=CARD, fg=INK, activebackground=CARD,
+                                            activeforeground=INK, selectcolor=CARD, disabledforeground=MUTED,
+                                            font=("Segoe UI", 10), highlightthickness=0, anchor="w")
+        self.quality_check.pack(fill="x", pady=(10, 0))
         self._label(settings, "", textvariable=self.mode_hint, size=9, color=MUTED, anchor="w").pack(fill="x", pady=(8, 0))
+
+        playback = self._section(outer, "Playback settings",
+                                 "Show a selected window late so translated speech meets the actor. "
+                                 "Frames stay in memory and disappear when the session stops.")
+        self.background_check = tk.Checkbutton(playback, text="Keep music and effects (experimental RNNoise bed)",
+                                               variable=self.background, command=self._update_controls,
+                                               bg=CARD, fg=INK, activebackground=CARD, activeforeground=INK,
+                                               selectcolor=CARD, disabledforeground=MUTED,
+                                               font=("Segoe UI", 10), highlightthickness=0, anchor="w")
+        self.background_check.pack(fill="x", pady=(10, 0))
+        self.picture_check = tk.Checkbutton(playback, text="Match picture to translated speech",
+                                            variable=self.picture, command=self._toggle_picture,
+                                            bg=CARD, fg=INK, activebackground=CARD, activeforeground=INK,
+                                            selectcolor=CARD, disabledforeground=MUTED,
+                                            font=("Segoe UI", 10), highlightthickness=0, anchor="w")
+        self.picture_check.pack(fill="x", pady=(10, 0))
+        picture_row = tk.Frame(playback, bg=CARD)
+        picture_row.pack(fill="x", pady=(10, 0))
+        self._label(picture_row, "Window", size=9, color=MUTED).pack(side="left", padx=(0, 7))
+        self.video_box = ttk.Combobox(picture_row, state="readonly", textvariable=self.video_var)
+        self.video_box.pack(side="left", fill="x", expand=True)
+        self._label(picture_row, "Delay (s)", size=9, color=MUTED).pack(side="left", padx=(12, 7))
+        self.delay_box = ttk.Combobox(picture_row, state="readonly", width=4, textvariable=self.picture_delay,
+                                      values=("4", "6", "8", "10", "12"))
+        self.delay_box.pack(side="left")
 
         actions = tk.Frame(outer, bg=BG)
         actions.pack(fill="x", pady=(0, 8))
@@ -203,56 +240,110 @@ class A2AWindow:
         self.sources, self.outputs = data
         self.source_box["values"] = [s.label for s in self.sources]
         self.output_box["values"] = [o.name for o in self.outputs]
-        selected = next((i for i, s in enumerate(self.sources) if s.pid == old_source), -1)
+        # System audio (the first choice) is the default, as in the Mac app.
+        selected = next((i for i, s in enumerate(self.sources) if s.pid == old_source), 0 if self.sources else -1)
         if selected >= 0:
             self.source_box.current(selected)
         else:
             self.source_var.set("")
         self.output_box.current(next((i for i, o in enumerate(self.outputs) if o.id == old_output), 0))
-        self.status.set("Select an application, then start translation." if self.sources
+        self.status.set("Choose a source, then start translation." if self.sources
                         else "No audio sessions found. Start playback in an app and press Refresh.")
         self._update_controls()
+
+    def _toggle_picture(self) -> None:
+        if self.picture.get():
+            self.refresh_windows()
+        self._update_controls()
+
+    def refresh_windows(self) -> None:
+        from .video.windows import enumerate_windows
+
+        self.video_choices = enumerate_windows()
+        self.video_box["values"] = [choice.label for choice in self.video_choices]
+        if self.video_choices and self.video_box.current() < 0:
+            self.video_box.current(0)
+        elif not self.video_choices:
+            self.video_var.set("No shareable windows found")
+
+    def _stop_picture(self) -> None:
+        if self.picture_window is not None:
+            self.picture_window.stop()
+            self.picture_window = None
 
     def _update_controls(self) -> None:
         busy = self.session is not None
         for box in (self.source_box, self.direction_box, self.output_box, self.device_box):
             box.configure(state="disabled" if busy else "readonly")
-        for radio in (self.voice_radio, self.caption_radio):
+        for radio in (self.voice_radio, self.system_radio, self.caption_radio, self.quality_check,
+                      self.background_check, self.picture_check):
             radio.configure(state="disabled" if busy else "normal")
+        for box in (self.video_box, self.delay_box):
+            box.configure(state="disabled" if busy or self.mode.get() == "captions" or not self.picture.get() else "readonly")
+        if self.mode.get() == "captions":
+            self.picture_check.configure(state="disabled")
+            self.background_check.configure(state="disabled")
+        if self.mode.get() == "captions":
+            self.quality_check.configure(state="disabled")
         valid_source = 0 <= self.source_box.current() < len(self.sources)
         self.start_button.configure(state="disabled" if busy or not valid_source else "normal")
         self.stop_button.configure(state="normal" if busy and not self.stopping else "disabled")
         self.refresh_button.configure(state="disabled" if busy else "normal")
         self.listen_box.configure(state="disabled" if self.mode.get() == "captions" or self.stopping else "readonly")
-        self.mode_hint.set("Captions only: original audio stays on; no translated speech is played."
-                           if self.mode.get() == "captions" else
-                           "Translated voice: initial silence while voices are prepared. Speaker consent is required.")
+        self.mode_hint.set({
+            "captions": "Captions only: original audio stays on; no translated speech is played.",
+            "system": "System voice: a Windows voice per speaker, cast by pitch. It does not sound like the speakers.",
+        }.get(self.mode.get(), "Original voices: initial silence while each speaker's voice is learned "
+                               "(research-only model). Speaker consent is required."))
 
     def start(self) -> None:
         index = self.source_box.current()
         if self.session or not (0 <= index < len(self.sources)):
             return
         captions_only = self.mode.get() == "captions"
+        voice = "system" if self.mode.get() == "system" else "clone"
         try:
-            preflight(captions_only)
+            picture = self.picture.get() and not captions_only
+            if picture and not (0 <= self.video_box.current() < len(self.video_choices)):
+                raise RuntimeError("Choose a window for the delayed picture.")
+            preflight(captions_only, voice, picture=picture,
+                      background=self.background.get() and not captions_only)
             output_index = self.output_box.current()
             output = self.outputs[output_index].id if 0 <= output_index < len(self.outputs) else ""
-            options = SessionOptions(pid=self.sources[index].pid,
+            source = self.sources[index]
+            options = SessionOptions(pid=source.pid, global_mix=source.global_mix,
                                      direction="zh-en" if self.direction.get().startswith("Mandarin") else "en-zh",
                                      captions_only=captions_only, output_id=output, playback=self.playback.get(),
-                                     device={"Automatic": "auto", "NVIDIA GPU": "cuda", "CPU": "cpu"}[self.device.get()])
+                                     device={"Automatic": "auto", "NVIDIA GPU": "cuda", "CPU": "cpu"}[self.device.get()],
+                                     voice=voice, quality_first=self.quality_first.get(),
+                                     picture_delay_ms=int(self.picture_delay.get()) * 1000 if picture else 0,
+                                     video_hwnd=self.video_choices[self.video_box.current()].hwnd if picture else None,
+                                     background=self.background.get() and not captions_only)
             self.session = PipelineProcess(options)
+            if picture:
+                from .video.capture import DelayedCapture
+                from .video.tk import DelayedPictureWindow
+
+                capture = DelayedCapture(options.video_hwnd, options.picture_delay_ms)
+                self.picture_window = DelayedPictureWindow(self.root, capture, self._video_error)
         except Exception as error:
+            self._stop_picture()
+            if self.session is not None:
+                self.session.stop()
+                self.session = None
             self.status.set("Unable to start. Check setup and try again.")
             messagebox.showerror("Cannot start A2A", str(error), parent=self.root)
             return
         self._clear_captions()
         self.stopping = False
         self.loading_started = time.monotonic()
-        self.loading_phase = "Loading local models"
+        self.loading = LoadingStages()
         self.status.set("Loading local models. This can take a few minutes…")
         self.progress.start(12)
         self._update_controls()
+
+    def _video_error(self, message: str) -> None:
+        self.status.set("Delayed picture stopped: " + message)
 
     def set_playback(self, _event=None) -> None:
         if self.session and not self.stopping and self.mode.get() != "captions":
@@ -264,6 +355,7 @@ class A2AWindow:
         if not self.session or self.stopping:
             return
         self.stopping = True
+        self._stop_picture()
         self.loading_started = None
         self.status.set("Stopping and restoring source audio…")
         self.session.stop()
@@ -299,15 +391,13 @@ class A2AWindow:
             return "Captions live · Original audio remains on."
         if self.playback.get() == "original":
             return "Listening to original audio · Translation continues."
+        if self.mode.get() == "system":
+            return "Listening to translated speech in system voices."
         return "Listening to translated voice · Waiting for each speaker's voice if needed."
 
     def _status_update(self, message: str) -> None:
-        if message.startswith("starting the translation worker"):
-            self.loading_phase = "Loading translation model"
-        elif message.startswith("starting the speech recognition worker"):
-            self.loading_phase = "Loading speech recognition model"
-        elif message.startswith("starting the") and "voice worker" in message:
-            self.loading_phase = "Loading voice model"
+        if self.loading.update(message):
+            pass
         elif message.startswith("live:"):
             self.loading_started = None
             self.progress.stop()
@@ -348,6 +438,7 @@ class A2AWindow:
                 self.loading_started = None
                 self._clear_captions()
                 failure = self.session.last_failure
+                self._stop_picture()
                 self.session = None
                 self.status.set("Session stopped." if code == 0 else
                                 failure or "Session ended with an error. Check the source volume and model setup.")
@@ -358,7 +449,7 @@ class A2AWindow:
                 self._update_controls()
             elif self.loading_started is not None and not self.stopping:
                 elapsed = int(time.monotonic() - self.loading_started)
-                self.status.set(f"{self.loading_phase}… {elapsed}s · First startup may take a few minutes.")
+                self.status.set(f"{self.loading.text}… {elapsed}s · First startup may take a few minutes.")
         self.root.after(100, self._poll)
 
 

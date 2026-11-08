@@ -19,10 +19,33 @@ import numpy as np
 from ..core.direction import TranslationLanguage
 from ..core.types import PCMFormat, PreparedVoice, VoiceProfile
 from ..media.resampler import StreamingResampler
-from ..models.base import AdapterError, SynthesisCapabilities, SynthesizedAudio
+from ..models.base import AdapterError, DeliveryClip, SynthesisCapabilities, SynthesizedAudio
 from .protocol import WorkerProcess
 
 SAMPLE_RATE = 24_000
+
+
+@dataclass(frozen=True)
+class CloneSynthesisStats:
+    """Worker-side pacing of one completed unit: numbers only, no text or audio."""
+
+    # WSOLA pacing applied to fit the source span: above 1 a long take was sped up, below 1 a
+    # short one was slowed to end with the actor (fill), 1 = no pacing.
+    pace: float
+    # Shaped audio before pacing and quiet-run compaction.
+    native_seconds: float
+    # Audio actually sent to the host.
+    audio_seconds: float
+    quiet_removed_seconds: float
+    # Character-count duration budget the worker enforced, and whether it stopped generation.
+    budget_seconds: float = 0.0
+    truncated: bool = False
+    # Takes discarded because they produced no voiced audio before the silent-take limit.
+    retries: int = 0
+    # Per-line conditioning verdict and its appended-audio/preparation cost (ADR-0015).
+    delivery: str = "absent"
+    delivery_seconds: float = 0.0
+    delivery_prep_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -61,10 +84,14 @@ class _Stream:
 
 class CloneVoiceSynthesizer:
     name = "clone"
+    # Takes `allow_fill`: a slotted host may let the worker slow a short take (ADR-0013).
+    supports_fill = True
 
     def __init__(self, argv: list[str], conditioning: str = "icl",
                  target_language: TranslationLanguage = TranslationLanguage.ENGLISH, ready_timeout: float = 600,
-                 stop_event: threading.Event | None = None) -> None:
+                 stop_event: threading.Event | None = None, load_gate: threading.Event | None = None) -> None:
+        """`load_gate`: the worker starts now (imports, weight hashes) but loads its weights
+        onto the device only once the gate is set (see cli.load_stages)."""
         self.conditioning = conditioning
         self.target_language = target_language
         self.info: CloneWorkerInfo | None = None
@@ -73,10 +100,16 @@ class CloneVoiceSynthesizer:
         self._lock = threading.Lock()
         self._prepares: dict[str, list] = {}
         self._streams: dict[int, _Stream] = {}
+        self._units: dict[int, int] = {}  # stream id -> unit
+        self._stats: dict[int, CloneSynthesisStats] = {}  # unit -> pacing of its completed take
         self._next_id = 0
-        self._worker = WorkerProcess(argv, self._on_event, self._on_exit)
+        self._worker = WorkerProcess(argv + (["--wait-load"] if load_gate is not None else []), self._on_event,
+                                     self._on_exit)
         deadline = time.monotonic() + ready_timeout
         while not self._ready.wait(min(0.1, max(0, deadline - time.monotonic()))):
+            if load_gate is not None and load_gate.is_set():
+                self._worker.send({"op": "load"})
+                load_gate = None
             if stop_event is not None and stop_event.is_set():
                 self._fail("worker startup canceled")
                 break
@@ -126,18 +159,36 @@ class CloneVoiceSynthesizer:
             raise AdapterError(slot[1])
         return PreparedVoice(profile.speaker_id, profile.version, profile.version)
 
-    def synthesize(self, unit: int, text: str, voice: PreparedVoice, target_seconds: float | None = None) -> _Stream:
+    def synthesize(self, unit: int, text: str, voice: PreparedVoice, target_seconds: float | None = None,
+                   allow_fill: bool = False, lane: int = 0, delivery: DeliveryClip | None = None) -> _Stream:
         with self._lock:
             if self._failure:
                 raise AdapterError(self._failure)
             self._next_id += 1
             stream = _Stream(self, self._next_id)
             self._streams[stream.id] = stream
+            self._units[stream.id] = unit
         request = {"op": "synth", "id": stream.id, "voice": self.key(voice.speaker_id, voice.profile_version), "text": text}
         if target_seconds is not None and target_seconds > 0:
             request["target_s"] = target_seconds
-        self._worker.send(request)
+            # Only a slotted host may slow a take; see SynthesisJob.allow_fill.
+            if allow_fill:
+                request["fill"] = True
+        payload = b""
+        if delivery is not None and len(delivery.pcm):
+            request["delivery"] = True
+            if delivery.source_text:
+                request["delivery_text"] = delivery.source_text
+            pcm = (delivery.pcm if delivery.sample_rate == SAMPLE_RATE else
+                   StreamingResampler.resample(delivery.pcm, delivery.sample_rate, SAMPLE_RATE))
+            payload = np.asarray(pcm, dtype="<f4").tobytes()
+        self._worker.send(request, payload)
         return stream
+
+    def take_stats(self, unit: int) -> CloneSynthesisStats | None:
+        """Pacing of a unit whose synthesis completed, once; None when canceled or unknown."""
+        with self._lock:
+            return self._stats.pop(unit, None)
 
     # MARK: Protocol events (reader thread)
 
@@ -163,12 +214,29 @@ class CloneVoiceSynthesizer:
                 self._streams.pop(stream.id, None)
                 stream.q.put(("error", "synthesis consumer fell behind"))
         elif kind == "done":
-            stream = self._streams.pop(int(event["id"]), None)
+            job = int(event["id"])
+            with self._lock:
+                unit = self._units.pop(job, None)
+                if unit is not None and not event.get("canceled"):
+                    # Bounded: the driver takes each entry when the unit finishes.
+                    if len(self._stats) >= 64:
+                        self._stats.clear()
+                    self._stats[unit] = CloneSynthesisStats(
+                        pace=float(event.get("pace") or 1.0), native_seconds=float(event.get("native_s") or 0),
+                        audio_seconds=float(event.get("audio_s") or 0),
+                        quiet_removed_seconds=float(event.get("quiet_samples_removed") or 0) / SAMPLE_RATE,
+                        budget_seconds=float(event.get("budget_s") or 0), truncated=bool(event.get("truncated")),
+                        retries=int(event.get("retries") or 0), delivery=str(event.get("delivery") or "absent"),
+                        delivery_seconds=float(event.get("delivery_s") or 0),
+                        delivery_prep_seconds=float(event.get("delivery_prep_s") or 0))
+            stream = self._streams.pop(job, None)
             if stream:
                 stream.q.put(("done", None))
         elif kind == "error":
             message = str(event.get("message", "worker error"))
             if event.get("id") is not None:
+                with self._lock:
+                    self._units.pop(int(event["id"]), None)
                 stream = self._streams.pop(int(event["id"]), None)
                 if stream:
                     stream.q.put(("error", message))
@@ -189,6 +257,7 @@ class CloneVoiceSynthesizer:
                 self._failure = message
             prepares, self._prepares = list(self._prepares.values()), {}
             streams, self._streams = list(self._streams.values()), {}
+            self._units.clear()
         for slot in prepares:
             slot[1] = message
             slot[0].set()

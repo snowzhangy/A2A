@@ -131,6 +131,8 @@ struct a2a_wasapi {
 
     std::atomic<int32_t> state{A2A_WASAPI_STARTING};
     std::atomic<int32_t> hresult{0};
+    // Static string literal selected on the RT thread; formatting happens in get_stats.
+    std::atomic<const char *> failure_reason{nullptr};
     std::atomic<uint64_t> capture_packets{0}, capture_frames{0}, capture_silent{0}, capture_discontinuities{0};
     std::atomic<uint64_t> capture_ts_errors{0}, render_wakeups{0}, render_frames{0}, render_full{0}, timeouts{0};
     std::atomic<uint64_t> last_capture_ns{0};
@@ -142,7 +144,6 @@ struct a2a_wasapi {
     // Written by the engine thread before it signals `ready_event` (or before a failure state).
     uint32_t render_buffer_frames = 0, mix_rate = 0, mix_channels = 0;
     double latency_ms = 0;
-    char message[256] = {};
     char device[256] = {};
 
     // Preallocated before the loop: the silent-packet source and the gain scratch.
@@ -153,7 +154,8 @@ struct a2a_wasapi {
 namespace {
 
 void fail(a2a_wasapi *s, HRESULT hr, const char *what) {
-    std::snprintf(s->message, sizeof s->message, "%s (HRESULT 0x%08lX)", what, (unsigned long)hr);
+    // RT-safe: no formatting, allocation, or logging on the MMCSS thread.
+    s->failure_reason.store(what, std::memory_order_relaxed);
     s->hresult.store((int32_t)hr, std::memory_order_relaxed);
     s->state.store(A2A_WASAPI_FAILED, std::memory_order_release);
 }
@@ -495,7 +497,11 @@ void a2a_wasapi_get_stats(a2a_wasapi *s, a2a_wasapi_stats *out) {
     out->render_mix_rate = s->mix_rate;
     out->render_mix_channels = s->mix_channels;
     out->render_latency_ms = s->latency_ms;
-    std::memcpy(out->message, s->message, sizeof out->message);
+    const char *reason = s->failure_reason.load(std::memory_order_relaxed);
+    if (reason) {
+        std::snprintf(out->message, sizeof out->message, "%s (HRESULT 0x%08lX)", reason,
+                      (unsigned long)(uint32_t)out->hresult);
+    }
     std::memcpy(out->render_device, s->device, sizeof out->render_device);
 }
 
@@ -568,6 +574,11 @@ int32_t a2a_wasapi_list_sessions(a2a_session_info *out, int32_t max) {
             utf8(name, info.display_name, sizeof info.display_name);
             CoTaskMemFree(name);
         }
+        LPWSTR identifier = nullptr;
+        if (SUCCEEDED(control->GetSessionIdentifier(&identifier))) {
+            utf8(identifier, info.session_id, sizeof info.session_id);
+            CoTaskMemFree(identifier);
+        }
         std::snprintf(info.endpoint, sizeof info.endpoint, "%s", endpoint);
         info.pid = pid;
         info.state = (int32_t)state;
@@ -604,6 +615,40 @@ int32_t a2a_wasapi_set_session_volume(const uint32_t *pids, int32_t count, float
         bool target = false;
         for (int32_t i = 0; i < count && !target; i++) target = pids[i] == pid;
         if (target && SUCCEEDED(volume->SetMasterVolume(clamped, nullptr))) changed++;
+    });
+    return FAILED(hr) ? (int32_t)hr : changed;
+}
+
+int32_t a2a_wasapi_set_session_volume_by_id(const char *session_id, float level) {
+    if (!session_id || !*session_id) return E_INVALIDARG;
+    int32_t changed = 0;
+    const float clamped = level < 0 ? 0.0f : (level > 1 ? 1.0f : level);
+    HRESULT hr = for_each_session([&](IAudioSessionControl2 *control, ISimpleAudioVolume *volume, const char *) {
+        LPWSTR identifier = nullptr;
+        char current[256] = {};
+        if (SUCCEEDED(control->GetSessionIdentifier(&identifier))) {
+            utf8(identifier, current, sizeof current);
+            CoTaskMemFree(identifier);
+        }
+        if (!std::strcmp(current, session_id) && SUCCEEDED(volume->SetMasterVolume(clamped, nullptr))) changed++;
+    });
+    return FAILED(hr) ? (int32_t)hr : changed;
+}
+
+int32_t a2a_wasapi_set_session_mute_by_id(const char *session_id, int32_t mute) {
+    if (!session_id || !*session_id) return E_INVALIDARG;
+    int32_t changed = 0;
+    HRESULT hr = for_each_session([&](IAudioSessionControl2 *control, ISimpleAudioVolume *volume, const char *) {
+        LPWSTR identifier = nullptr;
+        char current[256] = {};
+        if (SUCCEEDED(control->GetSessionIdentifier(&identifier))) {
+            utf8(identifier, current, sizeof current);
+            CoTaskMemFree(identifier);
+        }
+        if (std::strcmp(current, session_id)) return;
+        BOOL value = FALSE;
+        volume->GetMute(&value);
+        if ((value != FALSE) != (mute != 0) && SUCCEEDED(volume->SetMute(mute ? TRUE : FALSE, nullptr))) changed++;
     });
     return FAILED(hr) ? (int32_t)hr : changed;
 }

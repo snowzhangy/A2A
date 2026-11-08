@@ -443,6 +443,8 @@ class TorchBackend:
         self.device = ""
         self.streaming = False
         self.native_speed = False
+        # Returns when the host lets this worker claim device memory (--wait-load).
+        self.gate = lambda: None
 
     def load(self) -> None:
         os.environ["HF_HUB_OFFLINE"] = "1"
@@ -451,12 +453,33 @@ class TorchBackend:
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
         from voice_clone import verified_model  # verifies every manifest hash
         from voice_models import selection
-        from tts_torch_adapters import device_label, load_adapter, pick_device
 
         entries = selection(self.model_key, backend="torch")
-        paths = {entry["id"]: verified_model(entry["id"])[0] for entry in entries}
+        # Hash the weights (3.7 s for OmniVoice) while torch and the model package import
+        # (5-40 s on Windows). hashlib releases the GIL, and no weight is read for loading
+        # until every hash has matched.
+        verified: dict = {}
+
+        def verify() -> None:
+            try:
+                verified["paths"] = {entry["id"]: verified_model(entry["id"])[0] for entry in entries}
+            except BaseException as error:
+                verified["error"] = error
+
+        hashing = threading.Thread(target=verify, name="a2a.verify", daemon=True)
+        hashing.start()
+        try:
+            from tts_torch_adapters import device_label, import_model_package, load_adapter, pick_device
+
+            device = pick_device(self.requested_device)
+            import_model_package(self.model_key)
+        finally:
+            hashing.join()
+        if "error" in verified:
+            raise verified["error"]
+        paths = verified["paths"]
         entry = entries[-1]
-        device = pick_device(self.requested_device)
+        self.gate()
         self.adapter = load_adapter(self.model_key, paths[entry["id"]], device)
         self.name = f"{entry['id']}@{entry['upstream']['revision'][:12]}"
         self.device = device_label(device)
@@ -464,6 +487,10 @@ class TorchBackend:
         self.native_speed = getattr(self.adapter, "native_speed", False)
 
     def prepare(self, voice: Voice) -> None:
+        if self.model_key == "omnivoice" and not voice.text.strip():
+            # The portable host conditions on its own recognizer's transcript (icl); this backend
+            # has no reference transcriber for audio-only (xvector) references.
+            raise ValueError("this model needs the reference transcript; use --clone-mode icl")
         voice.native = self.adapter.prepare(voice)
         # Measure this voice's output level and pace on shaped audio, as ModelBackend does.
         warm = array.array("f")
@@ -476,7 +503,9 @@ class TorchBackend:
         shaped = len(Shaper(None, 1.0).process(warm)) or len(warm)
         voice.seconds_per_character = shaped / RATE / len(warm_text)
 
-    def generate(self, voice: Voice, text: str, interval: float, speed: float = 1.0):
+    def generate(self, voice: Voice, text: str, interval: float, attempt: int = 0, speed: float = 1.0):
+        # The shared contract (FakeBackend, ModelBackend): `attempt` is accepted and ignored here,
+        # since a retry already differs by its text and the adapter draws a fresh sample.
         step = max(1, int(RATE * interval))
         for audio in self.adapter.generate(voice, text, speed):
             pcm = array.array("f")
@@ -757,6 +786,9 @@ def main() -> None:
                         help="mlx on Apple silicon (default); torch for CUDA, MPS, or CPU (ADR-0007)")
     parser.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto",
                         help="torch backend device")
+    parser.add_argument("--wait-load", action="store_true",
+                        help="start now, but load weights onto the device only after the host's load frame "
+                             "(the portable host starts its stages together; GPU memory is claimed in order)")
     parser.add_argument("--max-delivery-seconds", type=float, default=4.0,
                         help="longest slice of the actor's own line appended to a reference (ADR-0015)")
     args = parser.parse_args()
@@ -770,9 +802,29 @@ def main() -> None:
     else:
         backend = ModelBackend(args.model, args.temperature, args.reference_transcriber, args.reference_locale)
     backend.speech_budget_multiplier = 1.5 if args.longer_speech_budget else 1.0
+
+    waited = 0.0  # spent at the host's gate, not loading
+
+    def wait_for_load() -> None:
+        nonlocal waited
+        began = time.perf_counter()
+        frame = channel.receive()
+        if frame is None:
+            sys.exit(0)  # the host stopped during start-up
+        if frame[0].get("op") != "load":
+            raise RuntimeError("expected the host's load signal")
+        waited += time.perf_counter() - began
+
+    gate = wait_for_load if args.wait_load else (lambda: None)
+    if isinstance(backend, TorchBackend):
+        backend.gate = gate  # after imports and hashing, before the weights
     started = time.perf_counter()
     try:
-        if not args.fake and args.model in ("audio8", "omnivoice"):
+        if not isinstance(backend, TorchBackend):
+            gate()
+        # The MLX path transcribes audio-only references itself. The torch path gets the
+        # transcript from the host's recognizer with each reference (icl), so it needs none.
+        if not args.fake and args.backend == "mlx" and args.model in ("audio8", "omnivoice"):
             if not args.reference_transcriber:
                 raise RuntimeError("Audio8 and OmniVoice require a local reference transcriber")
             try:
@@ -781,14 +833,14 @@ def main() -> None:
             except (OSError, subprocess.SubprocessError):
                 raise RuntimeError("Install the source-language speech assets to prepare voice references") from None
         backend.load()
-        loaded = time.perf_counter() - started
+        loaded = time.perf_counter() - started - waited
         if hasattr(backend, "warmup"):
             backend.warmup()
     except Exception as error:
         channel.send({"ev": "error", "message": f"load failed: {type(error).__name__}: {error}"})
         sys.exit(1)
     channel.send({"ev": "ready", "model": getattr(backend, "name", "fake"), "load_s": loaded,
-                  "warmup_s": time.perf_counter() - started - loaded, "rate": RATE,
+                  "warmup_s": time.perf_counter() - started - waited - loaded, "rate": RATE,
                   "streaming": backend.streaming, "selected_model": args.model,
                   "backend": "fake" if args.fake else args.backend, "device": getattr(backend, "device", None) or None})
     Worker(backend, channel, args.interval, args.research_text, args.max_delivery_seconds).run()

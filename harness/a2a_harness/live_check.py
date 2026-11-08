@@ -142,6 +142,8 @@ def check(run: Path, expected_path: Path, transcript_path: Path | None = None) -
         "tap_muted": tap.get("muted"),
         "capture_overflow_frames": tap.get("capture_overflow_frames"),
         "underruns": summary.get("underruns"),
+        "asr_dropped_finals": summary.get("asr_dropped_finals", 0),
+        "asr_forced_splits": summary.get("asr_forced_splits", 0),
         "thresholds": {"max_debt_seconds": summary.get("max_debt_seconds"),
                        "max_source_lag_seconds": summary.get("max_source_lag_seconds")},
     }
@@ -162,6 +164,8 @@ def check(run: Path, expected_path: Path, transcript_path: Path | None = None) -
         failures.append(f"{len(errors)} error events")
     if validation.trace_drops:
         failures.append(f"{validation.trace_drops} trace drops")
+    if summary.get("asr_dropped_finals", 0):
+        failures.append(f"{summary['asr_dropped_finals']} ASR finals dropped")
     if not validation.ok:
         failures.append("trace schema errors")
     if tap.get("muted") is not True:

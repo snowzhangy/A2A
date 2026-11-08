@@ -76,7 +76,7 @@ def _rms_db(x: np.ndarray) -> float:
 def _emit(result: dict, path: str | None) -> None:
     print(json.dumps(result, indent=1, default=str))
     if path:
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8") as fh:
             json.dump(result, fh, indent=1, default=str)
 
 

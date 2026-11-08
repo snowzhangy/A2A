@@ -76,7 +76,7 @@ class WasapiStats(C.Structure):
 
 class SessionInfo(C.Structure):
     _fields_ = [("pid", C.c_uint32), ("state", C.c_int32), ("muted", C.c_int32), ("volume", C.c_float),
-                ("display_name", C.c_char * 128), ("endpoint", C.c_char * 128)]
+                ("display_name", C.c_char * 128), ("endpoint", C.c_char * 128), ("session_id", C.c_char * 256)]
 
 
 LOOPBACK_INCLUDE_TREE, LOOPBACK_EXCLUDE_TREE = 0, 1
@@ -120,6 +120,10 @@ def lib():
         "a2a_engine_destroy": (None, [P]),
         "a2a_engine_capture_ring": (P, [P]),
         "a2a_engine_translated_ring": (P, [P]),
+        "a2a_engine_enable_background": (C.c_bool, [P, U32]),
+        "a2a_engine_background_ring": (P, [P]),
+        "a2a_engine_set_background_gain": (None, [P, F, U32]),
+        "a2a_engine_current_background_gain": (F, [P]),
         "a2a_engine_rendered_ring": (P, [P]),
         "a2a_engine_records": (P, [P]),
         "a2a_engine_set_input_channel_offset": (None, [P, U32]),
@@ -148,6 +152,8 @@ def lib():
             "a2a_wasapi_list_sessions": (I32, [C.POINTER(SessionInfo), I32]),
             "a2a_wasapi_set_session_mute": (I32, [C.POINTER(C.c_uint32), I32, I32]),
             "a2a_wasapi_set_session_volume": (I32, [C.POINTER(C.c_uint32), I32, F]),
+            "a2a_wasapi_set_session_volume_by_id": (I32, [C.c_char_p, F]),
+            "a2a_wasapi_set_session_mute_by_id": (I32, [C.c_char_p, I32]),
             "a2a_wasapi_default_render_id": (I32, [C.c_char_p, I32]),
         })
     for name, (restype, argtypes) in sig.items():
@@ -228,6 +234,7 @@ class Engine:
         self.translated = Ring(lib().a2a_engine_translated_ring(self.h))
         rendered = lib().a2a_engine_rendered_ring(self.h)
         self.rendered = Ring(rendered) if rendered else None
+        self.background = None
         self._records = lib().a2a_engine_records(self.h)
 
     def close(self) -> None:
@@ -253,6 +260,15 @@ class Engine:
                                  _fptr(out) if out_frames else None, out_frames,
                                  C.byref(out_ts) if out_ts is not None else None)
         return out
+
+    def enable_background(self, capacity_frames: int) -> Ring:
+        if not lib().a2a_engine_enable_background(self.h, capacity_frames):
+            raise RuntimeError("background bus allocation failed or audio already started")
+        self.background = Ring(lib().a2a_engine_background_ring(self.h))
+        return self.background
+
+    def set_background_gain(self, gain: float, ramp_frames: int) -> None:
+        lib().a2a_engine_set_background_gain(self.h, float(gain), ramp_frames)
 
     def set_render_output(self, enabled: bool) -> None:
         lib().a2a_engine_set_render_output(self.h, enabled)

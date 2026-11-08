@@ -8,7 +8,7 @@ from a2a_runtime.core.pipeline import round_half_away
 from a2a_runtime.core.state_machine import DEGRADED, translating
 from a2a_runtime.core.trace import TraceKind
 from a2a_runtime.core.types import (ASRHypothesis, ASRToken, PCMChunkHeader, PCMFormat, SourceSpan, SpeakerAssign,
-                                    SpeakerID, SpeechStart, TranslationCandidate, UnitID)
+                                    SpeakerID, SpeechEnd, SpeechStart, TranslationCandidate, UnitID)
 
 S1, S2 = SpeakerID("S1"), SpeakerID("S2")
 RATE = 48_000.0
@@ -75,25 +75,94 @@ class LiveSession:
     def label(self, speaker: SpeakerID, start: float, end: float, t: float) -> None:
         self.run(t, p.Speaker(SpeakerAssign(speaker, span(start, end))))
 
+    def pause(self, after_seconds: float, t: float) -> None:
+        """A VAD pause: the tracker ends the stretch it has been labeling, so the next speech is
+        a new turn and needs its own label."""
+        self.run(t, p.Vad(SpeechEnd(int(after_seconds * RATE))))
 
-def fluent(fluent=True, original_audio=False, prebuffer=0.08, max_debt=3.0) -> LiveSession:
+    def has_trace(self, kind: TraceKind, key: str, value) -> bool:
+        return any(e.value(key) == value for e in self.traces(kind))
+
+
+def fluent(fluent=True, original_audio=False, prebuffer=0.08, max_debt=3.0, adaptive=False,
+           complete_phrases=False, max_pending=8) -> LiveSession:
     config = p.PipelineConfig(session="fluent")
     config.finish_phrase_before_catch_up = fluent
     config.original_audio_enabled = original_audio
     config.health.prebuffer_seconds = prebuffer
     config.health.max_debt_seconds = max_debt
+    config.adaptive_streaming_prebuffer = adaptive
+    config.complete_phrases_before_playback = complete_phrases
+    config.max_pending_units = max_pending
     return LiveSession(config)
 
 
-def dialogue(voices=(S1, S2), fluent_playout=True) -> LiveSession:
+def dialogue(voices=(S1, S2), fluent_playout=True, locked=False, attributed=False, carry=None) -> LiveSession:
     config = p.PipelineConfig(session="dialogue")
     config.multi_speaker = True
+    config.pin_speaker_profiles = locked
+    config.require_speaker_attribution = attributed
+    if carry is not None:
+        config.unlabeled_speaker_carry_seconds = carry
     config.finish_phrase_before_catch_up = fluent_playout
     config.original_audio_enabled = False
     return LiveSession(config, voices)
 
 
 # MARK: Fluent playout
+
+
+def test_quality_queue_cap_discards_unheard_work_and_preserves_the_phrase_on_the_bus():
+    s = fluent(max_debt=20, complete_phrases=True, max_pending=2)
+    s.commit(1, 0, 1, 1.1)
+    s.pcm(1, 4, 1.3)
+    s.run(1.4, p.SynthesisFinished(UnitID(1), 1))
+    s.run(1.5, p.PlayStarted(UnitID(1), 0))
+    s.commit(2, 1, 2, 2.1)
+    s.commit(3, 2, 3, 3.1)
+    assert s.canceled("queue_limit") == ["u2"]
+    assert p.CancelSynthesis(UnitID(1)) not in s.effects
+    assert p.FlushTranslatedBus() not in s.effects
+    assert s.p.state == translating(S1)
+
+
+def test_complete_phrase_mode_holds_initial_and_later_audio_until_generation_ends():
+    s = fluent(max_debt=20, complete_phrases=True)
+    s.commit(1, 0, 2, 2.5)
+    assert p.ReleaseHeld(UnitID(1)) not in s.pcm(1, 2, 2.7)
+    assert p.ReleaseHeld(UnitID(1)) not in s.tick(2.8, 0)
+    assert p.ReleaseHeld(UnitID(1)) in s.run(2.9, p.SynthesisFinished(UnitID(1), 1))
+    s.run(3.0, p.PlayStarted(UnitID(1), 0))
+    s.commit(2, 2, 3, 3.2)
+    s.pcm(2, 0.5, 3.4)
+    assert p.ReleaseHeld(UnitID(2)) not in s.run(4.0, p.PlayEnded(UnitID(1), 96_000))
+    assert p.ReleaseHeld(UnitID(2)) not in s.tick(4.1, 0)
+    assert p.ReleaseHeld(UnitID(2)) in s.run(4.2, p.SynthesisFinished(UnitID(2), 1))
+    assert s.canceled("catch_up") == []
+
+
+def test_slow_streaming_builds_reserve_before_the_initial_handoff():
+    s = fluent(prebuffer=0.24, adaptive=True)
+    s.commit(1, 0, 2, 2.5)
+    assert p.ReleaseHeld(UnitID(1)) not in s.pcm(1, 0.32, 2.7)
+    # Audio arrives at half real time. The ordinary 240 ms reserve would already have started
+    # playback and exhausted the bus before the second chunk.
+    assert p.ReleaseHeld(UnitID(1)) not in s.pcm(1, 0.32, 3.34)
+    assert p.ReleaseHeld(UnitID(1)) not in s.pcm(1, 0.32, 3.98)
+    assert p.ReleaseHeld(UnitID(1)) in s.pcm(1, 0.32, 4.62)
+
+
+def test_fast_streaming_starts_after_two_chunks_and_completion_releases_short_audio():
+    s = fluent(prebuffer=0.24, adaptive=True)
+    s.commit(1, 0, 2, 2.5)
+    s.pcm(1, 0.32, 2.7)
+    assert p.ReleaseHeld(UnitID(1)) in s.pcm(1, 0.32, 2.8)
+    s.run(2.9, p.PlayStarted(UnitID(1), 0))
+    s.run(3, p.SynthesisFinished(UnitID(1), 1))
+    s.run(3.1, p.PlayEnded(UnitID(1), 30_720))
+    s.commit(2, 3.2, 3.4, 3.5)
+    assert p.ReleaseHeld(UnitID(2)) not in s.pcm(2, 0.05, 3.7)
+    assert p.ReleaseHeld(UnitID(2)) in s.run(3.8, p.SynthesisFinished(UnitID(2), 1))
 
 
 def test_empty_bus_does_not_starve_by_canceling_every_in_flight_synthesis():
@@ -270,7 +339,10 @@ def test_stable_conjunction_closes_a_clause_without_waiting_for_the_window():
     q.process(h, 0)
     out = _units(q.process(h, 100_000_000))
     assert [u.text for u in out] == ["我们今天开会"] and out[0].reason == CommitReason.CONJUNCTION
-    plain = CommitPolicy()
+    # Without streaming clauses nothing closes at the conjunction. The source-time budget is
+    # off here because this hypothesis stands 10 s ahead of its 12 keys; a frontier that far
+    # ahead of the text would close a length clause on its own.
+    plain = CommitPolicy(CommitPolicyConfig(max_unit_source_seconds=0))
     plain.process(h, 0)
     assert _units(plain.process(h, 100_000_000)) == []
 
@@ -299,6 +371,131 @@ def test_contiguous_token_timing_is_not_a_pause():
 
 
 # MARK: Multi-speaker
+
+
+def test_returning_actors_keep_their_first_voice_despite_later_profile_events():
+    d = dialogue(locked=True, attributed=True)
+    turns = [S1, S2, S1, S2]
+    for i, actor in enumerate(turns):
+        start = i * 2 + 0.2
+        d.label(actor, start, start + 1.0, start + 1.1)
+        if i >= 2:
+            d.run(start + 1.2, p.ProfileReady(actor, 2))
+        d.commit(i + 1, start, start + 1.0, start + 1.3)
+    assert [j.speaker for j in d.jobs()] == turns
+    assert [j.profile_version for j in d.jobs()] == [1, 1, 1, 1]
+    assert len(d.traces(TraceKind.PROFILE_READY)) == 2
+
+
+def test_translation_that_beats_the_speaker_label_waits_for_the_returning_actor():
+    d = dialogue(locked=True, attributed=True)
+    d.label(S2, 0.2, 1, 1.1)
+    d.pause(1.2, 1.15)  # the labeled stretch ended: the next turn is unknown
+    d.commit(1, 1.5, 3.1, 3.2)
+    assert d.jobs() == []
+    # A profile-ready event for the previous actor must not release the guess.
+    d.run(3.25, p.ProfileReady(S2, 2))
+    assert d.jobs() == []
+    d.label(S1, 1.5, 3.1, 3.4)
+    assert [j.speaker for j in d.jobs()] == [S1]
+    assert [j.profile_version for j in d.jobs()] == [1]
+
+
+def test_a_brief_reply_just_after_a_pause_continues_the_previous_speaker():
+    # Most unlabeled pieces are short replies a moment after a pause; at 3 s / 1 s limits no
+    # real turn was mislabeled by carrying them.
+    d = dialogue(locked=True, attributed=True)
+    d.label(S2, 0.2, 1, 1.1)
+    d.pause(1.1, 1.2)
+    d.commit(1, 1.4, 2.1, 2.2)  # 0.7 s, 0.4 s after the pause
+    assert [j.speaker for j in d.jobs()] == [S2]
+    assert d.has_trace(TraceKind.COMMIT_TARGET, "speaker_carried", True)
+
+
+def test_a_brief_reply_too_far_after_a_pause_still_waits_for_its_own_label():
+    d = dialogue(locked=True, attributed=True)
+    d.label(S2, 0.2, 1, 1.1)
+    d.pause(1.1, 1.2)
+    d.commit(1, 4.6, 5.3, 5.4)  # 3.6 s after that label ended
+    assert d.jobs() == []
+
+
+def test_an_unlabeled_turn_after_a_pause_expires_instead_of_borrowing_the_previous_actors_voice():
+    d = dialogue(locked=True, attributed=True)
+    d.label(S2, 0.2, 1, 1.1)
+    # The labeled stretch ended, and what follows is a turn of its own (1.6 s).
+    d.pause(1.2, 1.3)
+    d.commit(1, 1.5, 3.1, 3.2)
+    d.run(7.6, p.Tick())  # the source-lag limit for that piece has run out
+    assert d.jobs() == []
+    assert d.has_trace(TraceKind.SOURCE_DISPOSITION, "reason", "no_speaker")
+    d.label(S1, 1.5, 3.1, 7.7)
+    assert d.jobs() == []  # an expired line is never voiced late
+
+
+def test_speech_with_no_pause_inherits_the_speaker_of_the_labeled_piece():
+    d = dialogue(locked=True, attributed=True)
+    d.label(S2, 0.2, 3, 3.1)
+    d.commit(1, 3, 6, 6.1)
+    assert [j.speaker for j in d.jobs()] == [S2]
+    assert d.has_trace(TraceKind.COMMIT_TARGET, "speaker_carried", True)
+    # ...and the piece after that, while the stretch is still within the carry limit.
+    d.commit(2, 6, 9, 9.1)
+    assert [j.speaker for j in d.jobs()] == [S2, S2]
+
+
+def test_a_later_label_never_flows_back_into_an_earlier_unlabeled_piece():
+    d = dialogue(locked=True, attributed=True)
+    d.commit(1, 0.2, 3, 3.1)
+    assert d.jobs() == []
+    d.label(S2, 3, 6, 6.1)
+    assert d.jobs() == []
+
+
+def test_the_carry_ends_at_its_limit_and_the_piece_waits_again():
+    d = dialogue(locked=True, attributed=True)
+    d.label(S2, 0.2, 3, 3.1)
+    d.commit(1, 12, 15, 15.1)  # 9 s of unlabeled speech since the label
+    assert d.jobs() == []
+    d.run(20.1, p.Tick())  # the wait for a label of its own has run out
+    assert d.has_trace(TraceKind.SOURCE_DISPOSITION, "reason", "no_speaker")
+
+
+def test_the_carry_is_switchable_off_for_comparing_runs():
+    d = dialogue(locked=True, attributed=True, carry=0)
+    d.label(S2, 0.2, 3, 3.1)
+    d.commit(1, 3, 6, 6.1)
+    assert d.jobs() == []
+
+
+def test_an_unrelated_turn_cannot_reassign_a_unit_waiting_for_its_own_voice():
+    d = dialogue(voices=(S1,), locked=True, attributed=True)
+    d.label(S2, 0.2, 1.2, 1.3)
+    d.commit(1, 0.2, 1.2, 1.4)
+    assert d.jobs() == []
+    # A later, disjoint span cannot reassign this waiting unit to S1.
+    d.label(S1, 1.5, 2.5, 2.6)
+    assert d.jobs() == []
+    d.run(2.7, p.ProfileReady(S2, 1))
+    assert [j.speaker for j in d.jobs()] == [S2]
+
+
+def test_a_small_or_tied_labeled_share_cannot_select_the_previous_actor():
+    d = dialogue(locked=True, attributed=True)
+    d.label(S2, 0.2, 0.7, 1.3)
+    d.commit(1, 0.2, 1.2, 1.4)
+    assert d.jobs() == []
+    d.label(S1, 0.7, 1.2, 1.6)
+    assert d.jobs() == []
+
+
+def test_a_source_discontinuity_allows_a_new_session_voice():
+    d = dialogue(locked=True, attributed=True)
+    d.run(0.1, p.Discontinuity("test"))
+    d.run(0.2, p.ProfileReady(S1, 2))
+    d.label(S1, 0.3, 1.3, 1.4)
+    d.commit(1, 0.3, 1.3, 1.5)
+    assert [j.profile_version for j in d.jobs()] == [2]
 
 
 def test_each_unit_is_voiced_by_the_speaker_who_said_it():

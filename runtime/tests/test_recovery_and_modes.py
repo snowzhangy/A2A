@@ -15,7 +15,7 @@ from a2a_runtime.core.state_machine import BusGains, HealthSample, SessionStateM
 from a2a_runtime.core.trace import TraceKind
 from a2a_runtime.core.types import (ASRHypothesis, ASRToken, PCMChunkHeader, PCMFormat, SourceSpan, SpeakerID,
                                     SpeechEnd, SpeechStart, TranslationCandidate, UnitID)
-from a2a_runtime.core.validator import TranslationValidator
+from a2a_runtime.core.validator import Accepted, Rejected, Silent, TranslationValidator
 
 SPK = SpeakerID("S1")
 S2 = SpeakerID("S2")
@@ -39,6 +39,39 @@ def traces(effects):
 
 
 # MARK: Playback mode
+
+
+def test_separated_background_plays_during_voice_acquisition_but_mutes_for_original_and_stop():
+    config = p.PipelineConfig(session="background")
+    config.original_audio_enabled = False
+    config.background_audio_enabled = True
+    pl = p.SessionPipeline(config)
+    pl.handle(p.Arm(), 0)
+    armed = pl.handle(p.ArmSucceeded(), 1)
+    assert p.BackgroundGain(0.8, 0) in armed
+    assert any(isinstance(e, p.RampGains) and e.duration_ms == 0 and e.gains.original == 0 and e.gains.translated == 0
+               for e in armed)
+    assert p.BackgroundGain(0.0, 30) in pl.handle(p.SetPlaybackMode(PlaybackMode.ORIGINAL), 2)
+    assert p.BackgroundGain(0.8, 30) in pl.handle(p.SetPlaybackMode(PlaybackMode.TRANSLATED), 3)
+    assert p.BackgroundGain(0.0, 30) in pl.handle(p.Stop(), 4)
+
+
+def test_provider_playback_policy_gates_and_flushes_pcm():
+    config = p.PipelineConfig(session="synthetic")
+    config.provider_streaming = True
+    pl = p.SessionPipeline(config)
+    ramp = config.health.ramp_ms
+    assert pl.handle(p.ProviderPCM(), 1) == []
+    assert pl.handle(p.Arm(), 2) == [p.RampGains(BusGains.TRANSLATED, 0)]
+    assert pl.handle(p.ProviderPCM(), 3) == [p.EnqueueProviderPCM()]
+    assert pl.handle(p.SetPlaybackMode(PlaybackMode.ORIGINAL), 4) == [p.FlushTranslatedBus(),
+                                                                      p.RampGains(BusGains.ORIGINAL, ramp)]
+    assert pl.handle(p.ProviderPCM(), 5) == []
+    assert pl.handle(p.SetPlaybackMode(PlaybackMode.TRANSLATED), 6) == [p.FlushTranslatedBus(),
+                                                                        p.RampGains(BusGains.TRANSLATED, ramp)]
+    assert pl.handle(p.ProviderPCM(), 7) == [p.EnqueueProviderPCM()]
+    assert pl.handle(p.Stop(), 8) == [p.FlushTranslatedBus(), p.Teardown()]
+    assert pl.handle(p.ProviderPCM(), 9) == []
 
 
 def mode_session(mode=PlaybackMode.TRANSLATED) -> p.SessionPipeline:
@@ -420,15 +453,36 @@ def test_validator_checks_the_selected_target():
     def c(text, complete=True):
         return TranslationCandidate(UnitID(1), text, complete)
 
-    assert chinese.validate(c("我们下周开会。"), src, None) is None
-    assert chinese.validate(c("请在 Zoom 开会。"), src, None) is None
-    assert chinese.validate(c(src), src, None) == "wrong_language"
-    assert english.validate(c("我们下周开会。"), src, None) == "wrong_language"
-    assert english.validate(c(src), "我们下周开会。", None) is None
-    assert chinese.validate(c(" "), src, None) == "empty"
-    assert chinese.validate(c("我们下周开会。", False), src, None) == "incomplete"
-    assert chinese.validate(c("我们下周开会。"), src, "我们下周开会。") == "duplicate"
-    assert chinese.validate(c("会" * 200), src, None) == "too_long"
+    assert chinese.evaluate(c("我们下周开会。"), src, None) == Accepted("我们下周开会。")
+    assert isinstance(chinese.evaluate(c("请在 Zoom 开会。"), src, None), Accepted)
+    assert chinese.evaluate(c(src), src, None) == Rejected("wrong_language")
+    assert english.evaluate(c("我们下周开会。"), src, None) == Rejected("wrong_language")
+    assert isinstance(english.evaluate(c(src), "我们下周开会。", None), Accepted)
+    assert chinese.evaluate(c(" "), src, None) == Silent("empty")
+    assert chinese.evaluate(c("我们下周开会。", False), src, None) == Rejected("incomplete")
+    assert chinese.evaluate(c("我们下周开会。"), src, "我们下周开会。") == Rejected("duplicate")
+    assert chinese.evaluate(c("会" * 200), src, None) == Rejected("too_long")
+
+
+def test_fillers_are_silence_and_content_is_not():
+    english = TranslationValidator(TranslationLanguage.ENGLISH)
+    chinese = TranslationValidator(TranslationLanguage.MANDARIN)
+
+    def c(text):
+        return TranslationCandidate(UnitID(1), text)
+
+    for filler in ["Yeah.", "yeah", "Hmm", "Oh, oh!", "Uh, uh, um", "haha"]:
+        assert english.evaluate(c(filler), "", None) == Silent("filler")
+    for filler in ["嗯", "嗯嗯", "哦啊", "哈哈"]:
+        assert chinese.evaluate(c(filler), "", None) == Silent("filler")
+    # Content words, however short, are a real translation.
+    assert isinstance(english.evaluate(c("Oh, that is wrong."), "", None), Accepted)
+    assert isinstance(english.evaluate(c("Yes."), "", None), Accepted)
+    assert isinstance(english.evaluate(c("Yeah, right away."), "", None), Accepted)
+    assert isinstance(chinese.evaluate(c("我们开会。"), "", None), Accepted)
+    # Turning the rule off restores the old empty failure.
+    strict = TranslationValidator(TranslationLanguage.ENGLISH, silences_fillers=False)
+    assert strict.evaluate(c(" "), "", None) == Rejected("empty")
 
 
 @pytest.mark.parametrize("direction", list(TranslationDirection))

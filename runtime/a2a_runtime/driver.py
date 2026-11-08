@@ -21,15 +21,21 @@ import numpy as np
 
 from . import native
 from .core import pipeline as P
+from .core.audio_segment import (AdaptiveSpeechThreshold, Append, AudioSegmentPolicy, AudioStreamFeed,
+                                 Close, Discard)
 from .core.direction import TranslationLanguage
 from .core.reference_policy import ReferencePlan, ReferencePolicy, ReferencePolicyConfig, Rejected
 from .core.speech_evidence import SpeechEvidence
-from .core.trace import TraceEvent, TraceKind, f_int, f_str
-from .core.types import (CANONICAL_SAMPLE_RATE, AudioFrame16k, PCMChunkHeader, PreparedVoice, ReferenceQuality,
-                         SourceSpan, SpeakerAssign, SpeakerID, UnitID, VoiceProfile)
+from .core.pipeline import round_half_away
+from .core.term_map import TermMap
+from .core.trace import TraceEvent, TraceKind, f_bool, f_double, f_int, f_str, f_unit
+from .core.types import (CANONICAL_SAMPLE_RATE, ASRHypothesis, ASRToken, AudioFrame16k, PCMChunkHeader,
+                         PreparedVoice, ReferenceQuality, SourceSpan, SpeakerAssign, SpeakerID, UnitID, VoiceProfile)
 from .media import signal
+from .media.background_bed import BackgroundBed
 from .media.resampler import StreamingResampler
 from .media.wav import WAVStreamWriter
+from .models.base import AdapterError, DeliveryClip
 from .models.fixtures import DictionaryTranslator, EnergyVAD, ScriptedRecognizer, ToneSynthesizer
 from .trace_writer import RTRecordDrain, TraceWriter
 
@@ -42,6 +48,18 @@ EDGE_FADE_SECONDS = 0.005
 def log(message: str) -> None:
     sys.stderr.write(f"a2a-pipeline: {message}\n")
     sys.stderr.flush()
+
+
+def load_terms(path: str) -> dict[str, str]:
+    """A JSON object of term -> replacement (--glossary, --pronounce)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            terms = json.load(fh)
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"a2a-pipeline: {path}: {error}") from None
+    if not isinstance(terms, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in terms.items()):
+        raise SystemExit(f"a2a-pipeline: {path}: expected a JSON object of strings")
+    return terms
 
 
 # MARK: Source
@@ -117,9 +135,11 @@ class Source:
         return self._stdin_q.get()
 
     def next_live(self, until_stop: bool) -> np.ndarray | None:
-        """Live chunks as the capture ring fills. With `until_stop`, returns None once
-        --seconds elapse or a stop arrives; the tail reads on so playout finishes."""
+        """Live chunks as the capture ring fills; an empty chunk after 20 ms without capture.
+        With `until_stop`, returns None once --seconds elapse or a stop arrives; the tail reads
+        on so playout finishes."""
         live = self.live
+        wait_start = time.perf_counter()
         while len(self._pending) < self.chunk:
             # A stop request ends the session at once; --seconds lets the tail finish playout.
             if self.stop_requested.is_set() or (until_stop and live.deadline_passed()):
@@ -134,6 +154,9 @@ class Source:
                     self.failure = "capture stalled; the session stopped and released its tap"
                     return None
                 time.sleep(0.005)
+                # An empty chunk: the driver keeps playout and phrase slots moving meanwhile.
+                if time.perf_counter() - wait_start >= 0.02:
+                    return np.zeros(0, np.float32)
                 continue
             frames = self._tap_buffer[: n * live.channels].reshape(n, live.channels)
             mono = frames.mean(axis=1, dtype=np.float32).astype(np.float32)
@@ -145,6 +168,15 @@ class Source:
 
 
 # MARK: Driver
+
+
+def prepare_all(synthesizer, profile) -> list:
+    """One prepared voice per worker lane. A single-worker adapter yields one; a multi-lane
+    adapter yields its own hand-off per lane, because a handle is only meaningful to the
+    worker that produced it."""
+    if hasattr(synthesizer, "prepare_lanes"):
+        return synthesizer.prepare_lanes(profile)
+    return [synthesizer.prepare(profile)]
 
 
 @dataclass
@@ -174,40 +206,92 @@ class _Delivery:
 
 
 class Driver:
-    def __init__(self, options, recognizer, translator, synthesizer, live=None, controls=None) -> None:
+    def __init__(self, options, recognizer, translator, synthesizer, live=None, controls=None,
+                 separator=None, lid=None) -> None:
         o = self.o = options
         self.virtual = o.clock == "virtual"
         self.controls = controls
         self.live = live
         config = P.PipelineConfig(session=o.session, direction=o.direction)
+        config.direct_audio_translation = o.asr == "audio"
+        config.background_audio_enabled = o.background
         config.trace_text = o.research_text
         config.emit_captions = o.events_stdout
         config.original_audio_enabled = not o.translation_only
         config.playback_mode = o.playback
+        # A clone keeps each speaker's first voice for the session, and in a dialogue a line
+        # waits for its own speaker's label instead of borrowing the previous actor's voice.
+        config.pin_speaker_profiles = o.tts == "clone"
+        config.require_speaker_attribution = o.tts == "clone"
         if o.fluent:
             config.commit.streaming_clauses = True
             config.finish_phrase_before_catch_up = True
             config.health.prebuffer_seconds = 0.24
+        config.adaptive_streaming_prebuffer = o.adaptive_prebuffer
+        if o.quality_first:
+            config.finish_phrase_before_catch_up = True
+            config.complete_phrases_before_playback = True
+            config.commit.streaming_clauses = False
+            config.health.max_debt_seconds = 20
+            config.health.max_source_lag_seconds = 20
+            config.max_pending_units = 16
+            # Quality-first buys whole phrases with latency: a unit closes early only once it
+            # would exceed the session's own source-lag budget.
+            config.commit.max_unit_source_seconds = config.health.max_source_lag_seconds
         if o.max_debt_seconds is not None:
             config.health.max_debt_seconds = o.max_debt_seconds
         if o.max_source_lag_seconds is not None:
             config.health.max_source_lag_seconds = o.max_source_lag_seconds
+        # With a picture delay the lag limit counts from each unit's slot (ADR-0012).
+        config.presentation_delay_seconds = o.presentation_delay_ms / 1_000
+        config.turn_fill_enabled = o.turn_fill
+        config.clone_delivery_line = o.clone_delivery == "line"
+        self.restores_voice = (o.passthrough and o.asr == "audio" and o.background and o.tts == "clone"
+                               and o.presentation_delay_ms >= 4_000)
+        config.restores_original_voice = self.restores_voice
+        if self.restores_voice:
+            config.original_voice_decision_deadline_seconds = max(
+                0.1, min(6.0, config.presentation_delay_seconds - 1.5) - 0.7)
         if o.max_unit_keys is not None:
             config.commit.max_unit_keys = o.max_unit_keys
+        if o.max_unit_seconds is not None:
+            config.commit.max_unit_source_seconds = o.max_unit_seconds
+        if o.speaker_carry is not None:
+            config.unlabeled_speaker_carry_seconds = o.speaker_carry
+        if o.speaker_carry_pause is not None:
+            config.unlabeled_speaker_carry_after_pause_seconds = o.speaker_carry_pause
+        if o.speaker_carry_piece is not None:
+            config.unlabeled_speaker_carry_max_piece_seconds = o.speaker_carry_piece
+        # Quality-first preserves the complete target as well as complete PCM; the validator's
+        # implausible-output cap still applies, matching the Swift driver.
+        config.validator.shortens_over_budget_targets = o.shorten and not o.quality_first
+        config.validator.silences_fillers = o.filler_silence
+        if o.glossary:
+            config.glossary = load_terms(o.glossary)
+        # Spoken respellings applied to the synthesizer's text only (--pronounce).
+        self.pronunciation = TermMap(load_terms(o.pronounce) if o.pronounce else {}, ignores_case=True)
         self.tracker = None
         if o.speakers == "auto":
             from .models.speaker_tracking import VoiceprintSpeakerTracker
 
             config.multi_speaker = True
             self.tracker = VoiceprintSpeakerTracker()
-        self.pipeline = P.SessionPipeline(config)
+        # Mandarin recognition hands back one key per character, so only a word segmenter can
+        # keep a clause cut out of the middle of a word (CommitPolicy `WordSegmenter`).
+        self.word_segmenter = word_segmenter_for(o.direction.source) if o.word_cuts else None
+        self.target_word_segmenter = word_segmenter_for(o.direction.target) if o.word_cuts else None
+        self.pipeline = P.SessionPipeline(config, word_segmenter=self.word_segmenter,
+                                          target_word_segmenter=self.target_word_segmenter)
         self.trace = TraceWriter(o.trace)
         self.vad = vad_for(o)
         self.speech_evidence = SpeechEvidence()
         self.to16k = StreamingResampler(CANONICAL, 16_000)
+        self.separator = separator
+        self.lid = lid
         self.recognizer = recognizer
         self.translator = translator
         self.synthesizer = synthesizer
+        self.prepared_lane_voices: dict[str, list] = {}
         self.translator_latency = getattr(translator, "latency", None) if isinstance(translator, DictionaryTranslator) else None
         if live is not None:
             self.engine = live.engine
@@ -226,14 +310,46 @@ class Driver:
             self.out_channels = 1
             self.record_drain = None
         self.translated_ring = self.engine.translated
+        self.audio_segments = (AudioSegmentPolicy.sentences(o.presentation_delay_ms / 1000)
+                               if o.asr == "audio" and o.sentence_units and o.background
+                               and o.presentation_delay_ms > 0 else AudioSegmentPolicy())
+        self.background_ring = self.engine.enable_background(int(self.out_rate * (3 + o.presentation_delay_ms / 1000))) if o.background else None
+        self.background_resampler = StreamingResampler(CANONICAL, self.out_rate) if o.background else None
+        self.bed = BackgroundBed(int(o.presentation_delay_ms / 1000 * CANONICAL)) if o.background else None
+        self.background_frames = 0
+        self.background_failed = False
+        self.voice_history = np.zeros(0, np.float32)
+        self.voice_history_start = 0
+        self.separator_input = np.zeros(0, np.float32)
+        self.voice_lag = int(round(separator.latency_seconds * CANONICAL)) if separator else 0
+        self.separation_output = 0
+        self.segment_vad = vad_for(o) if o.asr == "audio" and o.background else None
+        if self.segment_vad is not None:
+            self.segment_vad.threshold_db = np.float32(o.vad_threshold_db - 5)
+        self.segment_threshold = (AdaptiveSpeechThreshold(o.vad_threshold_db - 5)
+                                  if self.audio_segments.dip_window_samples else None)
+        self.voice_to16k = StreamingResampler(CANONICAL, 16_000) if self.segment_vad is not None else None
+        self.recent_segments: list[SourceSpan] = []
+        self.segment_frontier = 0
+        self.last_capture_now = 0
         self.inbox: queue.SimpleQueue = queue.SimpleQueue()
         self.deliveries: list[_Delivery] = []
         self.seq = 0
         self.tasks: dict[UnitID, _Task] = {}
         self.translation_tasks: dict[UnitID, _Task] = {}
         self.translation_queue: list = []
+        self.translation_audio: dict[UnitID, np.ndarray] = {}
+        self.translation_tickets: dict[UnitID, object] = {}
+        self.audio_feed = AudioStreamFeed(self.audio_segments.stream_limit_samples)
+        self.hy_tickets: list[tuple[SourceSpan, object]] = []
+        self.hy_streaming = None
+        if (o.asr == "audio" and o.mt == "hy-local" and o.hy_stream and not self.virtual
+                and getattr(getattr(translator, "info", None), "streams_spans", False)):
+            self.hy_streaming = translator
         self.synthesis_queue: list[P.SynthesisJob] = []
-        self.active_synthesis: UnitID | None = None
+        # unit -> lane. One worker by default; two with --dual-clone when the cards allow it.
+        self.active_synthesis: dict[UnitID, int] = {}
+        self.synthesis_lanes = int(getattr(self.synthesizer, "lanes", 1))
         self.held: dict[UnitID, list] = {}
         self.unit_resamplers: dict[UnitID, StreamingResampler] = {}
         self.plays: dict[UnitID, PlayRecord] = {}
@@ -256,7 +372,25 @@ class Driver:
         self.history_start = 0
         self.reference_audio: dict[SpeakerID, dict[SourceSpan, np.ndarray]] = {}
         self.known_speakers: set[SpeakerID] = set()
+        # Opt-in research voice references (ADR-0006).
+        self.voice_memory = None
+        if o.voice_memory:
+            from .models.voice_memory import VoiceMemoryStore
+
+            self.voice_memory = VoiceMemoryStore(o.voice_memory)
+        self.memory_preparing: set[SpeakerID] = set()
+        self.memory_reused: set[SpeakerID] = set()
+        self.memory_failed: set[SpeakerID] = set()
+        self.remembered_ids: dict[SpeakerID, str] = {}
         self.stats: dict[str, int] = {}
+        # `late_ms` of every scheduled phrase under a picture delay (ADR-0012).
+        self.slot_late_ms: list[int] = []
+        # Virtual time spent without capture (--simulate-capture-gap); always 0 on the host clock.
+        self.idle_ns = 0
+        # Synthetic silence fed at a pause (idle_step); it is not source time on the virtual clock.
+        self.synthetic_frames = 0
+        self.idle_since: int | None = None
+        self.pause_flushed = False
         self.runtime_failed = False
         self.gain_target = (1.0, 0.0)
         self.last_consumed = 0
@@ -269,6 +403,7 @@ class Driver:
         self.stem_writer = WAVStreamWriter(o.stems, CANONICAL, 2) if o.stems else None
         self.source_writer = WAVStreamWriter(o.source_out, CANONICAL, 1) if o.source_out else None
         self.translated_writer = WAVStreamWriter(o.translated_out, self.out_rate, 1) if o.translated_out else None
+        self.background_writer = WAVStreamWriter(o.background_out, self.out_rate, 1) if o.background_out else None
         self.rendered_writer = None
         if o.rendered_out:
             self.rendered_writer = WAVStreamWriter(o.rendered_out, self.out_rate, self.out_channels)
@@ -307,6 +442,8 @@ class Driver:
 
     @property
     def keeps_history(self) -> bool:
+        if self.o.mt in ("hy", "hy-local"):
+            return True
         if not self.acquires_reference:
             return False
         policy = self.reference_policies.get(self.pipeline.config.default_speaker)
@@ -318,16 +455,23 @@ class Driver:
         policy = self.reference_policies.get(default)
         if not self.acquires_reference or not h.is_final or (not multi and policy is not None and policy.is_complete):
             return
-        span = ReferencePolicy(default).speech_span(h)
-        if span is None:
+        policy = ReferencePolicy(default)
+        candidates = policy.reference_candidates(h)
+        if not candidates:
             self._incr("reference_rejected_no_timing")
             self.publish_voice_progress(default, "collecting", reason="no_timing")
             return
+        for candidate in candidates:
+            span = policy.speech_span(candidate)
+            if span is None:
+                continue
+            if multi:
+                # Each cut must independently match a single tracked speaker.
+                self.deferred_references.append((candidate, span, self.now))
+            else:
+                self.offer_reference(candidate, span, default)
         if multi:
-            self.deferred_references.append((h, span, self.now))
             self.offer_deferred_references()
-        else:
-            self.offer_reference(h, span, default)
 
     def offer_deferred_references(self) -> None:
         waiting = []
@@ -354,16 +498,26 @@ class Driver:
         self.deferred_references = waiting
 
     def offer_reference(self, h, span: SourceSpan, speaker: SpeakerID) -> None:
-        policy = self.reference_policies.get(speaker) or ReferencePolicy(speaker)
+        if speaker in self.memory_preparing or speaker in self.memory_reused:
+            return
+        policy = self.reference_policies.get(speaker) or self.live_reference_policy(speaker)
         self.reference_policies[speaker] = policy
         if policy.is_complete:
             return
-        pcm = self.history_slice(span)
+        isolated = self.separator is not None and self.o.reference_isolation
+        pcm = self.voice_history_slice(span) if isolated else self.history_slice(span)
         if pcm is None:
-            self._incr("reference_rejected_expired")
-            self.publish_voice_progress(speaker, "collecting", policy.accepted_seconds, "expired")
+            reason = "not_voice" if isolated else "expired"
+            self._incr(f"reference_rejected_{reason}")
+            self.publish_voice_progress(speaker, "collecting", policy.accepted_seconds, reason)
             return
-        result = policy.offer(span, h.text, signal.dbfs(signal.rms(pcm)), self.clipped_fraction(pcm))
+        voice_share = None
+        if isolated:
+            mix = self.history_slice(span)
+            if mix is not None:
+                voice_share = signal.dbfs(signal.rms(pcm)) - signal.dbfs(signal.rms(mix))
+        result = policy.offer(span, h.text, signal.dbfs(signal.rms(pcm)), self.clipped_fraction(pcm),
+                              voice_share_db=voice_share)
         if isinstance(result, Rejected):
             self._incr(f"reference_rejected_{result.reason}")
             self.publish_voice_progress(speaker, "collecting", policy.accepted_seconds, result.reason)
@@ -377,9 +531,19 @@ class Driver:
             else:
                 self.prepare_reference(result)
 
+    def live_reference_policy(self, speaker: SpeakerID) -> ReferencePolicy:
+        # A pinned session voice is never upgraded: the actor sounds the same all session.
+        return ReferencePolicy(speaker, ReferencePolicyConfig(
+            allow_upgrade=not self.pipeline.config.pin_speaker_profiles,
+            allow_empty_text=self.o.asr == "audio",
+            min_voice_share_db=(-10.0 if self.o.background and self.o.reference_isolation
+                                and self.o.asr == "audio" else None)))
+
     def note_speaker(self, event) -> None:
         """Multi-speaker: a speaker's first label prepares their voice. Tone and system voices
         are ready at once (the system voice is cast by pitch); a clone waits for a reference."""
+        if isinstance(event, SpeakerAssign):
+            self.try_remembered_voice(event.speaker)
         if not isinstance(event, SpeakerAssign) or event.speaker in self.known_speakers:
             return
         speaker = event.speaker
@@ -406,6 +570,35 @@ class Driver:
 
         threading.Thread(target=run, daemon=True).start()
 
+    def try_remembered_voice(self, speaker: SpeakerID) -> None:
+        """Reuse a saved reference only after a conservative voice match (ADR-0006)."""
+        memory = self.voice_memory
+        if (self.o.tts != "clone" or memory is None or self.tracker is None or speaker in self.memory_preparing
+                or speaker in self.memory_reused or speaker in self.memory_failed):
+            return
+        policy = self.reference_policies.get(speaker)
+        if policy is not None and policy.has_issued_profile:
+            return
+        vp = self.tracker.voiceprint(speaker)
+        saved = memory.match(vp) if vp is not None else None
+        profile = saved.profile(speaker) if saved is not None else None
+        if profile is None:
+            return
+        self.memory_preparing.add(speaker)
+        self.remembered_ids[speaker] = saved.identity_id
+        self.publish_voice_progress(speaker, "preparing", reused=True)
+
+        def run() -> None:
+            started = native.now_ns()
+            try:
+                voices = prepare_all(self.synthesizer, profile)
+                self.inbox.put(("remembered_ready", voices[0], profile.quality.duration_seconds,
+                                native.now_ns() - started, voices))
+            except Exception:
+                self.inbox.put(("remembered_failed", speaker))
+
+        threading.Thread(target=run, daemon=True).start()
+
     def prepare_reference(self, plan: ReferencePlan) -> None:
         gap = np.zeros(CANONICAL * 15 // 100, np.float32)
         parts = []
@@ -423,22 +616,29 @@ class Driver:
         self.preparing_reference = True
         self.publish_voice_progress(plan.speaker, "preparing", plan.seconds)
         seconds = len(pcm) / CANONICAL
+        memory = self.voice_memory
+        import uuid
+
+        memory_id = self.remembered_ids.get(plan.speaker) or str(uuid.uuid4()).upper()
+        self.remembered_ids[plan.speaker] = memory_id
 
         def run() -> None:
             started = native.now_ns()
             try:
-                voice = self.synthesizer.prepare(profile)
-                self.inbox.put(("prepared", voice, seconds, native.now_ns() - started))
+                voices = prepare_all(self.synthesizer, profile)
+                if memory is not None:
+                    memory.remember(profile, memory_id)
+                self.inbox.put(("prepared", voices[0], seconds, native.now_ns() - started, voices))
             except Exception as error:
                 self.inbox.put(("prepare_failed", plan.speaker, plan.version, f"{error}"))
 
         threading.Thread(target=run, daemon=True).start()
 
     def publish_voice_progress(self, speaker: SpeakerID, state: str, seconds: float = 0.0,
-                               reason: str | None = None) -> None:
+                               reason: str | None = None, reused: bool = False) -> None:
         if not self.o.events_stdout:
             return
-        self._stdout(json.dumps({"reused": False, "required_seconds": ReferencePolicyConfig().min_seconds,
+        self._stdout(json.dumps({"reused": reused, "required_seconds": ReferencePolicyConfig().min_seconds,
                                  "seconds": seconds, "speaker": speaker.raw_value, "voice_status": state,
                                  **({"reason": reason} if reason else {})},
                                 sort_keys=True))
@@ -450,6 +650,84 @@ class Driver:
         hi = min(len(self.history), span.end - self.history_start)
         return self.history[lo:hi].copy() if lo < hi else None
 
+    def voice_history_slice(self, span: SourceSpan) -> np.ndarray | None:
+        if span.start < self.voice_history_start:
+            return None
+        lo = span.start - self.voice_history_start
+        hi = min(len(self.voice_history), span.end - self.voice_history_start)
+        pcm = self.voice_history[lo:hi].copy() if lo < hi else None
+        return pcm if pcm is not None and len(pcm) == span.count else None
+
+    def source_clock_frontier(self) -> int:
+        elapsed = max(0, self.now - self.last_capture_now)
+        return self.src_frames + elapsed * CANONICAL // 1_000_000_000
+
+    def flush_bed(self, final: bool = False) -> None:
+        if self.bed is None or self.background_failed:
+            return
+        mixed = self.bed.drain(self.source_clock_frontier())
+        pcm = self.background_resampler.process(mixed)
+        if final:
+            pcm = np.concatenate([pcm, self.background_resampler.flush()])
+        if not len(pcm):
+            return
+        written = self.background_ring.write(pcm)
+        self.background_frames += written
+        if self.background_writer is not None:
+            self.background_writer.append(pcm[:written])
+        if written != len(pcm):
+            raise AdapterError("background bus overflow")
+
+    def fail_background(self) -> None:
+        if self.background_failed:
+            return
+        self.background_failed = True
+        # A failed separator mutes only the bed; original audio is never substituted for it.
+        self.engine.set_background_gain(0, 0)
+        if self.background_ring is not None:
+            self.background_ring.skip(self.background_ring.readable)
+
+    def process_separation(self, samples: np.ndarray) -> list[SourceSpan]:
+        if self.separator is None or self.background_failed:
+            return []
+        self.separator_input = np.concatenate([self.separator_input, samples])
+        complete = len(self.separator_input) // 480 * 480
+        if complete:
+            self.separator.separate(self.separator_input[:complete])
+            self.separator_input = self.separator_input[complete:].copy()
+        segments: list[SourceSpan] = []
+        for voice, bed in self.separator.drain():
+            self.bed.push(bed)
+            self.separation_output += len(voice)
+            if self.separation_output <= self.voice_lag:
+                continue  # discard separator cold-start lookahead, aligning voice to source time
+            corrected_start = self.separation_output - self.voice_lag - len(voice)
+            self.voice_history = np.concatenate([self.voice_history, voice])
+            keep = CANONICAL * 30
+            if len(self.voice_history) > keep + CANONICAL * 10:
+                drop = len(self.voice_history) - keep
+                self.voice_history_start += drop
+                self.voice_history = self.voice_history[drop:]
+            if self.segment_vad is None:
+                continue
+            span = SourceSpan(corrected_start, corrected_start + len(voice))
+            self.segment_frontier = span.end
+            db = signal.dbfs(signal.rms(voice))
+            if self.segment_threshold is not None:
+                self.segment_vad.threshold_db = np.float32(self.segment_threshold.update(span, db))
+            low = self.voice_to16k.process(voice)
+            events = self.segment_vad.process(AudioFrame16k(span, low))
+            segments += self.audio_segments.process(events, span.end, (span, db))
+        return segments
+
+    def following_silence_seconds(self, span: SourceSpan) -> float:
+        next_start = next((other.start for other in self.recent_segments if other.start >= span.end), None)
+        if next_start is not None:
+            return max(0.0, (next_start - span.end) / CANONICAL)
+        if self.segment_vad is not None:
+            return max(0.0, self.segment_frontier - self.segment_vad.last_voiced_sample) / CANONICAL
+        return 0.0
+
     @staticmethod
     def clipped_fraction(pcm) -> float:
         a = np.asarray(pcm)
@@ -457,7 +735,7 @@ class Driver:
 
     def clock(self) -> int:
         if self.virtual:
-            return self.t0 + self.src_frames * 1_000_000_000 // CANONICAL
+            return self.t0 + (self.src_frames - self.synthetic_frames) * 1_000_000_000 // CANONICAL + self.idle_ns
         return native.now_ns()
 
     def _stdout(self, line: str) -> None:
@@ -475,6 +753,17 @@ class Driver:
             if isinstance(effect, P.TraceOut):
                 e = effect.event
                 self.trace.emit(e)
+                # Picture delay: how far from its slot each phrase was scheduled (positive = late).
+                if e.kind == TraceKind.PLAY_SCHEDULED and e.value("late_ms") is not None:
+                    self.slot_late_ms.append(e.value("late_ms"))
+                # Run-summary counters: how each line left the session.
+                if e.kind == TraceKind.SOURCE_DISPOSITION and e.value("disposition") == "silence":
+                    self._incr("silence_units")
+                if e.kind == TraceKind.COMMIT_TARGET:
+                    if e.value("shortened") is True:
+                        self._incr("shortened_targets")
+                    if e.value("speaker_carried") is True:
+                        self._incr("speaker_carried_units")
                 if o.events_stdout and e.kind in (TraceKind.STATE_CHANGE, TraceKind.ERROR, TraceKind.QUEUE_DEPTH,
                                                   TraceKind.FALLBACK_ENTER, TraceKind.FALLBACK_EXIT, TraceKind.GAIN_RAMP):
                     self._stdout(e.json_line())
@@ -489,12 +778,19 @@ class Driver:
             elif isinstance(effect, P.Translate):
                 self.start_translation(effect.request)
             elif isinstance(effect, P.Synthesize):
-                self.start_synthesis(effect.job)
+                if self.virtual:
+                    self.start_synthesis(effect.job)
+                else:
+                    self.synthesis_queue.append(effect.job)
             elif isinstance(effect, P.CancelTranslation):
                 task = self.translation_tasks.pop(effect.unit, None)
                 if task:
                     task.cancelled = True
+                    if hasattr(self.translator, "cancel_unit"):
+                        self.translator.cancel_unit(effect.unit)  # skip it in the worker queue
                 self.translation_queue = [r for r in self.translation_queue if r.unit_id != effect.unit]
+                self.translation_audio.pop(effect.unit, None)
+                self.translation_tickets.pop(effect.unit, None)
                 self.deliveries = [d for d in self.deliveries
                                    if not (d.event[0] == "input" and isinstance(d.event[1], P.Translation)
                                            and d.event[1].unit == effect.unit)]
@@ -528,11 +824,36 @@ class Driver:
                 self.unconsumed.clear()
                 self.unconsumed_frames = 0
                 self.unconsumed_base = self.translated_ring.total_written
-            elif isinstance(effect, P.Teardown):
-                pass
+            elif isinstance(effect, P.BackgroundGain):
+                self.engine.set_background_gain(0 if self.background_failed else effect.gain,
+                                                effect.duration_ms * self.out_rate // 1_000)
+            elif isinstance(effect, P.RestoreOriginalVoice):
+                if self.restores_voice and not self.background_failed:
+                    pcm = self.voice_history_slice(effect.span)
+                    replaced = self.bed.replace(effect.span, pcm) if pcm is not None else 0
+                    self._incr("voice_restored_units")
+                    if replaced < effect.span.count:
+                        self._incr("voice_restored_late")
+            elif isinstance(effect, (P.Teardown, P.EnqueueProviderPCM)):
+                pass  # no cloud provider stream in this driver
         self.launch_next_translation()
-        if self.active_synthesis is None and self.synthesis_queue:
+        if self.can_start_synthesis and self.synthesis_queue:
             self.start_synthesis(self.synthesis_queue.pop(0))
+
+    @property
+    def can_start_synthesis(self) -> bool:
+        """With two workers the back lane starts only once the front phrase is playing: order is
+        kept and at most one future phrase is buffered."""
+        if self.virtual:
+            return True
+        if len(self.active_synthesis) >= self.synthesis_lanes:
+            return False
+        if self.synthesis_lanes > 1 and self.o.presentation_delay_ms == 0:
+            if len(self.plays) >= 2:
+                return False
+            if self.plays and not any(play.started for play in self.plays.values()):
+                return False
+        return True
 
     def _cancel_synthesis(self, unit: UnitID) -> None:
         task = self.tasks.pop(unit, None)
@@ -541,8 +862,7 @@ class Driver:
             if task.stream is not None and hasattr(task.stream, "cancel"):
                 task.stream.cancel()
         self.synthesis_queue = [j for j in self.synthesis_queue if j.unit != unit]
-        if self.active_synthesis == unit:
-            self.active_synthesis = None
+        self.active_synthesis.pop(unit, None)
         self.unit_resamplers.pop(unit, None)
         self.deliveries = [d for d in self.deliveries
                            if not (d.event[0] in ("chunk", "finished", "failed") and d.event[1].unit == unit)]
@@ -551,7 +871,75 @@ class Driver:
         self.seq += 1
         self.deliveries.append(_Delivery(self.now + after, self.seq, event))
 
+    def feed_hy(self, closed: list[SourceSpan]) -> None:
+        """Stream open speech and redeem closed spans in order without blocking capture."""
+        hy = self.hy_streaming
+        if hy is None:
+            return
+        voiced_end = self.segment_vad.voiced_end if self.segment_vad is not None else self.vad.voiced_end
+        actions = self.audio_feed.update(closed, self.audio_segments.open_start, voiced_end)
+        for action in actions:
+            if isinstance(action, Append):
+                pcm = self.history_slice(action.span)
+                if pcm is None or len(pcm) != action.span.count:
+                    hy.discard()
+                    self.audio_feed = AudioStreamFeed(self.audio_segments.stream_limit_samples)
+                    return
+                hy.stream(pcm)
+            elif isinstance(action, Close):
+                if len(self.hy_tickets) >= 16:
+                    self.hy_tickets.pop(0)
+                self.hy_tickets.append((action.span, hy.close(span_samples=action.span.count)))
+            elif isinstance(action, Discard):
+                hy.discard()
+
+    def reset_audio_translation(self) -> None:
+        self.audio_segments = (AudioSegmentPolicy.sentences(self.o.presentation_delay_ms / 1000)
+                               if self.o.asr == "audio" and self.o.sentence_units and self.o.background
+                               and self.o.presentation_delay_ms > 0 else AudioSegmentPolicy())
+        self.audio_feed = AudioStreamFeed(self.audio_segments.stream_limit_samples)
+        self.hy_tickets.clear()
+        self.translation_audio.clear()
+        self.translation_tickets.clear()
+        self.recent_segments.clear()
+        self.segment_frontier = self.src_frames
+        if self.separator is not None:
+            self.separator.reset()
+            self.separation_output = self.src_frames
+            self.voice_history = np.zeros(0, np.float32)
+            self.voice_history_start = self.src_frames
+            self.separator_input = np.zeros(0, np.float32)
+            self.bed.reset(self.src_frames)
+            self.background_ring.skip(self.background_ring.readable)
+            self.background_resampler = StreamingResampler(CANONICAL, self.out_rate)
+            self.segment_vad = vad_for(self.o) if self.o.asr == "audio" else None
+            if self.segment_vad is not None:
+                self.segment_vad.threshold_db = np.float32(self.o.vad_threshold_db - 5)
+            self.segment_threshold = (AdaptiveSpeechThreshold(self.o.vad_threshold_db - 5)
+                                      if self.audio_segments.dip_window_samples else None)
+            self.voice_to16k = StreamingResampler(CANONICAL, 16_000) if self.segment_vad is not None else None
+        if self.o.mt in ("hy", "hy-local") and hasattr(self.translator, "reset"):
+            self.translator.reset()
+
     def start_translation(self, req) -> None:
+        if self.o.asr == "audio":
+            span = req.source_span
+            ticket_index = next((i for i, item in enumerate(self.hy_tickets) if item[0] == span), None)
+            if ticket_index is not None:
+                self.translation_tickets[req.unit_id] = self.hy_tickets[ticket_index][1]
+                del self.hy_tickets[: ticket_index + 1]
+                self.translation_queue.append(req)
+                self.launch_next_translation()
+                return
+            if self.hy_streaming is not None:
+                # Whole-span sending now would interleave with the next open streamed span.
+                self.inbox.put(("input", P.Translation(req.unit_id, P.Failure("Hy-SimulMT span was not streamed"))))
+                return
+            audio = self.history_slice(span) if span is not None else None
+            if audio is None or len(audio) != span.count:
+                self.inbox.put(("input", P.Translation(req.unit_id, P.Failure("Hy-SimulMT source audio unavailable"))))
+                return
+            self.translation_audio[req.unit_id] = audio
         if self.virtual:
             latency = self.translator_latency.nanoseconds(len(req.uncommitted_source)) if self.translator_latency else 0
             try:
@@ -568,13 +956,20 @@ class Driver:
             return
         req = self.translation_queue.pop(0)
         task = _Task(req.unit_id)
+        audio = self.translation_audio.pop(req.unit_id, None)
+        ticket = self.translation_tickets.pop(req.unit_id, None)
         modeled = (self.translator_latency.nanoseconds(len(req.uncommitted_source))
                    if self.translator_latency else 0)
 
         def run() -> None:
             started = native.now_ns()
             try:
-                outcome = P.Success(self.translator.translate(req))
+                if ticket is not None:
+                    outcome = P.Success(self.hy_streaming.answer(ticket, req.unit_id))
+                elif audio is not None:
+                    outcome = P.Success(self.translator.translate(req.unit_id, audio))
+                else:
+                    outcome = P.Success(self.translator.translate(req))
             except Exception as error:
                 outcome = P.Failure(f"{type(error).__name__}: {error}")
             spent = native.now_ns() - started
@@ -588,14 +983,19 @@ class Driver:
         task.thread.start()
 
     def start_synthesis(self, job: P.SynthesisJob) -> None:
+        lane = 0
         if not self.virtual:
-            if self.active_synthesis is not None:
+            if not self.can_start_synthesis:
                 self.synthesis_queue.append(job)
                 return
-            self.active_synthesis = job.unit
+            lane = next(n for n in range(self.synthesis_lanes) if n not in self.active_synthesis.values())
+            self.active_synthesis[job.unit] = lane
         synthesizer = self.synthesizer
-        voice = self.prepared_voices.get(f"{job.speaker.raw_value}/{job.profile_version}") or PreparedVoice(
-            job.speaker, job.profile_version, 0)
+        key = f"{job.speaker.raw_value}/{job.profile_version}"
+        # Virtual clock nodes run every job inline on lane 0 and never touch a worker.
+        lanes = None if self.virtual else self.prepared_lane_voices.get(key)
+        voice = (lanes[lane] if lanes and lane < len(lanes) else None) or self.prepared_voices.get(key) or (
+            PreparedVoice(job.speaker, job.profile_version, 0))
         self.plays[job.unit] = PlayRecord(job.unit)
         tone = synthesizer if isinstance(synthesizer, ToneSynthesizer) else None
         if self.virtual and tone is not None:
@@ -606,16 +1006,24 @@ class Driver:
             self.schedule(("finished", job), at)
             return
         task = _Task(job.unit)
+        spoken = self.pronunciation.apply(job.text)
+        # The actor's own line conditions this take only; it remains in memory and dies with the job.
+        delivery = None
+        if job.delivery_allowed:
+            pcm = self.history_slice(job.span)
+            if pcm is not None:
+                delivery = DeliveryClip(pcm, CANONICAL, self.pipeline.source_text(job.unit) or "")
 
         def run() -> None:
             try:
                 if tone is not None:
                     time.sleep(tone.first_chunk.nanoseconds(0) / 1e9)
-                    stream = tone.synthesize(job.unit.raw_value, job.text)
-                elif hasattr(synthesizer, "synthesize_voice"):
-                    stream = synthesizer.synthesize_voice(job.unit.raw_value, job.text, voice, job.target_seconds)
+                    stream = tone.synthesize(job.unit.raw_value, spoken)
+                elif getattr(synthesizer, "supports_fill", False):
+                    stream = synthesizer.synthesize(job.unit.raw_value, spoken, voice, job.target_seconds,
+                                                    allow_fill=job.allow_fill, lane=lane, delivery=delivery)
                 else:
-                    stream = synthesizer.synthesize(job.unit.raw_value, job.text, voice, job.target_seconds)
+                    stream = synthesizer.synthesize(job.unit.raw_value, spoken, voice, job.target_seconds)
                 task.stream = stream
                 if task.cancelled and hasattr(stream, "cancel"):
                     stream.cancel()
@@ -658,8 +1066,8 @@ class Driver:
         elif kind == "finished":
             job = event[1]
             self.tasks.pop(job.unit, None)
-            if self.active_synthesis == job.unit:
-                self.active_synthesis = None
+            self.active_synthesis.pop(job.unit, None)
+            self.trace_synthesis_done(job)
             play = self.plays.get(job.unit)
             if play is None:
                 return
@@ -673,13 +1081,15 @@ class Driver:
         elif kind == "failed":
             job, message = event[1], event[2]
             self.tasks.pop(job.unit, None)
-            if self.active_synthesis == job.unit:
-                self.active_synthesis = None
+            self.active_synthesis.pop(job.unit, None)
             self.send(P.SynthesisFailed(job.unit, message))
         elif kind == "prepared":
             voice, seconds, prepare_ns = event[1], event[2], event[3]
+            voices = event[4] if len(event) > 4 else [voice]
             self.preparing_reference = False
-            self.prepared_voices[f"{voice.speaker_id.raw_value}/{voice.profile_version}"] = voice
+            key = f"{voice.speaker_id.raw_value}/{voice.profile_version}"
+            self.prepared_voices[key] = voice
+            self.prepared_lane_voices[key] = voices
             policy = self.reference_policies.get(voice.speaker_id)
             if policy and policy.is_complete and not any(p.speaker == voice.speaker_id for p in self.pending_references):
                 self.reference_audio.pop(voice.speaker_id, None)
@@ -693,11 +1103,32 @@ class Driver:
             self.publish_voice_progress(voice.speaker_id, "ready", seconds)
             if self.pending_references:
                 self.prepare_reference(self.pending_references.pop(0))
+        elif kind == "remembered_ready":
+            voice, seconds, prepare_ns = event[1], event[2], event[3]
+            self.memory_preparing.discard(voice.speaker_id)
+            self.memory_reused.add(voice.speaker_id)
+            self.reference_audio.pop(voice.speaker_id, None)
+            self.reference_policies.pop(voice.speaker_id, None)
+            key = f"{voice.speaker_id.raw_value}/{voice.profile_version}"
+            self.prepared_voices[key] = voice
+            self.prepared_lane_voices[key] = event[4]
+            self._incr("reference_memory_reused")
+            self.profile_log.append({"speaker": voice.speaker_id.raw_value, "version": voice.profile_version,
+                                     "reference_seconds": seconds, "prepare_seconds": prepare_ns / 1e9,
+                                     "source_seconds": self.src_frames / CANONICAL, "reused": True})
+            self.publish_voice_progress(voice.speaker_id, "ready", seconds, reused=True)
+            self.send(P.ProfileReady(voice.speaker_id, voice.profile_version))
+        elif kind == "remembered_failed":
+            speaker = event[1]
+            self.memory_preparing.discard(speaker)
+            self.memory_failed.add(speaker)
+            self._incr("reference_memory_failed")
+            self.publish_voice_progress(speaker, "collecting")
         elif kind == "prepare_failed":
             speaker, version, message = event[1], event[2], event[3]
             self.preparing_reference = False
             if version == 1:
-                self.reference_policies[speaker] = ReferencePolicy(speaker)
+                self.reference_policies[speaker] = self.live_reference_policy(speaker)
                 self.reference_audio.pop(speaker, None)
                 self.pending_references = [p for p in self.pending_references if p.speaker != speaker]
             self.publish_voice_progress(speaker, "collecting")
@@ -720,6 +1151,49 @@ class Driver:
         elif kind == "voice_failed":
             self._incr("voice_prepare_failed")
             log(f"voice for {event[1]} failed: {event[2]}" if self.o.research_text else f"voice for {event[1]} failed")
+
+    def trace_synthesis_done(self, job: P.SynthesisJob) -> None:
+        """`tts.done`: the worker's pacing of a completed unit, numbers only."""
+        take = getattr(self.synthesizer, "take_stats", None)
+        done = take(job.unit.raw_value) if take else None
+        if done is None:
+            return
+        if done.truncated:
+            self._incr("tts_truncated_units")
+        if done.retries > 0:
+            self._incr("tts_silent_retries", done.retries)
+        delivery = getattr(done, "delivery", "absent")
+        if delivery != "absent":
+            self._incr("delivery_used_units" if delivery == "line" else "delivery_refused_units")
+            if delivery != "line":
+                self._incr(f"delivery_{delivery}")
+            self.stats["delivery_prep_ms_max"] = max(
+                self.stats.get("delivery_prep_ms_max", 0), round_half_away(done.delivery_prep_seconds * 1000))
+
+        def ms(seconds: float) -> int:
+            return round_half_away(seconds * 1000)
+
+        fields = [f_unit(job.unit), f_double("pace", done.pace), f_int("native_ms", ms(done.native_seconds)),
+                  f_int("audio_ms", ms(done.audio_seconds)), f_int("quiet_removed_ms", ms(done.quiet_removed_seconds))]
+        if done.budget_seconds > 0:
+            fields.append(f_int("budget_ms", ms(done.budget_seconds)))
+        # The character-count cap stopped generation: this line lost its tail.
+        if done.truncated:
+            fields.append(f_bool("truncated", True))
+        # A silent first take was discarded and generated again with another seed.
+        if done.retries > 0:
+            fields.append(f_int("retries", done.retries))
+        if delivery != "absent":
+            fields.append(f_str("delivery", delivery))
+            fields.append(f_int("delivery_ms", ms(done.delivery_seconds)))
+            fields.append(f_int("delivery_prep_ms", ms(done.delivery_prep_seconds)))
+        if job.target_seconds is not None:
+            fields.append(f_int("target_ms", ms(job.target_seconds)))
+        if not self.pronunciation.is_empty:
+            fields.append(f_bool("respelled", self.pronunciation.apply(job.text) != job.text))
+        gate = self.pipeline.gate
+        self.trace.emit(TraceEvent(self.now, self.o.session, gate.epoch, gate.generation, TraceKind.TTS_DONE,
+                                   tuple(fields)))
 
     def write(self, audio, unit: UnitID) -> None:
         resampler = self.unit_resamplers.get(unit)
@@ -851,8 +1325,14 @@ class Driver:
             self.runtime_failed = True
             log("recognition is still processing when the tail limit expired; increase --tail-seconds or use a faster device")
 
-    def step(self, chunk: np.ndarray | None, frames: int) -> None:
+    def step(self, chunk: np.ndarray | None, frames: int, synthetic: bool = False) -> None:
+        """`synthetic`: silence that is not source time (a pause flush). It renders no output
+        span of its own."""
         self.now = self.clock()
+        if chunk is not None:
+            self.idle_since = None
+            self.pause_flushed = False
+            self.last_capture_now = self.now
         if self.controls is not None:
             mode = self.controls.take_latest()
             if mode is not None:
@@ -863,6 +1343,12 @@ class Driver:
         span = SourceSpan(start, self.src_frames)
         if chunk is not None:
             self.send(P.Captured(span))
+        if self.live is not None:
+            reason = self.live.take_discontinuity()
+            if reason:
+                log(f"{reason}; translation restarts from the next phrase")
+                self.send(P.Discontinuity(reason))
+                self.reset_audio_translation()
         if (not self.o.captions_only and self.o.tts != "clone" and not self.profile_ready
                 and start * 1_000 // CANONICAL >= self.o.profile_ready_ms):
             self.profile_ready = True
@@ -901,17 +1387,51 @@ class Driver:
             for event in self.tracker.process(frame16, vad_events):
                 self.send(P.Speaker(event))
                 self.note_speaker(event)
-        self.recognizer.accept(frame16)
-        for h in self.recognizer.drain_hypotheses():
-            if self.o.asr == "scripted" or self.speech_evidence.accepts(h):
-                self.send(P.Hypothesis(h))
-                self.acquire_reference(h)
-            else:
-                self._incr("silence_hypotheses_rejected")
+        segments = []
+        if self.separator is not None:
+            try:
+                segments = self.process_separation(samples)
+            except Exception:
+                self.fail_background()
+        elif self.o.asr == "audio":
+            segments = self.audio_segments.process(vad_events, span.end)
+        if self.o.asr == "audio":
+            # The worker hears the span before the reducer commits it, hiding all but the last turn.
+            self.feed_hy(segments)
+            for segment in segments:
+                self.send(P.AudioSegment(segment))
+                self.send(P.FollowingSilence(segment, self.following_silence_seconds(segment)))
+                self.recent_segments.append(segment)
+                if len(self.recent_segments) > 32:
+                    self.recent_segments.pop(0)
+                if self.restores_voice and self.lid is not None:
+                    voice = self.voice_history_slice(segment)
+                    if voice is not None:
+                        self.lid.identify(segment, voice)
+                    else:
+                        self._incr("lid_failed")
+                if self.acquires_reference:
+                    h = ASRHypothesis(segment.start, (ASRToken("", segment),), True, segment.end)
+                    self.acquire_reference(h)
+            for closed in self.recent_segments:
+                self.send(P.FollowingSilence(closed, self.following_silence_seconds(closed)))
+            if self.lid is not None:
+                for source_span, matches in self.lid.drain():
+                    self._incr("lid_same_language" if matches else "lid_translate")
+                    self.send(P.SourceLanguage(source_span, matches))
+        else:
+            self.recognizer.accept(frame16)
+            for h in self.recognizer.drain_hypotheses():
+                if self.o.asr == "scripted" or self.speech_evidence.accepts(h):
+                    self.send(P.Hypothesis(h))
+                    self.acquire_reference(h)
+                else:
+                    self._incr("silence_hypotheses_rejected")
         if self.deferred_references:
             self.offer_deferred_references()
         for adapter, label in ((self.recognizer, "recognition"), (self.translator, "translation"),
-                               (self.synthesizer, "voice worker")):
+                               (self.synthesizer, "voice worker"), (self.separator, "separator"),
+                               (self.lid, "language identifier")):
             failure = getattr(adapter, "failure", None)
             if failure and not self.runtime_failed:
                 log(f"{label} stopped: {failure}" if self.o.research_text else f"{label} stopped")
@@ -926,10 +1446,60 @@ class Driver:
         self.deliveries.sort()
         while self.deliveries and self.deliveries[0].at <= self.now:
             self.deliver(self.deliveries.pop(0).event)
-        self.render(samples if chunk is not None else None, frames)
+        try:
+            self.flush_bed()
+        except AdapterError:
+            self.fail_background()
+        self.render(samples if chunk is not None else None, 0 if synthetic else frames)
         if self.now >= self.last_tick + 100_000_000:
             self.last_tick = self.now
             self.send(P.TranslatedBacklog(self.translated_ring.readable / self.out_rate))
+            self.send(P.Tick())
+        if self.now >= self.last_resource + 1_000_000_000:
+            self.last_resource = self.now
+            self.emit_resource()
+        self.trace.flush()
+
+    def idle_step(self, frames: int) -> None:
+        """A period without capture. Model results, playout tracking, ticks and phrase slots still
+        advance by the clock; nothing touches the source timeline, VAD, or tracker."""
+        self.now = self.clock()
+        # No frames is not silence: the phrase spoken just before a pause would stay open until
+        # capture resumes and miss its slot. Once per pause, 0.6 s of silence closes it through
+        # the usual VAD rules. It gets no capture anchor, so slots stay on captured time.
+        since = self.idle_since if self.idle_since is not None else self.now
+        self.idle_since = since
+        if not self.pause_flushed and self.now - since >= 300_000_000:
+            self.pause_flushed = True
+            flush = CANONICAL * 3 // 5
+            self.step(None, flush, synthetic=True)
+            self.synthetic_frames += flush
+            self.idle_since = since
+            self.pause_flushed = True
+            return
+        if self.controls is not None:
+            mode = self.controls.take_latest()
+            if mode is not None:
+                self.send(P.SetPlaybackMode(mode))
+        while True:
+            try:
+                event = self.inbox.get_nowait()
+            except queue.Empty:
+                break
+            self.deliver(event)
+        self.deliveries.sort()
+        while self.deliveries and self.deliveries[0].at <= self.now:
+            self.deliver(self.deliveries.pop(0).event)
+        # The device renders on its own; a file replay renders the same span of output.
+        try:
+            self.flush_bed()
+        except AdapterError:
+            self.fail_background()
+        self.render(None, frames if self.live is None else 0)
+        # Every input re-checks slots, so due phrases start within one idle step.
+        self.send(P.TranslatedBacklog(self.translated_ring.readable / self.out_rate))
+        if self.now >= self.last_tick + 100_000_000:
+            self.last_tick = self.now
             self.send(P.Tick())
         if self.now >= self.last_resource + 1_000_000_000:
             self.last_resource = self.now
@@ -961,7 +1531,10 @@ class Driver:
         if self.live is not None:
             self.live.start_clock(o.seconds)
             while (chunk := source.next_live(until_stop=True)) is not None:
-                self.step(chunk, len(chunk))
+                if len(chunk):
+                    self.step(chunk, len(chunk))
+                else:
+                    self.idle_step(0)
                 if self.runtime_failed:
                     break
             log(f"stopping: finishing in-flight units over live audio (up to {o.tail_seconds} s)")
@@ -970,14 +1543,24 @@ class Driver:
                 chunk = source.next_live(until_stop=False)
                 if chunk is None:
                     break
-                self.step(chunk, len(chunk))
+                if len(chunk):
+                    self.step(chunk, len(chunk))
+                else:
+                    self.idle_step(0)
                 tail += len(chunk)
                 if tail >= CANONICAL and self.idle:
                     break
         else:
             realtime_file = not self.virtual and source.total_frames is not None and o.pace == "realtime"
             wall_start = native.now_ns()
+            gap = o.capture_gap
             while (chunk := source.next()) is not None:
+                if gap is not None and self.src_frames / CANONICAL >= gap[0]:
+                    at, seconds = gap
+                    gap = None
+                    for _ in range(round_half_away(seconds * 50)):
+                        self.idle_ns += 20_000_000
+                        self.idle_step(CANONICAL // 50)
                 self.step(chunk, len(chunk))
                 if self.runtime_failed:
                     break
@@ -1000,8 +1583,12 @@ class Driver:
             self.runtime_failed = True
             log(source.failure)
             self.send(P.Discontinuity(source.failure))
+        try:
+            self.flush_bed(final=True)
+        except AdapterError:
+            self.fail_background()
         self.send(P.Stop())
-        for adapter in (self.synthesizer, self.translator, self.recognizer):
+        for adapter in (self.synthesizer, self.translator, self.recognizer, self.separator, self.lid):
             if hasattr(adapter, "shutdown"):
                 adapter.shutdown()
         if self.live is not None:
@@ -1009,10 +1596,22 @@ class Driver:
             self.live.stop()
         self.write_rendered()
         self.trace.close()
-        for w in (self.out_writer, self.stem_writer, self.source_writer, self.translated_writer, self.rendered_writer):
+        if self.voice_memory is not None:
+            self.voice_memory.flush()
+        for w in (self.out_writer, self.stem_writer, self.source_writer, self.translated_writer,
+                  self.rendered_writer, self.background_writer):
             if w:
                 w.close()
         self.summary()
+
+    def slot_summary(self) -> dict:
+        """Slot timing: phrases scheduled, median and worst lateness, and how many started within
+        250 ms of their slot (scheduling time, before the device buffer)."""
+        if not self.slot_late_ms:
+            return {"scheduled": 0}
+        ordered = sorted(self.slot_late_ms)
+        return {"scheduled": len(ordered), "median_late_ms": ordered[len(ordered) // 2], "max_late_ms": ordered[-1],
+                "within_250ms": sum(1 for ms in ordered if abs(ms) <= 250)}
 
     def pace(self, wall_start: int) -> None:
         target = wall_start + self.src_frames * 1_000_000_000 // CANONICAL
@@ -1031,9 +1630,15 @@ class Driver:
             "tts_identity_qualified": False,
             "source_frames": self.src_frames, "output_frames": self.out_frames, "trace_events": self.trace.event_count,
             "pcm_dropped": self.stats.get("pcm_dropped", 0), "underruns": self.stats.get("underruns", 0),
+            "asr_dropped_finals": getattr(self.recognizer, "dropped_finals", 0),
+            "asr_forced_splits": getattr(self.recognizer, "forced_splits", 0),
             "final_state": str(self.pipeline.state), "runtime_failed": self.runtime_failed,
             "captions_only": o.captions_only, "translation_only": o.translation_only,
             "output_sample_rate": self.out_rate, "playback": self.pipeline.playback_mode.value, "fluent": o.fluent,
+            "presentation_delay_ms": o.presentation_delay_ms, "turn_fill": o.turn_fill, "slot": self.slot_summary(),
+            "adaptive_prebuffer": o.adaptive_prebuffer, "quality_first": o.quality_first,
+            "background": {"enabled": o.background, "failed": self.background_failed,
+                           "frames": self.background_frames, "backend": "rnnoise" if self.separator else None},
             "rendered_frames_recorded": self.rendered_frames,
             "rendered_capture_overflow_frames": self.engine.rendered.overflow_frames if self.engine.rendered else 0,
             "silence_hypotheses_rejected": self.stats.get("silence_hypotheses_rejected", 0),
@@ -1041,22 +1646,62 @@ class Driver:
             "max_debt_seconds": self.pipeline.config.health.max_debt_seconds,
             "max_source_lag_seconds": self.pipeline.config.health.max_source_lag_seconds,
             "max_unit_keys": self.pipeline.config.commit.max_unit_keys,
+            "max_unit_seconds": self.pipeline.config.commit.max_unit_source_seconds,
+            # Cuts stay off Han words only where the system segmenter is available.
+            "word_cuts": self.word_segmenter is not None or self.target_word_segmenter is not None,
+            "speaker_carry_seconds": self.pipeline.config.unlabeled_speaker_carry_seconds,
+            "speaker_carry_after_pause_seconds": self.pipeline.config.unlabeled_speaker_carry_after_pause_seconds,
+            "speaker_carry_max_piece_seconds": self.pipeline.config.unlabeled_speaker_carry_max_piece_seconds,
+            "speaker_carried_units": self.stats.get("speaker_carried_units", 0),
+            "shorten_targets": self.pipeline.config.validator.shortens_over_budget_targets,
+            "shortened_targets": self.stats.get("shortened_targets", 0),
+            "filler_silence": self.pipeline.config.validator.silences_fillers,
+            "silence_units": self.stats.get("silence_units", 0),
+            "tts_truncated_units": self.stats.get("tts_truncated_units", 0),
+            "tts_silent_retries": self.stats.get("tts_silent_retries", 0),
             "speakers": {"mode": o.speakers, "detected": 1 if self.tracker is None else len(self.known_speakers)},
+            "audio_units": {"max_seconds": self.audio_segments.max_samples / CANONICAL,
+                            "detector": "voice" if self.segment_vad is not None else "session",
+                            "pause_closes": self.audio_segments.pause_closes,
+                            "cap_closes": self.audio_segments.cap_closes},
+            "passthrough": {"enabled": self.restores_voice, "identifier": self.lid is not None,
+                            "hold_seconds": self.bed.delay_frames / CANONICAL if self.bed else 0,
+                            "same_language": self.stats.get("lid_same_language", 0),
+                            "translated": self.stats.get("lid_translate", 0),
+                            "failed": self.stats.get("lid_failed", 0),
+                            "voice_restored_units": self.stats.get("voice_restored_units", 0),
+                            "voice_restored_late": self.stats.get("voice_restored_late", 0)},
             "runtime": {"implementation": "portable", "platform": sys.platform, "vad": o.vad,
+                        "dropped_finals": getattr(self.recognizer, "dropped_finals", 0),
+                        "forced_splits": getattr(self.recognizer, "forced_splits", 0),
                         "adapters": {k: getattr(a, "describe", lambda: getattr(a, "name", type(a).__name__))()
                                      for k, a in (("asr", self.recognizer), ("mt", self.translator),
                                                   ("tts", self.synthesizer))}},
         }
+        if o.mt in ("hy", "hy-local"):
+            info = getattr(self.translator, "info", None)
+            s["speech_translation"] = {
+                "backend": o.mt, "audio_leaves_machine": o.mt == "hy",
+                "streaming": self.hy_streaming is not None,
+                "model": info.model if info else "",
+                "load_seconds": info.load_seconds if info else 0,
+                "warmup_seconds": info.warmup_seconds if info else 0}
         if self.tracker is not None and o.tts != "clone":
             s["voices"] = self.profile_log
         info = getattr(self.synthesizer, "info", None)
         if o.tts == "clone":
             s["clone"] = {"model": info.model if info else "", "selected_model": o.clone_model,
                           "audio_output_streaming": bool(caps.audio_output_streaming) if caps else False,
-                          "conditioning": o.clone_mode, "reference": "fixed" if o.voice_ref else "acquired",
+                          "conditioning": o.clone_mode, "delivery": o.clone_delivery,
+                          "reference": "fixed" if o.voice_ref else "acquired",
                           "profiles": self.profile_log, "load_seconds": info.load_seconds if info else 0,
                           "warmup_seconds": info.warmup_seconds if info else 0,
-                          "reference_stats": {k: v for k, v in self.stats.items() if k.startswith("reference_")}}
+                          "workers": getattr(self.synthesizer, "worker_count", 1),
+                          "session_voice_locked": self.pipeline.config.pin_speaker_profiles,
+                          "speaker_attribution_required": (self.pipeline.config.require_speaker_attribution
+                                                           and self.pipeline.config.multi_speaker),
+                          "reference_stats": {k: v for k, v in self.stats.items() if k.startswith("reference_")},
+                          "delivery_stats": {k: v for k, v in self.stats.items() if k.startswith("delivery_")}}
         if self.live is not None:
             s["mode"] = "tap"
             s["output_frames"] = self.engine.counter("output_frames")
@@ -1064,11 +1709,23 @@ class Driver:
         self._stdout(json.dumps(s, sort_keys=True))
 
 
-def vad_for(o):
-    if o.vad == "silero":
-        from .models.silero import SileroVAD
+def word_segmenter_for(language):
+    """Windows' word segmenter for a Mandarin side, as the Swift host injects NaturalLanguage's:
+    per-character keys hide Han words, so only a segmenter keeps a cut out of one. None for
+    space-delimited languages (the commit policy's Latin rule) or where none is available."""
+    if language is not TranslationLanguage.MANDARIN or sys.platform != "win32":
+        return None
+    from .models.word_segmenter import WindowsWordSegmenter
 
-        return SileroVAD()
+    try:
+        return WindowsWordSegmenter(language.translation_identifier)
+    except OSError as error:
+        log(f"word segmenter unavailable ({error}); clause cuts follow the commit rules only")
+        return None
+
+
+def vad_for(o):
+    # --vad silero is refused by option validation until the manifest pins a Silero revision.
     return EnergyVAD(threshold_db=o.vad_threshold_db)
 
 

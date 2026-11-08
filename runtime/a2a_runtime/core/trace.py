@@ -53,6 +53,7 @@ class TraceKind(str, Enum):
     GAIN_RAMP = "gain.ramp"
     FINALIZE_REQUEST = "asr.finalize_request"
     CATCH_UP = "catch_up"
+    TTS_DONE = "tts.done"
 
 
 class _Null:

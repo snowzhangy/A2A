@@ -17,9 +17,12 @@ from __future__ import annotations
 import ctypes as C
 import ctypes.wintypes as W
 import json
+import msvcrt
 import os
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,6 +53,14 @@ _k32.OpenProcess.restype = W.HANDLE
 _k32.OpenProcess.argtypes = [W.DWORD, W.BOOL, W.DWORD]
 _k32.GetExitCodeProcess.argtypes = [W.HANDLE, C.POINTER(W.DWORD)]
 _k32.CloseHandle.argtypes = [W.HANDLE]
+
+
+class FILETIME(C.Structure):
+    _fields_ = [("dwLowDateTime", W.DWORD), ("dwHighDateTime", W.DWORD)]
+
+
+_k32.GetProcessTimes.argtypes = [W.HANDLE, C.POINTER(FILETIME), C.POINTER(FILETIME),
+                                C.POINTER(FILETIME), C.POINTER(FILETIME)]
 _k32.WaitForSingleObject.argtypes = [W.HANDLE, W.DWORD]
 _k32.WaitForSingleObject.restype = W.DWORD
 
@@ -91,6 +102,22 @@ def is_alive(pid: int) -> bool:
         _k32.CloseHandle(h)
 
 
+def process_start_100ns(pid: int) -> int | None:
+    """Process creation timestamp, used to distinguish a reused PID from the original process."""
+    if pid <= 0:
+        return None
+    h = _k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return None
+    try:
+        created, exited, kernel, user = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+        if not _k32.GetProcessTimes(h, C.byref(created), C.byref(exited), C.byref(kernel), C.byref(user)):
+            return None
+        return (created.dwHighDateTime << 32) | created.dwLowDateTime
+    finally:
+        _k32.CloseHandle(h)
+
+
 def wait_for_exit(pid: int) -> None:
     h = _k32.OpenProcess(SYNCHRONIZE, False, pid)
     if not h:
@@ -126,6 +153,7 @@ class AudioSession:
     display_name: str
     endpoint: str
     exe: str
+    session_id: str
 
 
 _SESSION_STATES = {0: "inactive", 1: "active", 2: "expired"}
@@ -139,19 +167,25 @@ def audio_sessions() -> list[AudioSession]:
     names = {p.pid: p.exe for p in processes()}
     return [AudioSession(s.pid, _SESSION_STATES.get(s.state, str(s.state)), bool(s.muted), s.volume,
                          s.display_name.decode("utf-8", "replace"), s.endpoint.decode("utf-8", "replace"),
-                         names.get(s.pid, "")) for s in buf[:n]]
+                         names.get(s.pid, ""), s.session_id.decode("utf-8", "replace")) for s in buf[:n]]
 
 
 @dataclass(frozen=True)
 class Source:
-    """A tap target: the root process and the tree whose audio is captured and silenced."""
+    """A tap target: the root process and the tree whose audio is captured and silenced.
+
+    `global_mix` is the whole output mix (the Swift driver's `--tap-global`): `root` is this
+    runtime, whose tree is the one excluded from capture and never silenced."""
 
     root: int
     exe: str
     members: frozenset[int]
+    global_mix: bool = False
 
     @property
     def label(self) -> str:
+        if self.global_mix:
+            return "the whole output mix (excluding this runtime)"
         return f"{self.exe} (pid {self.root}, {len(self.members)} process{'es' if len(self.members) != 1 else ''})"
 
 
@@ -191,6 +225,11 @@ def resolve(pid: int | None = None, exe: str | None = None) -> Source:
                               f"(pids {', '.join(str(r.pid) for r in roots)}); pass --tap-pid")
     root = roots[0]
     return Source(root.pid, root.exe, frozenset(process_tree(root.pid, procs)))
+
+
+def system_audio() -> Source:
+    """Every process's audio except this runtime's own tree (its playback and its workers)."""
+    return Source(os.getpid(), "system audio", frozenset(), global_mix=True)
 
 
 # MARK: Render endpoints
@@ -284,17 +323,43 @@ DEFAULT_DUCK_DB = -60.0
 
 
 def _write_journal(path: Path, entries: list[dict]) -> None:
+    """Atomically replace the journal. Callers hold `_journal_lock` for read/modify/write cycles."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"entries": entries}, indent=1))
-    os.replace(tmp, path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(json.dumps({"entries": entries}, indent=1), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+@contextmanager
+def _journal_lock(path: Path):
+    """Serialize hosts and guards on Windows; the lock file itself is never replaced."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    with open(lock_path, "a+b") as lock:
+        lock.seek(0)
+        msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def _read_journal(path: Path) -> list[dict]:
     try:
-        return list(json.loads(path.read_text()).get("entries", []))
-    except (OSError, ValueError):
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return []
+    except (OSError, ValueError) as error:
+        raise SourceError(f"cannot read audio recovery journal {path}: {error}") from error
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), list) or not all(
+        isinstance(entry, dict) for entry in data["entries"]
+    ):
+        raise SourceError(f"invalid audio recovery journal {path}; preserve it for manual recovery")
+    return data["entries"]
 
 
 def _pid_array(pids):
@@ -318,14 +383,37 @@ def set_volume(pids: set[int] | frozenset[int], level: float) -> int:
     return r
 
 
-class SourceSilencer:
-    """Keeps the source tree inaudible while it is tapped, and restores it afterwards.
+def set_session_volume(session_id: str, level: float) -> int:
+    r = native.lib().a2a_wasapi_set_session_volume_by_id(session_id.encode("utf-8"), float(level))
+    if r < 0:
+        raise OSError(f"session volume failed (HRESULT 0x{r & 0xFFFFFFFF:08X})")
+    return r
 
-    `duck` (default) lowers each session to `duck_db`; `capture_gain` undoes it exactly.
-    `mute` silences the sessions, which also silences process-loopback capture, so it is
-    only for probes. Every change is journaled (pid, exe, original value) before it is
-    applied. Sessions the app opens later, and volume changes made by the app or the user,
-    are caught by `refresh`, which the driver calls every 250 ms.
+
+def set_session_mute(session_id: str, mute: bool) -> int:
+    r = native.lib().a2a_wasapi_set_session_mute_by_id(session_id.encode("utf-8"), 1 if mute else 0)
+    if r < 0:
+        raise OSError(f"session mute failed (HRESULT 0x{r & 0xFFFFFFFF:08X})")
+    return r
+
+
+def _same_process(entry: dict, pid: int) -> bool:
+    # The Windows system-sounds audio session has PID 0 and no process handle.
+    # Its endpoint-specific session identifier is the only available identity.
+    if pid == 0:
+        return entry.get("pid") == 0 and bool(entry.get("session_id"))
+    if not is_alive(pid):
+        return False
+    recorded = entry.get("process_start_100ns")
+    return recorded is None or process_start_100ns(pid) == recorded
+
+
+class SourceSilencer:
+    """Duck and restore exact audio-session identities, with a locked crash-recovery journal.
+
+    A PID is not an identity: Windows can reuse it, and one process can own sessions on several
+    endpoints. Every entry therefore carries the native session identifier and process creation
+    time. Missing sessions stay journaled for the guard instead of being mistaken for restored.
     """
 
     def __init__(self, source: Source, mode: str = "duck", duck_db: float = DEFAULT_DUCK_DB,
@@ -336,88 +424,156 @@ class SourceSilencer:
         self.mode = mode
         self.level = 10 ** (duck_db / 20)
         self.journal = journal
-        self._changed: dict[int, dict] = {}
+        self._changed: dict[str, dict] = {}
         self.foreign_changes = 0
 
     @property
     def capture_gain(self) -> float:
         return 1.0 / self.level if self.mode == "duck" else 1.0
 
-    def refresh(self) -> int:
-        """Silence sessions of the tree not silenced yet and re-assert ones that moved.
-        Returns the number of sessions changed."""
+    def _sessions(self) -> list[AudioSession]:
+        if self.source.global_mix:
+            own = process_tree(self.source.root) | {os.getppid()}
+            return [s for s in audio_sessions() if s.pid != 0 and s.pid not in own]
         members = set(self.source.members)
         if is_alive(self.source.root):
             members |= process_tree(self.source.root)
-        sessions = [s for s in audio_sessions() if s.pid in members]
+        return [s for s in audio_sessions() if s.pid in members]
+
+    def refresh(self) -> int:
+        """Duck new sessions and re-assert external changes without touching another session."""
         new = []
-        for s in sessions:
-            prior = self._changed.get(s.pid)
+        for s in self._sessions():
+            if not s.session_id:
+                continue  # an unidentifiable session is never changed by PID guesswork
+            prior = self._changed.get(s.session_id)
             if self.mode == "duck":
                 if prior is None:
-                    new.append({"pid": s.pid, "exe": s.exe, "kind": "duck", "volume": s.volume, "level": self.level})
+                    new.append({"pid": s.pid, "exe": s.exe, "kind": "duck", "volume": s.volume,
+                                "level": self.level, "endpoint": s.endpoint, "session_id": s.session_id,
+                                "process_start_100ns": process_start_100ns(s.pid)})
                 elif abs(s.volume - self.level) > 1e-6:
-                    self.foreign_changes += 1  # an app or mixer volume control moved it
-                    set_volume({s.pid}, self.level)
+                    self.foreign_changes += 1
+                    set_session_volume(s.session_id, self.level)
             elif prior is None and not s.muted:
-                new.append({"pid": s.pid, "exe": s.exe, "kind": "mute", "volume": s.volume})
+                new.append({"pid": s.pid, "exe": s.exe, "kind": "mute", "volume": s.volume,
+                            "endpoint": s.endpoint, "session_id": s.session_id,
+                            "process_start_100ns": process_start_100ns(s.pid)})
         if not new:
             return 0
         stamp = {"host_pid": os.getpid(), "at": time.time()}
-        pids = {e["pid"] for e in new}
-        entries = [e for e in _read_journal(self.journal) if e.get("pid") not in pids]
-        _write_journal(self.journal, entries + [{**e, **stamp} for e in new])  # journal before changing
-        changed = set_volume(pids, self.level) if self.mode == "duck" else set_mute(pids, True)
-        for e in new:
-            self._changed[e["pid"]] = e
+        new = [{**entry, **stamp} for entry in new]
+        new_ids = {entry["session_id"] for entry in new}
+        with _journal_lock(self.journal):
+            entries = _read_journal(self.journal)
+            for entry in entries:
+                host = int(entry.get("host_pid", 0))
+                if entry.get("session_id") in new_ids and host != os.getpid() and is_alive(host):
+                    raise SourceError("another running A2A host already owns this audio session")
+            entries = [entry for entry in entries if entry.get("session_id") not in new_ids]
+            _write_journal(self.journal, entries + new)  # journal before changing
+        changed = 0
+        for entry in new:
+            session_id = entry["session_id"]
+            # Include the attempted change even if the native setter reports an error after
+            # changing the session, so normal cleanup can still try to restore it.
+            self._changed[session_id] = entry
+            if self.mode == "duck":
+                changed += set_session_volume(session_id, self.level)
+            else:
+                changed += set_session_mute(session_id, True)
         return changed
 
     def restore(self) -> int:
         if not self._changed:
             return 0
         restored = 0
-        for pid, e in self._changed.items():
-            restored += set_volume({pid}, e["volume"]) if e["kind"] == "duck" else set_mute({pid}, False)
-        live = {s.pid for s in audio_sessions()}
-        # A session whose process already exited keeps its entry for repair on the next launch.
-        done = {pid for pid in self._changed if pid in live or is_alive(pid)}
-        _write_journal(self.journal, [e for e in _read_journal(self.journal) if e.get("pid") not in done])
+        done = set()
+        current = {s.session_id: s for s in audio_sessions()}
+        for session_id, entry in self._changed.items():
+            session = current.get(session_id)
+            if session is None or not _same_process(entry, session.pid):
+                continue  # the detached guard repairs a later session/relaunch
+            if entry["kind"] == "duck":
+                if abs(session.volume - float(entry["level"])) > 1e-6:
+                    done.add(session_id)  # the user or another application changed it
+                    continue
+                changed = set_session_volume(session_id, entry["volume"])
+            else:
+                if not session.muted:
+                    done.add(session_id)
+                    continue
+                changed = set_session_mute(session_id, False)
+            restored += changed
+            if changed > 0:
+                done.add(session_id)
+        with _journal_lock(self.journal):
+            entries = [entry for entry in _read_journal(self.journal)
+                       if not (entry.get("session_id") in done and int(entry.get("host_pid", 0)) == os.getpid())]
+            _write_journal(self.journal, entries)
         self._changed.clear()
         return restored
 
 
 def restore_stranded(journal: Path = JOURNAL, all_hosts: bool = False) -> list[dict]:
-    """Undo silencing left by a host that is no longer running. An entry whose process has
-    exited is matched by exe name to a session still at the duck level (Windows restores the
-    persisted per-app volume when the app starts again)."""
-    entries = _read_journal(journal)
-    if not entries:
-        return []
-    sessions = audio_sessions()
-    by_pid = {s.pid: s for s in sessions}
-    repaired, keep = [], []
-    for e in entries:
-        host = int(e.get("host_pid", 0))
-        if not all_hosts and host != os.getpid() and is_alive(host):
-            keep.append(e)
-            continue
-        pid = int(e["pid"])
-        if e.get("kind") == "mute":
-            targets = {pid} if pid in by_pid else {s.pid for s in sessions if s.exe == e.get("exe") and s.muted}
-            if targets:
-                set_mute(targets, False)
-        else:
-            level = float(e.get("level", 0))
-            targets = {pid} if pid in by_pid else {
-                s.pid for s in sessions if s.exe == e.get("exe") and abs(s.volume - level) < 1e-6}
-            if targets:
-                set_volume(targets, float(e.get("volume", 1.0)))
-        if not targets and not is_alive(pid):
-            keep.append({**e, "host_pid": 0})  # not running now: repair its next launch
-            continue
-        repaired.append(e)
-    _write_journal(journal, keep)
-    return repaired
+    """Repair dead hosts without restoring a reused PID or dropping an unresolved entry."""
+    with _journal_lock(journal):
+        entries = _read_journal(journal)
+        if not entries:
+            return []
+        sessions = audio_sessions()
+        by_id = {s.session_id: s for s in sessions if s.session_id}
+        by_pid = {s.pid: s for s in sessions}
+        repaired, keep = [], []
+        for entry in entries:
+            host = int(entry.get("host_pid", 0))
+            if not all_hosts and host != os.getpid() and is_alive(host):
+                keep.append(entry)
+                continue
+            pid = int(entry["pid"])
+            pid_alive = is_alive(pid)
+            original_alive = pid_alive and _same_process(entry, pid)
+            target = by_id.get(entry.get("session_id", ""))
+            if target is not None and (target.pid != pid or not _same_process(entry, target.pid)):
+                target = None  # session identifiers are only valid with their original process
+            if target is None and original_alive and not entry.get("session_id"):
+                candidate = by_pid.get(pid)
+                if candidate is not None and candidate.session_id:
+                    target = candidate  # legacy journal entry, guarded by process creation time
+            candidates = [target] if target is not None else []
+            if not candidates and not pid_alive:
+                # Windows persists per-app volume across relaunch. Only a session still at our
+                # exact duck/mute state is eligible; another app at normal volume is never touched.
+                level = float(entry.get("level", 0))
+                candidates = [s for s in sessions if s.exe == entry.get("exe") and s.session_id
+                              and (s.muted if entry.get("kind") == "mute"
+                                   else abs(s.volume - level) < 1e-6)]
+                # An executable may have multiple sessions with different original levels.
+                # Guessing which is which could overwrite an unrelated session's volume.
+                matching_entries = [other for other in entries if other.get("exe") == entry.get("exe")
+                                    and other.get("kind") == entry.get("kind")]
+                if len(candidates) != 1 or len(matching_entries) != 1:
+                    candidates = []
+            if target is not None:
+                still_ducked = (target.muted if entry.get("kind") == "mute"
+                                else abs(target.volume - float(entry.get("level", 0))) < 1e-6)
+                if not still_ducked:
+                    repaired.append(entry)  # already restored, or the user changed it after the host died
+                    continue
+            changed = 0
+            for session in candidates:
+                if entry.get("kind") == "mute":
+                    if session.muted:
+                        changed += set_session_mute(session.session_id, False)
+                elif abs(session.volume - float(entry.get("level", 0))) < 1e-6:
+                    changed += set_session_volume(session.session_id, float(entry.get("volume", 1.0)))
+            if changed > 0:
+                repaired.append(entry)
+            else:
+                # Alive but sessionless, already exited, or reused PID: keep repair pending.
+                keep.append(entry if original_alive else {**entry, "host_pid": 0})
+        _write_journal(journal, keep)
+        return repaired
 
 
 def pending_repairs(journal: Path = JOURNAL) -> list[dict]:

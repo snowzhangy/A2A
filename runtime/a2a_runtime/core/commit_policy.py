@@ -6,14 +6,17 @@ apple/Sources/A2ACore/CommitPolicy.swift.
 2. A unit closes at a clause boundary or at a finalized utterance. A VAD end only
    requests finalization. The reconsideration window never forces an unsafe split.
 3. Unfinished numbers, negation, and dangling function words wait for context.
+4. An un-finalized unit that already covers `max_unit_source_seconds` of speech closes at its
+   last safe boundary rather than holding the whole utterance (M4).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .target_budget import WordSegmenter
 from .text import CommitLexicon, NormalizedText, is_letter, is_number, unsafe_ending
-from .types import ASRHypothesis, SourceSpan, UnitID, wrapping_sub_u64
+from .types import CANONICAL_SAMPLE_RATE, ASRHypothesis, SourceSpan, UnitID, wrapping_sub_u64
 
 
 @dataclass
@@ -28,6 +31,17 @@ class CommitPolicyConfig:
     prefer_word_boundaries: bool = False
     # Live mode may use stable conjunctions and timed pauses before sentence finality.
     streaming_clauses: bool = False
+    # A unit that covers this much source speech closes at its last safe boundary without
+    # waiting for finalization. Key counts mean different speech durations across languages,
+    # so the budget is measured in source seconds. Zero disables the rule.
+    max_unit_source_seconds: float = 4.0
+    # Stable keys a length-forced cut leaves behind, so the rest of the utterance stays
+    # splittable and a cut never strands one or two characters.
+    min_tail_keys: int = 3
+    # Keys the clause must already carry before the seconds budget may cut it. A recognizer
+    # that keeps VAD open over music advances its audio frontier without new text, and the
+    # floor keeps that from cutting a short clause nobody meant to end.
+    length_clause_min_keys: int = 12
     # Silence between consecutive timed tokens that closes a clause (180 ms of source).
     min_clause_pause_samples: int = 8_640
 
@@ -38,7 +52,9 @@ class CommitReason:
     FINALIZED = "finalized"
     CONJUNCTION = "conjunction"
     FORCED_LENGTH = "forced_length"
+    LENGTH_CLAUSE = "length_clause"
     PROSODIC_PAUSE = "prosodic_pause"
+    AUDIO_SEGMENT = "audio_segment"
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,8 +134,12 @@ def _word_part(key: str) -> bool:
 
 
 class CommitPolicy:
-    def __init__(self, config: CommitPolicyConfig | None = None, first_unit: int = 1) -> None:
+    def __init__(self, config: CommitPolicyConfig | None = None, first_unit: int = 1,
+                 word_segmenter: WordSegmenter | None = None) -> None:
         self.config = config or CommitPolicyConfig()
+        # None keeps the Latin-only rule. Han hosts inject a segmenter: keys are one per Han
+        # character while Mandarin words run one to four, so no key rule can see a word cut.
+        self._word_segmenter = word_segmenter
         self._next_unit = first_unit
         self._utterance: int | None = None
         self._previous_keys: tuple[str, ...] | None = None
@@ -186,13 +206,24 @@ class CommitPolicy:
         text = NormalizedText.of(h.text)
         self._last_text = text
         keys = text.keys
-        f = len(self._committed_keys)
 
-        # The committed prefix must survive; otherwise report once and continue past it.
-        if len(keys) < f or keys[:f] != self._committed_keys:
+        # The committed prefix must survive; otherwise report once and try to re-align.
+        committed = len(self._committed_keys)
+        if len(keys) < committed or keys[:committed] != self._committed_keys:
             if not self._revision_reported:
-                out.append(RevisionBehindFrontier(h.utterance, f))
+                out.append(RevisionBehindFrontier(h.utterance, committed))
                 self._revision_reported = True
+            # The usual revision is punctuation the recognizer adds late, which inserts keys
+            # into text that was already spoken. Without re-alignment the frontier index points
+            # into the inserted keys and the next unit speaks the words after it a second time.
+            aligned = self._re_sync(self._committed_keys, keys)
+            if aligned is not None:
+                self._committed_keys = keys[:aligned]
+                if len(self._key_stable_at) > aligned:
+                    del self._key_stable_at[aligned:]
+                while len(self._key_stable_at) < aligned:
+                    self._key_stable_at.append(t_ns)
+        f = len(self._committed_keys)
 
         if h.is_final:
             stable = len(keys)
@@ -239,8 +270,18 @@ class CommitPolicy:
                 # A confirmed connective with a stable suffix is stronger evidence than a timer.
                 if stable - f >= 8:
                     split = self._conjunction_split(text, f, stable)
-                    if split is not None and stable - split >= 3:
+                    if split is not None and stable - split >= cfg.min_tail_keys:
                         out.append(Commit(self._make_unit(text, h, f, split, CommitReason.CONJUNCTION, t_ns)))
+                        continue
+            # Meetings produce recognizer utterances of 10-14 s. Once a stable unit exceeds its
+            # budget, holding it costs a whole utterance of lag and projects English 1.7x its own
+            # length into the debt, so close it at the latest safe position instead.
+            if pending_keys >= cfg.length_clause_min_keys:
+                seconds = self._pending_source_seconds(text, h, stable)
+                if seconds is not None and seconds >= cfg.max_unit_source_seconds:
+                    split = self._late_boundary(text, f, stable)
+                    if split is not None:
+                        out.append(Commit(self._make_unit(text, h, f, split, CommitReason.LENGTH_CLAUSE, t_ns)))
                         continue
             if pending_keys >= cfg.max_unit_keys:
                 cut = self._forced_split(text, f, stable)
@@ -277,6 +318,72 @@ class CommitPolicy:
             i += 1
         return None
 
+    @staticmethod
+    def _re_sync(committed: tuple[str, ...], keys: tuple[str, ...]) -> int | None:
+        """Index just past the committed keys in a revised hypothesis, skipping keys the
+        recognizer inserted (late punctuation). None when the change is in spoken content,
+        where no alignment is safe and the frontier must stay where it is."""
+        i = 0
+        for k in committed:
+            while i < len(keys) and keys[i] != k:
+                if keys[i] not in CommitLexicon.punctuation:
+                    return None
+                i += 1
+            if i >= len(keys):
+                return None
+            i += 1
+        return i
+
+    def _pending_source_seconds(self, text: NormalizedText, h: ASRHypothesis, stable: int) -> float | None:
+        """Source speech the pending unit covers, from where uncovered source begins to the
+        newest stable key. That key's own token timing is preferred: an utterance held open
+        over music advances the audio frontier without any speech."""
+        if self.config.max_unit_source_seconds <= 0 or stable <= 0:
+            return None
+        start = self.uncommitted_start
+        spans = self._char_spans(h)
+        raw = text.raw_index[stable - 1]
+        timed = spans[raw] if raw < len(spans) else None
+        end = timed.end if timed is not None else h.audio_frontier
+        if end <= start:
+            return None
+        return (end - start) / CANONICAL_SAMPLE_RATE
+
+    @staticmethod
+    def _char_spans(h: ASRHypothesis) -> list[SourceSpan | None]:
+        """Recognizer timing for every raw character of the hypothesis (None where a token has none)."""
+        spans: list[SourceSpan | None] = []
+        for token in h.tokens:
+            spans.extend([token.span] * len(NormalizedText.of(token.text).raw))
+        return spans
+
+    def _late_boundary(self, text: NormalizedText, lo: int, hi: int) -> int | None:
+        """Latest boundary in `(lo, hi)` that leaves a splittable tail and a safe ending.
+        Cutting as late as possible keeps the clause as natural as a forced split can be."""
+        p = hi - self.config.min_tail_keys
+        while p - lo >= self.config.min_comma_unit_keys:
+            if unsafe_ending(text.raw_text(lo, p)) is None and not self._splits_any_word(text, p):
+                return p
+            p -= 1
+        return None
+
+    @staticmethod
+    def _splits_word(text: NormalizedText, p: int) -> bool:
+        """True when cutting before key `p` would split a Latin word in space-delimited text."""
+        if not (0 < p < len(text.keys)) or text.raw_index[p] != text.raw_index[p - 1] + 1:
+            return False
+        return _word_part(text.keys[p - 1]) and _word_part(text.keys[p])
+
+    def _splits_any_word(self, text: NormalizedText, p: int) -> bool:
+        """True when cutting before key `p` would split a word. The Latin rule stays behind
+        `prefer_word_boundaries` because there spaces are the only cue; an injected segmenter
+        always applies, because per-character keys reveal nothing about Han words."""
+        if self.config.prefer_word_boundaries and self._splits_word(text, p):
+            return True
+        if self._word_segmenter is None or not (0 < p < len(text.keys)):
+            return False
+        return self._word_segmenter.splits_word("".join(text.raw), text.raw_index[p])
+
     def _conjunction_split(self, text: NormalizedText, lo: int, hi: int) -> int | None:
         keys = text.keys
         p = hi - 1
@@ -311,15 +418,13 @@ class CommitPolicy:
         limit = min(hi, lo + cfg.max_unit_keys)
         p = limit
         while p > lo + cfg.min_comma_unit_keys:
-            if (cfg.prefer_word_boundaries and p < len(text.keys)
-                    and text.raw_index[p] == text.raw_index[p - 1] + 1
-                    and _word_part(text.keys[p - 1]) and _word_part(text.keys[p])):
+            if self._splits_any_word(text, p):
                 p -= 1
                 continue
             if unsafe_ending(text.raw_text(lo, p)) is None:
                 return p
             p -= 1
-        return limit
+        return limit  # nowhere safe at all: split rather than hold a unit forever
 
     @staticmethod
     def _is_decimal_point(text: NormalizedText, i: int, stable_end: int) -> bool:
@@ -352,9 +457,7 @@ class CommitPolicy:
         later of speech onset and the previous unit's end to the latest accepted frame."""
         start = max(self._speech_onset, self._last_unit_end if self._last_unit_end is not None else self._speech_onset)
         estimate = SourceSpan(start, max(start, h.audio_frontier))
-        char_spans: list[SourceSpan | None] = []
-        for token in h.tokens:
-            char_spans.extend([token.span] * len(NormalizedText.of(token.text).raw))
+        char_spans = self._char_spans(h)
         merged: SourceSpan | None = None
         for k in range(lo, hi):
             ri = text.raw_index[k]
