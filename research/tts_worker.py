@@ -14,8 +14,10 @@ Requests:  prepare {voice, text, mode: icl|xvector, rate, language: english|chin
                       ends with the actor instead of leaving their tail silent.
 Events:    ready {model, load_s, warmup_s}   prepared {voice, seconds}
            chunk {id, rate}  payload = f32le mono PCM      done {id, canceled, audio_s, gen_s, first_s,
-                                                                  budget_s, generated_s, truncated,
-                                                                  retries}
+                                                                  budget_s, generated_s, lead_s,
+                                                                  truncated, retries}
+                      `budget_s` bounds the take from its first voiced frame; `lead_s` is the
+                      silence the model generated before that frame (never sent to the host).
            error {id?, voice?, message}
 
 Stdin EOF ends the process immediately, so a killed host never leaves the model resident.
@@ -143,6 +145,8 @@ class Shaper:
         self.gain = gain_hint
         self.post_roll = self.SENTENCE_POST_ROLL if sentence_end else self.POST_ROLL
         self.started = False
+        # Samples dropped before the first voiced frame: the model's leading silence.
+        self.skipped = 0
         self.pending = array.array("f")
         self.voiced_energy = 0.0
         self.voiced_frames = 0
@@ -151,7 +155,9 @@ class Shaper:
         if not self.started:
             first = first_voiced_start(pcm, self.FLOOR)
             if first is None:
+                self.skipped += len(pcm)
                 return array.array("f")
+            self.skipped += max(0, first - self.PRE_ROLL)
             pcm = pcm[max(0, first - self.PRE_ROLL):]
             self.started = True
             if self.gain is None and self.target:
@@ -264,6 +270,23 @@ SPEECH_TAIL_SECONDS = 0.75
 # fixed, so retrying the same request would reproduce the same silent take.
 SILENT_TAKE_SECONDS = 1.0
 TAKE_ATTEMPTS = 2
+# The budget bounds speech, so it runs from the take's first voiced frame. Qwen starts a take
+# with silence: 0.46 s at the median, 0.63 s at p90 and up to 3.2 s over 196 English takes on
+# four cloned voices (reports/week2/qwen-take-budget.md). Counted against the budget, that
+# silence and the pause before EOS stopped 24 of those takes at the cap, cutting the last
+# words of 4 of them, although only one take's speech was longer than its budget (by 0.06 s).
+# The model's token cap leaves this much room for the silence; the worker ends the take once
+# the speech itself has used the budget.
+LEAD_ALLOWANCE_SECONDS = 1.5
+# Added to a take's speech when the voice's pace is learned from it. The raw take is 0.5-0.9 s
+# longer than its speech (silence before it, the pause before EOS). Learning the raw length
+# sped up 56 of 102 Mandarin takes to the limit, and 32 of them still ended more than 0.25 s
+# before their source did. Learning the speech alone left 9 takes more than 0.4 s over their
+# source; this margin leaves 4 (17 at the limit, 13 sped and short). English takes run over
+# their source either way, because their text is longer than the source allows.
+PACE_MARGIN_SECONDS = 0.2
+# This much held-back quiet at the cap means the speech had ended before it.
+QUIET_TAIL_SAMPLES = RATE // 5
 
 
 def speech_budget_seconds(text: str, language: str = "english") -> float:
@@ -272,9 +295,12 @@ def speech_budget_seconds(text: str, language: str = "english") -> float:
     return characters / MIN_CHARS_PER_SECOND.get(language, 11.0) + SPEECH_TAIL_SECONDS
 
 
-def max_tokens_for(text: str, language: str = "english", budget_multiplier: float = 1.0) -> int:
-    """Token cap that enforces `speech_budget_seconds` (missed EOS cannot run past it)."""
-    return max(25, min(500, math.ceil(speech_budget_seconds(text, language) * budget_multiplier * TOKENS_PER_SECOND)))
+def max_tokens_for(text: str, language: str = "english", budget_multiplier: float = 1.0,
+                   lead_seconds: float = 0.0) -> int:
+    """Token cap that enforces `speech_budget_seconds` (missed EOS cannot run past it), plus
+    `lead_seconds` of room for silence before the speech when the worker ends the take itself."""
+    seconds = speech_budget_seconds(text, language) * budget_multiplier + lead_seconds
+    return max(25, min(500, math.ceil(seconds * TOKENS_PER_SECOND)))
 
 
 def take_seed(voice_seed: int, attempt: int) -> int:
@@ -393,8 +419,11 @@ class ModelBackend:
             # Deterministic per voice and attempt: a retry of a failed take samples differently.
             mx.random.seed(take_seed(voice.sampling_seed, attempt))
         budget_multiplier = getattr(self, "speech_budget_multiplier", 1.0)
+        # A streaming take is ended by the worker when its speech reaches the budget, so the
+        # model's own cap also covers the silence before it. A whole-phrase model is cut only here.
+        lead = LEAD_ALLOWANCE_SECONDS if self.streaming else 0.0
         for result in self.adapter.generate(voice, text, interval,
-                                            max_tokens_for(text, voice.language, budget_multiplier), self.temperature):
+                                            max_tokens_for(text, voice.language, budget_multiplier, lead), self.temperature):
             mx.eval(result.audio)
             samples = self.np.asarray(result.audio, dtype=self.np.float32).reshape(-1)
             if result.sample_rate != RATE:
@@ -682,6 +711,13 @@ class Worker:
             model_speed = speed if native_speed and speed > 1.0 else 1.0
             # Never past the budget: a two-character line still gets its whole budget on the last take.
             silent_limit = int(RATE * min(SILENT_TAKE_SECONDS, budget_s - 0.1))
+            # Only a backend that delivers audio while it generates can be stopped mid-take.
+            streaming = getattr(self.backend, "streaming", False)
+            speech_limit = int(RATE * budget_s) if streaming else None
+            # Where the model's own token cap ends the take. A take that starts later than the
+            # lead allowance reaches it before its speech has used the budget.
+            cap_s = max_tokens_for(text, voice.language, getattr(self.backend, "speech_budget_multiplier", 1.0),
+                                   LEAD_ALLOWANCE_SECONDS if streaming else 0.0) / TOKENS_PER_SECOND
             retries = 0
             for attempt in range(TAKE_ATTEMPTS):
                 # A silent take emitted nothing, so every take starts from a clean shaper and pacer.
@@ -719,14 +755,31 @@ class Worker:
                                 first = time.perf_counter() - started
                             emitted += len(out)
                             self.channel.send({"ev": "chunk", "id": job, "rate": RATE}, out.tobytes())
+                        # The budget is spent by speech, not by the silence before it.
+                        if speech_limit is not None and shaper.started \
+                                and generated_samples - shaper.skipped >= speech_limit:
+                            break
                 finally:
                     generator.close()
+                # EOS can arrive before the silent-take limit (or without yielding a chunk).
+                # Nothing has reached the listener, so that failed start is just as safe to
+                # retry as a take stopped by the limit. Never repeat partially voiced speech.
+                silent = silent or not shaper.started
                 if not silent or self.is_canceled(job):
                     break
             canceled = self.is_canceled(job)
             # Reaching the budget means the cap stopped generation, not the model: the line was
             # truncated. It is reported rather than hidden, so a run can be read correctly.
-            truncated = not canceled and generated_samples / RATE >= budget_s - 0.05
+            lead_samples = shaper.skipped if shaper.started else 0
+            # A take that reached the cap while it was already quiet (the pause before EOS)
+            # lost nothing; one still voiced there lost its tail, and one that never spoke
+            # ran its whole budget on silence.
+            still_voiced = not shaper.started or len(shaper.pending) < QUIET_TAIL_SAMPLES
+            # Either limit can end a take: the speech budget, or the token cap when the leading
+            # silence was longer than the cap allows for.
+            at_limit = ((generated_samples - lead_samples) / RATE >= budget_s - 0.05
+                        or generated_samples / RATE >= cap_s - 0.05)
+            truncated = not canceled and still_voiced and at_limit
             if not canceled and pacing is not None:
                 tail = pacing.process(compactor.process([], final=True), final=True)
                 if len(tail):
@@ -735,12 +788,15 @@ class Worker:
                     emitted += len(tail)
                     self.channel.send({"ev": "chunk", "id": job, "rate": RATE}, tail.tobytes())
                 if generated_samples and native_samples and not truncated:
-                    # Pace of the model's own audio, silence trim included: the estimate the next
-                    # unit's speed-up is chosen from. A take with no speech says nothing about
-                    # pace; counting its cap-length silence would speed up the following lines.
-                    # Nor does a take the cap stopped: its length is the cap's, not the voice's,
-                    # and learning it pinned every later line at the fastest speed (ADR-0016).
-                    observed = generated_samples / RATE / max(1, len(text))
+                    # Pace of the audio the pacer is given: the take without the silence around
+                    # it or the pauses the compactor removed, plus a margin. That is the length
+                    # the next unit's speed is chosen against. A take with no speech says nothing
+                    # about pace; counting its cap-length silence would speed up the following
+                    # lines. Nor does a take the cap stopped: its length is the cap's, not the
+                    # voice's, and learning it pinned every later line at the fastest speed
+                    # (ADR-0016).
+                    speech = max(0, native_samples - compactor.removed) / RATE
+                    observed = (speech + PACE_MARGIN_SECONDS) / max(1, len(text))
                     voice.seconds_per_character = 0.7 * voice.seconds_per_character + 0.3 * observed
             elif not canceled and model_speed > 1.0 and native_samples and not truncated:
                 # Natively paced audio ran at `model_speed`: learn the voice's unhurried pace.
@@ -760,6 +816,7 @@ class Worker:
                                "language": voice.language,
                                "pace": speed, "native_s": native_samples / RATE,
                                "budget_s": budget_s, "generated_s": generated_samples / RATE,
+                               "lead_s": lead_samples / RATE,
                                "truncated": truncated, "retries": retries,
                                "delivery": delivery_verdict, "delivery_s": round(delivery_seconds, 3),
                                "delivery_prep_s": round(delivery_prep_s, 4),

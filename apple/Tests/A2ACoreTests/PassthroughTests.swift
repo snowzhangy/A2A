@@ -125,6 +125,46 @@ private struct Direct {
         #expect(!lateVoice.contains { if case .synthesize = $0 { true } else { false } })
     }
 
+    @Test func singleSpeakerKeepsTheTranslationWhileItsFirstVoiceIsPrepared() {
+        var c = PipelineConfig(session: "initial-voice")
+        c.directAudioTranslation = true
+        c.presentationDelaySeconds = 8
+        c.restoresOriginalVoice = true
+        c.originalVoiceDecisionDeadlineSeconds = 5.3
+        var p = SessionPipeline(config: c)
+        let line = SourceSpan(start: 0, end: 144_000)
+        _ = p.handle(.arm, at: 0)
+        _ = p.handle(.armSucceeded, at: 0)
+        _ = p.handle(.captured(span: line), at: 3_000_000_000)
+        _ = p.handle(.audioSegment(line), at: 3_000_000_000)
+        let translated = p.handle(.translation(UnitID(1), .success(TranslationCandidate(unitID: UnitID(1), text: "Please send the report."))), at: 3_100_000_000)
+        #expect(!restores(translated) && !synthesizes(translated))
+        #expect(!restores(p.handle(.tick, at: 3_200_000_000)))
+        let ready = p.handle(.profileReady(speaker, version: 1), at: 3_300_000_000)
+        let jobs = ready.compactMap { if case .synthesize(let job) = $0 { job } else { nil as SynthesisJob? } }
+        #expect(jobs.count == 1)
+        #expect(jobs.first?.text == "Please send the report.")
+        #expect(jobs.first?.speaker == speaker)
+        #expect(!restores(p.handle(.tick, at: 5_400_000_000)))
+        #expect(!synthesizes(p.handle(.profileReady(speaker, version: 2), at: 5_500_000_000)))
+    }
+
+    @Test func singleSpeakerVoiceWaitStillExpiresAndNeverSpeaksOverRestoredAudio() {
+        var c = PipelineConfig(session: "initial-voice-expired")
+        c.directAudioTranslation = true
+        c.restoresOriginalVoice = true
+        c.originalVoiceDecisionDeadlineSeconds = 5.3
+        c.presentationDelaySeconds = 8
+        var p = SessionPipeline(config: c)
+        _ = p.handle(.arm, at: 0)
+        _ = p.handle(.armSucceeded, at: 0)
+        _ = p.handle(.captured(span: span), at: 3_000_000_000)
+        _ = p.handle(.audioSegment(span), at: 3_000_000_000)
+        _ = p.handle(.translation(UnitID(1), .success(TranslationCandidate(unitID: UnitID(1), text: "Hello."))), at: 3_100_000_000)
+        #expect(restores(p.handle(.tick, at: 5_400_000_000)))
+        #expect(!synthesizes(p.handle(.profileReady(speaker, version: 1), at: 5_500_000_000)))
+    }
+
     @Test func aStalledTranslatorRestoresTheActorAndIgnoresItsLateResult() {
         var c = PipelineConfig(session: "stalled-mt")
         c.directAudioTranslation = true
@@ -195,6 +235,75 @@ private struct Direct {
         let fallback = p.handle(.tick, at: 2_200_000_000)
         #expect(fallback.contains(.restoreOriginalVoice(second)))
         #expect(!fallback.contains(.restoreOriginalVoice(first)))
+    }
+
+    /// A delayed session as the pipeline configures it: the deadline comes from the delay.
+    private func delayed(_ d: Double, speakers: Bool = false) -> SessionPipeline {
+        var c = PipelineConfig(session: "deadline-\(d)")
+        c.directAudioTranslation = true
+        c.presentationDelaySeconds = d
+        c.restoresOriginalVoice = true
+        c.originalVoiceDecisionDeadlineSeconds = PipelineConfig.originalVoiceDecisionDeadline(presentationDelaySeconds: d)
+        if speakers {
+            c.multiSpeaker = true
+            c.requireSpeakerAttribution = true
+        }
+        var p = SessionPipeline(config: c)
+        _ = p.handle(.arm, at: 0)
+        _ = p.handle(.armSucceeded, at: 0)
+        _ = p.handle(.profileReady(speaker, version: 1), at: 0)
+        return p
+    }
+
+    private func restores(_ out: [PipelineEffect]) -> Bool {
+        out.contains { if case .restoreOriginalVoice = $0 { true } else { false } }
+    }
+
+    private func synthesizes(_ out: [PipelineEffect]) -> Bool {
+        out.contains { if case .synthesize = $0 { true } else { false } }
+    }
+
+    @Test func aUnitAsLongAsTheDeadlineIsTranslatedWhenItsAnswerComesInNormalTime() {
+        // Every delay the app offers: a unit at the sentence cap, answered 1.5 s after it closes
+        // (live p99 was 1.6 s), plays its translation, though its start is past the deadline.
+        for d in stride(from: 4.0, through: 20, by: 1) {
+            var p = delayed(d)
+            let cap = AudioSegmentPolicy.sentences(presentationDelaySeconds: d).maxSamples
+            let line = SourceSpan(start: 0, end: cap)
+            let closed = Double(cap) / Double(canonicalSampleRate)
+            _ = p.handle(.captured(span: line), at: UInt64(closed * 1e9))
+            _ = p.handle(.audioSegment(line), at: UInt64(closed * 1e9))
+            var restored = false
+            for t in stride(from: closed, to: closed + 1.5, by: 0.1) { restored = restores(p.handle(.tick, at: UInt64(t * 1e9))) || restored }
+            let answer = p.handle(.translation(UnitID(1), .success(TranslationCandidate(unitID: UnitID(1), text: "Hello there."))),
+                                  at: UInt64((closed + 1.5) * 1e9))
+            #expect(!restored, "D = \(d)")
+            #expect(synthesizes(answer), "D = \(d)")
+        }
+    }
+
+    @Test func aLongUnitWhoseTranslatorStallsIsRestoredOnceItStalls() {
+        var p = delayed(5)   // deadline 2.8 s
+        let line = SourceSpan(start: 0, end: 144_000)   // 3 s
+        _ = p.handle(.captured(span: line), at: 3_000_000_000)
+        _ = p.handle(.audioSegment(line), at: 3_000_000_000)
+        #expect(!restores(p.handle(.tick, at: 4_900_000_000)))
+        let stalled = p.handle(.tick, at: 5_100_000_000)
+        #expect(stalled.contains(.cancelTranslation(UnitID(1))))
+        #expect(stalled.contains(.restoreOriginalVoice(line)))
+        let late = p.handle(.translation(UnitID(1), .success(TranslationCandidate(unitID: UnitID(1), text: "Hello."))), at: 5_200_000_000)
+        #expect(!synthesizes(late))
+    }
+
+    @Test func aLabelArrivingInNormalTimeAfterTheDeadlineStillGetsTheLineTranslated() {
+        var p = delayed(5, speakers: true)   // deadline 2.8 s
+        let line = SourceSpan(start: 0, end: 144_000)
+        _ = p.handle(.captured(span: line), at: 3_000_000_000)
+        _ = p.handle(.audioSegment(line), at: 3_000_000_000)
+        _ = p.handle(.translation(UnitID(1), .success(TranslationCandidate(unitID: UnitID(1), text: "Hello there."))), at: 3_600_000_000)
+        #expect(!restores(p.handle(.tick, at: 4_000_000_000)))
+        #expect(!restores(p.handle(.tick, at: 4_400_000_000)))
+        #expect(synthesizes(p.handle(.speaker(.assign(speaker, line)), at: 4_500_000_000)))
     }
 
     @Test func aLineIsBudgetedIntoTheSilenceAfterItNotIntoTheNextLine() {

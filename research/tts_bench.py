@@ -20,7 +20,6 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKER = os.path.join(ROOT, "research", "tts_worker.py")
-PYTHON = os.path.join(ROOT, "research", ".venv", "bin", "python")
 RATE = 24_000
 
 DEFAULT_TEXTS = [
@@ -74,13 +73,15 @@ def main() -> int:
     ap.add_argument("--mode", default="xvector")
     ap.add_argument("--interval", type=float, default=0.32)
     ap.add_argument("--temperature", type=float, default=0.6)
+    ap.add_argument("--language", choices=("english", "chinese"), default="english")
+    ap.add_argument("--target-seconds", type=float, help="include the live worker's pacing path")
     ap.add_argument("--repeat", type=int, default=2)
     ap.add_argument("--text", action="append", default=None)
     args = ap.parse_args()
 
     pcm = read_wav_f32(args.reference)
     proc = subprocess.Popen(
-        [PYTHON, WORKER, "--model", args.model, "--interval", str(args.interval),
+        [sys.executable, WORKER, "--model", args.model, "--interval", str(args.interval),
          "--temperature", str(args.temperature)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr)
     stdin, stdout = proc.stdin, proc.stdout
@@ -102,7 +103,7 @@ def main() -> int:
 
     t0 = time.perf_counter()
     stdin.write(frame({"op": "prepare", "voice": "s1", "mode": args.mode, "rate": RATE,
-                       "text": "", "language": "chinese"}, pcm))
+                       "text": "", "language": args.language}, pcm))
     stdin.flush()
     header, _ = next(stream)
     print(f"prepare ({args.mode}, {len(pcm)/4/RATE:.1f} s reference): {header.get('ev')} "
@@ -115,7 +116,10 @@ def main() -> int:
             t0 = time.perf_counter()
             first = None
             samples = 0
-            stdin.write(frame({"op": "synth", "id": job, "voice": "s1", "text": text}))
+            request = {"op": "synth", "id": job, "voice": "s1", "text": text}
+            if args.target_seconds is not None:
+                request["target_s"] = args.target_seconds
+            stdin.write(frame(request))
             stdin.flush()
             for header, payload in stream:
                 if header.get("id") != job and header.get("ev") != "error":

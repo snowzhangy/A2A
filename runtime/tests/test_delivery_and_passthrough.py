@@ -133,6 +133,46 @@ def test_unanswered_line_restores_only_when_host_supports_it():
     assert p.RestoreOriginalVoice(SPAN) not in off.run(3.4, p.SourceLanguage(SPAN, True))
 
 
+def test_single_speaker_keeps_translation_while_its_first_voice_is_prepared():
+    config = p.PipelineConfig(session="initial-voice")
+    config.direct_audio_translation = True
+    config.presentation_delay_seconds = 8
+    config.restores_original_voice = True
+    config.original_voice_decision_deadline_seconds = 5.3
+    reducer = p.SessionPipeline(config)
+    reducer.handle(p.Arm(), 0)
+    reducer.handle(p.ArmSucceeded(), 0)
+    reducer.handle(p.Captured(SPAN), 3_000_000_000)
+    reducer.handle(p.AudioSegment(SPAN), 3_000_000_000)
+    translated = reducer.handle(p.Translation(UnitID(1), p.Success(
+        TranslationCandidate(UnitID(1), "Please send the report."))), 3_100_000_000)
+    assert not has(translated, p.RestoreOriginalVoice) and not has(translated, p.Synthesize)
+    assert not has(reducer.handle(p.Tick(), 3_200_000_000), p.RestoreOriginalVoice)
+    ready = reducer.handle(p.ProfileReady(SPEAKER, 1), 3_300_000_000)
+    jobs = [e.job for e in ready if isinstance(e, p.Synthesize)]
+    assert len(jobs) == 1
+    assert jobs[0].text == "Please send the report." and jobs[0].speaker == SPEAKER
+    assert not has(reducer.handle(p.Tick(), 5_400_000_000), p.RestoreOriginalVoice)
+    assert not has(reducer.handle(p.ProfileReady(SPEAKER, 2), 5_500_000_000), p.Synthesize)
+
+
+def test_single_speaker_voice_wait_expires_and_never_speaks_over_restored_audio():
+    config = p.PipelineConfig(session="initial-voice-expired")
+    config.direct_audio_translation = True
+    config.presentation_delay_seconds = 8
+    config.restores_original_voice = True
+    config.original_voice_decision_deadline_seconds = 5.3
+    reducer = p.SessionPipeline(config)
+    reducer.handle(p.Arm(), 0)
+    reducer.handle(p.ArmSucceeded(), 0)
+    reducer.handle(p.Captured(SPAN), 3_000_000_000)
+    reducer.handle(p.AudioSegment(SPAN), 3_000_000_000)
+    reducer.handle(p.Translation(UnitID(1), p.Success(
+        TranslationCandidate(UnitID(1), "Hello."))), 3_100_000_000)
+    assert has(reducer.handle(p.Tick(), 5_400_000_000), p.RestoreOriginalVoice)
+    assert not has(reducer.handle(p.ProfileReady(SPEAKER, 1), 5_500_000_000), p.Synthesize)
+
+
 def restoration_pipeline(session, line, attributed=True, profile=True):
     config = p.PipelineConfig(session=session)
     config.direct_audio_translation = True
@@ -235,3 +275,59 @@ def test_line_is_budgeted_into_following_silence_not_next_line():
     tight.run(3, p.AudioSegment(SPAN))
     tight.run(3.3, p.FollowingSilence(SPAN, 0))
     assert len(synthesized(tight.translate(1, line, 3.4))) == 16
+
+
+def delayed_pipeline(d, speakers=False):
+    config = p.PipelineConfig(session=f"deadline-{d}")
+    config.direct_audio_translation = True
+    config.presentation_delay_seconds = d
+    config.restores_original_voice = True
+    config.original_voice_decision_deadline_seconds = p.PipelineConfig.original_voice_decision_deadline(d)
+    if speakers:
+        config.multi_speaker = True
+        config.require_speaker_attribution = True
+    reducer = p.SessionPipeline(config)
+    for inp in (p.Arm(), p.ArmSucceeded(), p.ProfileReady(SPEAKER, 1)):
+        reducer.handle(inp, 0)
+    return reducer
+
+
+def test_unit_as_long_as_the_deadline_is_translated_when_answered_in_normal_time():
+    from a2a_runtime.core.audio_segment import AudioSegmentPolicy
+    for d in range(4, 21):
+        reducer = delayed_pipeline(float(d))
+        cap = AudioSegmentPolicy.sentences(float(d)).max_samples
+        line = SourceSpan(0, int(cap))
+        closed = cap / 48_000
+        reducer.handle(p.Captured(line), int(closed * 1e9))
+        reducer.handle(p.AudioSegment(line), int(closed * 1e9))
+        restored = False
+        for k in range(15):
+            restored |= has(reducer.handle(p.Tick(), int((closed + 0.1 * k) * 1e9)), p.RestoreOriginalVoice)
+        answer = reducer.handle(p.Translation(UnitID(1), p.Success(TranslationCandidate(UnitID(1), "Hello there."))),
+                                int((closed + 1.5) * 1e9))
+        assert not restored, d
+        assert has(answer, p.Synthesize), d
+
+
+def test_long_unit_whose_translator_stalls_is_restored_once_it_stalls():
+    reducer = delayed_pipeline(5.0)
+    line = SourceSpan(0, 144_000)
+    reducer.handle(p.Captured(line), 3_000_000_000)
+    reducer.handle(p.AudioSegment(line), 3_000_000_000)
+    assert not has(reducer.handle(p.Tick(), 4_900_000_000), p.RestoreOriginalVoice)
+    stalled = reducer.handle(p.Tick(), 5_100_000_000)
+    assert p.CancelTranslation(UnitID(1)) in stalled and p.RestoreOriginalVoice(line) in stalled
+    late = reducer.handle(p.Translation(UnitID(1), p.Success(TranslationCandidate(UnitID(1), "Hello."))), 5_200_000_000)
+    assert not has(late, p.Synthesize)
+
+
+def test_label_arriving_in_normal_time_after_the_deadline_still_gets_the_line_translated():
+    reducer = delayed_pipeline(5.0, speakers=True)
+    line = SourceSpan(0, 144_000)
+    reducer.handle(p.Captured(line), 3_000_000_000)
+    reducer.handle(p.AudioSegment(line), 3_000_000_000)
+    reducer.handle(p.Translation(UnitID(1), p.Success(TranslationCandidate(UnitID(1), "Hello there."))), 3_600_000_000)
+    assert not has(reducer.handle(p.Tick(), 4_000_000_000), p.RestoreOriginalVoice)
+    assert not has(reducer.handle(p.Tick(), 4_400_000_000), p.RestoreOriginalVoice)
+    assert has(reducer.handle(p.Speaker(SpeakerAssign(SPEAKER, line)), 4_500_000_000), p.Synthesize)

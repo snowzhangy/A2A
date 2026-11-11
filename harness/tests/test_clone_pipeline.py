@@ -24,6 +24,86 @@ from a2a_harness.fixture import load
 PYTHON = shutil.which("python3", path="/usr/bin") or sys.executable
 
 
+@pytest.mark.parametrize("direction,target,seconds_per_character", [
+    ("zh-en", "The new price is final now, so we can sign the contract with the client before Friday.", 0.12),
+    ("en-zh", "请把合同交给客户并提醒他们必须在下周五下午之前签字确认。", 0.36),
+])
+def test_full_text_clone_preserves_the_sentence_tail(pipeline_binary, tmp_path, direction, target,
+                                                    seconds_per_character):
+    """A complete caption must reach TTS, and a slower take must finish before its cap.
+
+    Synthetic audio/translation only. The voice takes longer than the ordinary speech budget,
+    but fits the bounded full-text budget, reproducing a line whose last words were cut off.
+    """
+    rate = 48_000
+    source = tmp_path / "source.wav"
+    tone = (0.1 * np.sin(2 * np.pi * 140 * np.arange(rate * 3) / rate)).astype(np.float32)
+    write_wav(source, np.concatenate([tone, np.zeros(rate, dtype=np.float32)]), rate)
+    model = tmp_path / "fake.gguf"
+    model.write_bytes(b"fake")
+    hy = tmp_path / "hy_worker.py"
+    hy.write_text(f"#!{sys.executable}\n" + textwrap.dedent(f"""
+        import json, struct, sys
+        def read(n):
+            data = bytearray()
+            while len(data) < n:
+                part = sys.stdin.buffer.read(n - len(data))
+                if not part:
+                    sys.exit(0)
+                data.extend(part)
+            return data
+        def send(event):
+            data = json.dumps(event).encode('utf-8')
+            sys.stdout.buffer.write(struct.pack('<II', len(data), 0) + data)
+            sys.stdout.buffer.flush()
+        send(dict(ev='ready', model='synthetic-hy', load_s=0, warmup_s=0, protocol=2))
+        while True:
+            hl, pl = struct.unpack('<II', read(8))
+            request = json.loads(read(hl))
+            read(pl)
+            if request['op'] == 'flush':
+                send(dict(ev='done', id=request['id'], text={target!r}))
+    """), encoding="utf-8")
+    hy.chmod(0o755)
+    worker = tmp_path / "slow_voice.py"
+    worker.write_text(textwrap.dedent(f"""
+        import array, math, sys
+        sys.path.insert(0, {str(REPO_ROOT / 'research')!r})
+        import tts_worker
+        def generate(self, voice, text, interval, attempt=0, speed=1.0):
+            total = round(len(text) * {seconds_per_character} * tts_worker.RATE)
+            step = round(interval * tts_worker.RATE)
+            for start in range(0, total, step):
+                yield array.array('f', (0.1 * math.sin(i / 10)
+                                       for i in range(start, min(total, start + step))))
+        tts_worker.FakeBackend.generate = generate
+        tts_worker.main()
+    """), encoding="utf-8")
+    trace_path = tmp_path / "trace.jsonl"
+    done = subprocess.run([
+        str(pipeline_binary), "--input", str(source), "--clock", "host", "--pace", "asap",
+        "--asr", "audio", "--mt", "hy-local", "--hy-worker", str(hy), "--hy-model", str(model),
+        "--direction", direction,
+        "--no-sentence-units", "--tts", "clone", "--clone-fake", "--clone-model", "qwen", "--clone-mode", "xvector",
+        "--clone-python", PYTHON, "--clone-worker", str(worker), "--voice-ref", str(source),
+        "--fluent", "--no-shorten", "--max-debt-seconds", "60", "--max-source-lag-seconds", "120",
+        "--events-stdout", "--research-text", "--trace", str(trace_path), "--tail-seconds", "15",
+        "--out", str(tmp_path / "out.wav"),
+    ], capture_output=True, text=True, encoding="utf-8", timeout=45)
+    assert done.returncode == 0, done.stderr[-2000:]
+    messages = [json.loads(line) for line in done.stdout.splitlines()]
+    assert any(m.get("caption") == "target.final" and m["text"] == target for m in messages)
+    events = trace.load(trace_path)
+    targets = [e for e in events if e["ev"] == "commit.target"]
+    assert targets and all(e["text"] == target and not e.get("shortened") for e in targets)
+    takes = [e for e in events if e["ev"] == "tts.done" and "audio_ms" in e]
+    assert takes and all(not e.get("truncated") for e in takes), takes
+    expected_ms = len(target) * seconds_per_character * 1000
+    assert all(e["native_ms"] == pytest.approx(expected_ms, abs=20) for e in takes)
+    assert all(e["audio_ms"] >= expected_ms / 1.3 - 20 for e in takes)
+    assert any(e["ev"] == "play.end" for e in events), "the complete take must reach playback"
+
+
 @pytest.mark.skipif(PYTHON is None, reason="needs a Python for the fake worker")
 def test_dual_clone_prefetches_one_phrase_without_reordering(pipeline_binary, tmp_path):
     rate = 48_000

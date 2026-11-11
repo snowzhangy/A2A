@@ -4,7 +4,9 @@ A line whose speech drags past its budget doubles the queue behind it, and the s
 up by skipping other lines: measured on a live session, about 14 lines came out at roughly 2
 characters per second instead of 4-5, and one took 10 s for 3 s of source
 (reports/week2/live-session-recovery.md). The worker now bounds emitted audio by the character
-count and reports the cut instead of hiding it. No model, MLX, or audio device involved.
+count and reports the cut instead of hiding it. The budget runs from the take's first voiced
+frame: the silence Qwen generates before it speaks is not speech and must not cost a line its
+last words (reports/week2/qwen-take-budget.md). No model, MLX, or audio device involved.
 """
 from __future__ import annotations
 
@@ -20,8 +22,8 @@ import pytest
 from a2a_harness import REPO_ROOT
 
 sys.path.insert(0, str(REPO_ROOT / "research"))
-from tts_worker import (MIN_CHARS_PER_SECOND, RATE, TOKENS_PER_SECOND, Voice, Worker,  # noqa: E402
-                        max_tokens_for, speech_budget_seconds)
+from tts_worker import (LEAD_ALLOWANCE_SECONDS, MIN_CHARS_PER_SECOND, PACE_MARGIN_SECONDS, RATE,  # noqa: E402
+                        TOKENS_PER_SECOND, Voice, Worker, max_tokens_for, speech_budget_seconds)
 
 
 def test_budget_leaves_room_for_the_pace_the_model_reaches():
@@ -99,8 +101,9 @@ def test_a_line_that_reaches_the_budget_is_reported_as_truncated():
 
 
 def test_the_budget_reaches_the_model_as_its_token_cap():
-    # Enforcement is the model's: the worker hands it the cap, and a run-away generation
-    # (missed EOS) stops there rather than streaming ten seconds onto the bus.
+    # The model is handed a cap, so a run-away generation (missed EOS) stops there rather than
+    # streaming ten seconds onto the bus. A streaming model's cap also covers the silence before
+    # its speech, because the worker ends the take once the speech has used the budget.
     from tts_worker import ModelBackend
 
     class Adapter:
@@ -121,12 +124,18 @@ def test_the_budget_reaches_the_model_as_its_token_cap():
     reference = Voice(array.array("f", (0.1 * math.sin(i / 40) for i in range(RATE))), "", "xvector", "chinese")
     text = "字" * 21
     list(backend.generate(reference, text, 0.32))
-    assert backend.adapter.caps == [max_tokens_for(text, "chinese")]
-    # 7.3 s of audio at most: the 21-character line cannot run to the 10 s it took.
-    assert backend.adapter.caps[0] / TOKENS_PER_SECOND < 7.5
+    assert backend.adapter.caps == [max_tokens_for(text, "chinese", lead_seconds=LEAD_ALLOWANCE_SECONDS)]
+    # 7.3 s of speech and its leading silence at most: the line cannot run to the 10 s it took.
+    assert backend.adapter.caps[0] / TOKENS_PER_SECOND < 7.5 + LEAD_ALLOWANCE_SECONDS
     backend.speech_budget_multiplier = 1.5
     list(backend.generate(reference, text, 0.32))
-    assert backend.adapter.caps[-1] == max_tokens_for(text, "chinese", 1.5)
+    assert backend.adapter.caps[-1] == max_tokens_for(text, "chinese", 1.5, LEAD_ALLOWANCE_SECONDS)
+    # A whole-phrase model cannot be stopped mid-take, so its cap stays the budget itself.
+    backend.speech_budget_multiplier = 1.0
+    backend.streaming = False
+    list(backend.generate(reference, text, 0.32))
+    assert backend.adapter.caps[-1] == max_tokens_for(text, "chinese")
+    assert backend.adapter.caps[-1] / TOKENS_PER_SECOND < 7.5
 
 
 def test_a_line_at_the_normal_pace_is_never_cut():
@@ -145,6 +154,129 @@ def test_longer_budget_is_reported_consistently_by_the_worker():
     text = "一二三四五六七八九十"
     worker.synthesize({"id": 1, "voice": "v1", "text": text})
     assert channel.done()["budget_s"] == pytest.approx(1.5 * speech_budget_seconds(text, "chinese"))
+
+
+class ShapedBackend:
+    """One take: `lead` seconds of silence, `speech` seconds of voice, `tail` seconds of silence."""
+    name = "shaped"
+
+    def __init__(self, lead: float, speech: float, tail: float = 0.0, streaming: bool = True) -> None:
+        self.lead, self.speech, self.tail = int(RATE * lead), int(RATE * speech), int(RATE * tail)
+        self.streaming = streaming
+        self.generated = 0
+
+    def load(self) -> None:
+        pass
+
+    def prepare(self, voice: Voice) -> None:
+        voice.native = "stub-reference"
+
+    def generate(self, voice, text, interval, attempt=0, speed=1.0):
+        step = int(RATE * interval)
+        total = self.lead + self.speech + self.tail
+        for start in range(0, total, step):
+            n = min(step, total - start)
+            self.generated += n
+            yield array.array("f", (0.1 * math.sin(i / 10) if self.lead <= i < self.lead + self.speech else 1e-5
+                                    for i in range(start, start + n)))
+
+
+def shaped_take(backend: ShapedBackend, text: str, **request) -> tuple[dict, Voice]:
+    channel = Channel()
+    worker = Worker(backend, channel, 0.32, False)
+    voice = Voice(array.array("f", (0.1 * math.sin(i / 40) for i in range(RATE))), "", "xvector", "chinese")
+    worker.voices["v1"] = voice
+    worker.synthesize({"id": 1, "voice": "v1", "text": text, **request})
+    return channel.done(), voice
+
+
+def test_leading_silence_does_not_spend_the_budget():
+    # 196 English takes on four cloned voices started with 0.46 s of silence at the median and
+    # up to 3.2 s. Counted against the budget, that silence stopped takes whose speech fit it.
+    text = "一二三四"   # budget 2.0 s
+    budget = speech_budget_seconds(text, "chinese")
+    done, _ = shaped_take(ShapedBackend(lead=0.8, speech=budget - 0.1), text)
+    assert done["generated_s"] > budget          # the old rule cut this take
+    assert done["truncated"] is False
+    assert done["lead_s"] == pytest.approx(0.8, abs=0.05)
+    assert done["audio_s"] == pytest.approx(budget - 0.1, abs=0.1)
+
+
+def test_speech_that_runs_on_stops_at_the_budget_after_its_first_voiced_frame():
+    text = "一二三四"
+    budget = speech_budget_seconds(text, "chinese")
+    backend = ShapedBackend(lead=0.8, speech=10.0)
+    done, _ = shaped_take(backend, text)
+    assert done["truncated"] is True
+    # The worker ends the take itself: one streaming chunk past the budget at most.
+    assert budget <= done["generated_s"] - done["lead_s"] < budget + 0.33
+    assert backend.generated < RATE * (0.8 + budget + 0.33)
+    assert done["audio_s"] <= budget + 0.33
+
+
+def test_a_take_stopped_by_the_token_cap_before_its_budget_is_still_truncated(monkeypatch):
+    # Silence longer than the lead allowance: the model's cap ends the take while it is still
+    # speaking and before the speech has used its budget. That is a cut line, and its length
+    # is the cap's, so it must not teach the voice a pace either.
+    import audio_pacing
+
+    text = "一二三四五六七八九十"
+    budget = speech_budget_seconds(text, "chinese")
+    lead = LEAD_ALLOWANCE_SECONDS + 0.5
+    cap = max_tokens_for(text, "chinese", lead_seconds=LEAD_ALLOWANCE_SECONDS) / TOKENS_PER_SECOND
+    # The stub honors the cap the way the model does; the last take may start this late.
+    backend = ShapedBackend(lead=lead, speech=cap - lead)
+    channel = Channel()
+    worker = Worker(backend, channel, 0.32, False)
+    voice = Voice(array.array("f", (0.1 * math.sin(i / 40) for i in range(RATE))), "", "xvector", "chinese")
+    worker.voices["v1"] = voice
+    before = voice.seconds_per_character
+    import tts_worker
+    monkeypatch.setattr(tts_worker, "TAKE_ATTEMPTS", 1)
+    worker.synthesize({"id": 1, "voice": "v1", "text": text, "target_s": 2.0})
+    done = channel.done()
+    assert done["generated_s"] - done["lead_s"] < budget - 0.3    # the speech budget was not reached
+    assert done["truncated"] is True
+    if audio_pacing.available:
+        assert voice.seconds_per_character == before
+
+
+def test_a_take_that_is_quiet_at_the_cap_lost_nothing():
+    # The pause before a late EOS reached the cap on 6 of 196 takes whose words were all there.
+    text = "一二三四"
+    done, voice = shaped_take(ShapedBackend(lead=0.2, speech=1.0, tail=5.0), text)
+    assert done["truncated"] is False
+    assert done["audio_s"] == pytest.approx(1.0, abs=0.1)
+    assert done["generated_s"] < speech_budget_seconds(text, "chinese") + 0.2 + 0.33
+
+
+def test_a_whole_phrase_model_is_not_stopped_by_the_worker():
+    # Its chunks are slices of a finished phrase: dropping the rest would cut audio the model
+    # itself kept inside its own cap.
+    text = "一二三四"
+    backend = ShapedBackend(lead=0.0, speech=4.0, streaming=False)
+    done, _ = shaped_take(backend, text)
+    assert backend.generated == RATE * 4
+    assert done["audio_s"] == pytest.approx(4.0, abs=0.1)
+    assert done["truncated"] is True
+
+
+def test_the_voice_learns_the_pace_of_its_speech_not_of_the_silence_around_it():
+    # Learned from the raw take, the silence sped up 56 of 102 Mandarin takes to the limit while
+    # 32 of them still ended more than 0.25 s before their source did.
+    import audio_pacing
+
+    if not audio_pacing.available:
+        pytest.skip("audio pacing dependencies are not installed")
+    text = "一二三四五六七八九十"
+    done, voice = shaped_take(ShapedBackend(lead=0.6, speech=2.0, tail=0.5), text, target_s=2.0)
+    assert done["truncated"] is False
+    speech = done["native_s"]
+    assert speech == pytest.approx(2.0, abs=0.2)     # pre-roll and post-roll only
+    assert voice.seconds_per_character == pytest.approx(
+        0.7 * 0.25 + 0.3 * (speech + PACE_MARGIN_SECONDS) / len(text), abs=1e-6)
+    # The raw take is 3.1 s, which would have read as 0.31 s per character.
+    assert voice.seconds_per_character < 0.25
 
 
 class SilentStartBackend:
@@ -219,6 +351,39 @@ def test_a_take_with_speech_is_never_retried():
     done = synthesize_with(backend, "你好")
     assert backend.calls == [("你好", 0)]
     assert done["retries"] == 0
+
+
+@pytest.mark.parametrize("silent_chunks", [0, 1, 2])
+def test_early_eos_without_speech_retries_before_losing_the_line(silent_chunks):
+    class EarlyEOS(Backend):
+        def __init__(self):
+            super().__init__(0.1)
+            self.calls = []
+
+        def generate(self, voice, text, interval, attempt=0, speed=1.0):
+            self.calls.append(attempt)
+            if attempt == 0:
+                for _ in range(silent_chunks):
+                    yield array.array("f", [1e-5] * int(RATE * interval))
+                return
+            yield from super().generate(voice, text, interval, attempt, speed)
+
+    backend = EarlyEOS()
+    done = synthesize_with(backend, "好的我知道")
+    assert backend.calls == [0, 1]
+    assert done["retries"] == 1
+    assert done["audio_s"] > 0
+
+
+def test_an_empty_retry_is_bounded_and_reports_no_audio():
+    class Empty(Backend):
+        def generate(self, voice, text, interval, attempt=0, speed=1.0):
+            yield from ()
+
+    done = synthesize_with(Empty(0.1), "好的")
+    assert done["retries"] == 1
+    assert done["audio_s"] == 0
+    assert done["truncated"] is False
 
 
 def test_retry_seed_is_deterministic_and_differs_per_attempt():

@@ -26,12 +26,15 @@ public struct AudioSegmentPolicy: Sendable {
         dipWindowSamples = Int64(dipWindowSeconds * Double(canonicalSampleRate))
     }
 
-    /// Sentence units under picture delay `d` seconds. The longest span leaves 3.5 s of the delay
-    /// for the translator's last turn, the voice's first audio and a reserve. Replays needed about
-    /// 2.5 s, but in the live app (screen capture, Hy and two voices on one GPU) 5 s units finished
-    /// synthesis a p10 of 1 s after their slot. Never less than the 3 s live default, at most 6 s.
+    /// Sentence units under picture delay `d` seconds. For longer delays, retain the measured
+    /// 3.5 s reserve. Short delays need shorter spans to have any chance of reaching their slot;
+    /// this trades phrase completeness for latency and is not a guarantee of a 3 s dub.
     public static func sentences(presentationDelaySeconds d: Double) -> AudioSegmentPolicy {
-        AudioSegmentPolicy(maxSeconds: min(6, max(3, d - 3.5)), minSeconds: 0.25, dipWindowSeconds: 1)
+        let maximum = min(6, max(min(3, max(1.8, d - 1.2)), d - 3.5))
+        // The unstreamed dip tail must shrink with the span; otherwise Hy receives too little
+        // audio ahead of the cut to overlap its 800 ms turns with the source speech.
+        let dip = min(1, max(0.4, maximum - 1.4))
+        return AudioSegmentPolicy(maxSeconds: maximum, minSeconds: 0.25, dipWindowSeconds: dip)
     }
 
     /// Start of the span being spoken, if any; it closes at a speech end or at `maxSamples`.

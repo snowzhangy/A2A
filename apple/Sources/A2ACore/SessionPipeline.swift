@@ -97,6 +97,25 @@ public struct PipelineConfig: Sendable {
     /// before its delayed background has left the host's hold buffer. Zero disables the
     /// deadline; the host sets it only when it can actually restore the isolated voice.
     public var originalVoiceDecisionDeadlineSeconds = 0.0
+    /// A translation still pending this long after its span closed counts as stalled. Only a
+    /// stalled translation is given up at the deadline: a unit as long as the deadline is still
+    /// being answered when it passes, and canceling it there replaced healthy translations with
+    /// the original voice (71% of units at D = 4, 18% at 6, 1–2% at 8 in recorded sessions). Hy
+    /// answered within 1.6 s of close at p99 live.
+    public var translationStallSeconds = 2.0
+    /// Likewise for a speaker label; labels arrived up to 2.7 s after close in live sessions.
+    public var speakerLabelStallSeconds = 3.0
+
+    /// How long the host holds the separated bed under picture delay `d`, so a span decided in
+    /// time can be written back with its own voice (ADR-0018).
+    public static func originalVoiceHoldSeconds(presentationDelaySeconds d: Double) -> Double {
+        min(6, d - 1.5)
+    }
+
+    /// The decision deadline for that hold, less 0.7 s for driver ticks and separator jitter.
+    public static func originalVoiceDecisionDeadline(presentationDelaySeconds d: Double) -> Double {
+        max(0.1, originalVoiceHoldSeconds(presentationDelaySeconds: d) - 0.7)
+    }
 
     public init(session: String, direction: TranslationDirection = .chineseToEnglish) {
         self.session = session
@@ -647,11 +666,14 @@ public struct SessionPipeline: Sendable {
                     return out
                 }
                 guard machine.hasProfile(r.speaker), let version = profileVersion(r.speaker) else {
-                    if config.multiSpeaker { r.stage = .awaitingVoice }
+                    // The first reference is acquired while translation is already running.
+                    // Single-speaker sessions need the same bounded wait as dialogue, or the
+                    // first translated sentences are discarded just before their voice is ready.
+                    r.stage = .awaitingVoice
                     units[id] = r
                     if config.traceText { fields.append(.string("text", text)) }
                     out.append(trace(.commitTarget, fields))
-                    return config.multiSpeaker ? out : out + finish(id, as: .originalOnly, reason: "no_profile")
+                    return out
                 }
                 fields.insert(.int("prof", version), at: 2)
                 if config.traceText { fields.append(.string("text", text)) }
@@ -1019,12 +1041,15 @@ public struct SessionPipeline: Sendable {
             }
         default: break
         }
-        // Preserve the original voice before the held bed passes a stalled translation. This
-        // cancels the request first, so a late result cannot speak over the restored voice.
+        // Preserve the original voice when a translation has stalled: past the bed deadline and
+        // well past the translator's normal answer time. A long unit is still being answered
+        // when its start passes the deadline; that one is restored late only if it then stalls.
+        // This cancels the request first, so a late result cannot speak over the restored voice.
         if config.restoresOriginalVoice, config.originalVoiceDecisionDeadlineSeconds > 0, !anchors.isEmpty {
             for id in order {
                 guard let r = units[id], r.stage == .translating,
-                      sourceAgeSeconds(of: r.source.span.start) >= config.originalVoiceDecisionDeadlineSeconds else { continue }
+                      sourceAgeSeconds(of: r.source.span.start) >= config.originalVoiceDecisionDeadlineSeconds,
+                      sourceAgeSeconds(of: r.source.span.end) >= config.translationStallSeconds else { continue }
                 out.append(.cancelTranslation(id))
                 out += finish(id, as: .originalOnly, reason: "mt_timeout_restore")
                 out.append(.restoreOriginalVoice(r.source.span))
@@ -1033,8 +1058,10 @@ public struct SessionPipeline: Sendable {
         // Attribution and voice acquisition are bounded by the source-lag and bed deadlines.
         for id in order {
             guard let r = units[id], r.stage == .awaitingVoice || r.stage == .awaitingSpeaker else { continue }
+            // A missing voice profile will not arrive within a line; a label normally does.
             let restoreDeadline = config.restoresOriginalVoice && config.originalVoiceDecisionDeadlineSeconds > 0
                 && !anchors.isEmpty && sourceAgeSeconds(of: r.source.span.start) >= config.originalVoiceDecisionDeadlineSeconds
+                && (r.stage == .awaitingVoice || sourceAgeSeconds(of: r.source.span.end) >= config.speakerLabelStallSeconds)
             guard restoreDeadline || lateness(of: r.source.span.end) > config.health.maxSourceLagSeconds else { continue }
             out += finish(id, as: .originalOnly, reason: r.stage == .awaitingSpeaker ? "no_speaker" : "no_profile")
             if restoreDeadline { out.append(.restoreOriginalVoice(r.source.span)) }

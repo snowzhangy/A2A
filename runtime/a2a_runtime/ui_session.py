@@ -147,7 +147,7 @@ def pipeline_command(options: SessionOptions, trace_path: Path, parent_pid: int 
     clone = options.voice == "clone"
     # The Mac app's session (SessionModel.pipelineArguments), with this host's models.
     cmd += (["--tts", "clone", "--clone-model", "omnivoice", "--clone-backend", "torch"] if clone else ["--tts", "system"])
-    cmd += ["--translation-only", "--fluent", "--speakers", "auto", "--playback", options.playback]
+    cmd += ["--translation-only", "--fluent", "--no-shorten", "--speakers", "auto", "--playback", options.playback]
     if options.picture_delay_ms:
         cmd += ["--presentation-delay-ms", str(options.picture_delay_ms)]
     if options.background:

@@ -82,8 +82,55 @@ fails before scheduling, is restored if its entire voice is still inside the bed
 window. A unit already scheduled is never restored, avoiding a second voice over audible speech.
 Stop and discontinuity never restore canceled units.
 
+### Follow-up: give up only a stalled translation or label at the deadline
+
+The deadline counts from a unit's start, but a unit enters translation only when it closes.
+A unit about as long as the deadline was therefore canceled while Hy was still answering it
+normally. Examples:
+- At D = 5 the deadline is 2.8 s and the cap is 3 s.
+- At D = 8 a 4.5 s unit with the usual 0.8 s answer time misses the 5.3 s deadline.
+
+Replaying five recorded sessions' measured unit lengths and answer times (280 units) gives the share of healthy translations canceled:
+
+| D | 4 | 5 | 6 | 8 |
+|---|---|---|---|---|
+| Canceled | 71% | 44% | 18% | 1% |
+
+Hy answered within 1.6 s of a unit closing at p99 (one live outlier took 4.4 s). Speaker labels behaved the same way: at D ≤ 6, 21–193 of 257 labels arrived after the deadline, though all came within 2.7 s of the unit closing.
+
+At the deadline the reducer now gives up a pending translation only if its unit closed at least `translationStallSeconds` ago (2 s). It gives up a pending label only after `speakerLabelStallSeconds` (3 s). A missing voice profile is still decided at the deadline.
+- A short unit whose translator stalls is still restored in full.
+- A long one is restored once it stalls, after part of its bed has been written, and counts as `voice_restored_late`.
+
+`PipelineConfig.originalVoiceDecisionDeadline(presentationDelaySeconds:)` now owns the hold and deadline formula. The Python port mirrors the deadline; its bed already holds the whole delay.
+
+Replay with the app's live flags, D = 5, local Hy, two Qwen workers:
+
+| Clip | Old rule | New rule |
+|---|---|---|
+| 93 s of Mandarin drama | 24 of 38 units translated, 12 `mt_timeout_restore` | 35 of 38 translated, none; 34 of 35 scheduled within 250 ms of their slot (max 413 ms) |
+| 49 s mixed clip | 11 translated, 2 `mt_timeout_restore` | 12 translated; the 3 English lines are still `same_language` |
+
+The remaining 3 untranslated units were `no_profile`, from the start of the session before the voice was ready. Live sessions at D = 8 are not yet measured.
+
+### Follow-up: preserve sentence endings in desktop playback
+
+The listener reported missing final words after the worker's silence-budget fix. Normal
+desktop playback still shortened a translation to its source duration before synthesis,
+while captions showed the complete answer. The desktop apps now pass `--no-shorten` in
+normal streaming mode too. That mode and `--quality-first` both give the clone worker its
+existing 1.5× speech budget, retaining the token cap and queue/lag limits. The CLI's default
+shortening policy remains available for timing experiments.
+
+This preserves the full validated text, including the final clause, without requiring
+whole-phrase buffering. Longer takes can finish late and increase catch-up skips; it does
+not guarantee every line will play. The “Prioritize complete phrases” toggle additionally
+waits for a completed waveform and allows more lag. Synthetic regression
+`test_full_text_clone_preserves_the_sentence_tail` checks caption/voice text equality,
+untruncated synthesis at a slower pace, and playback completion.
+
 DoD:
 
-- `scripts/check.sh`, covering `PassthroughTests` (same-language, late verdict, unanswered lines, silence-bounded budget) and the manifest gate.
+- `scripts/check.sh`, covering `PassthroughTests` (same-language, late verdict, unanswered lines, silence-bounded budget, the stall-based deadline at every delay from 4 to 20 s) and the manifest gate. `runtime/tests/test_delivery_and_passthrough.py` mirrors the deadline tests.
 - `scripts/build_app.sh` and `scripts/smoke_app.sh`.
 - The mixed-language replay above.

@@ -14,7 +14,11 @@ import Testing
     @Test func sentenceUnitsGrowWithThePictureDelayWithinBounds() {
         let second = Int64(canonicalSampleRate)
         #expect(AudioSegmentPolicy.sentences(presentationDelaySeconds: 8).maxSamples == 9 * second / 2)
-        #expect(AudioSegmentPolicy.sentences(presentationDelaySeconds: 4).maxSamples == 3 * second)
+        let lowLatency = AudioSegmentPolicy.sentences(presentationDelaySeconds: 3)
+        #expect(lowLatency.maxSamples == 86_400)
+        #expect(lowLatency.dipWindowSamples == 19_200)
+        #expect(lowLatency.streamLimitSamples == 67_200)
+        #expect(AudioSegmentPolicy.sentences(presentationDelaySeconds: 4).maxSamples == 134_400)
         #expect(AudioSegmentPolicy.sentences(presentationDelaySeconds: 20).maxSamples == 6 * second)
         let p = AudioSegmentPolicy.sentences(presentationDelaySeconds: 8)
         #expect(p.streamLimitSamples == p.maxSamples - second)
@@ -47,6 +51,15 @@ import Testing
         var p = AudioSegmentPolicy(maxSeconds: 5, minSeconds: 0.25, dipWindowSeconds: 1)
         _ = p.process(events: [.speechStart(0)], frontier: 0)
         #expect(p.process(events: [], frontier: 240_000) == [SourceSpan(start: 0, end: 240_000)])
+    }
+
+    @Test func threeSecondPictureDelayCutsContinuousSpeechWithoutLosingAudio() {
+        var p = AudioSegmentPolicy.sentences(presentationDelaySeconds: 3)
+        _ = p.process(events: [.speechStart(0)], frontier: 0)
+        #expect(p.process(events: [], frontier: 86_399).isEmpty)
+        #expect(p.process(events: [], frontier: 86_400) == [SourceSpan(start: 0, end: 86_400)])
+        #expect(p.process(events: [.speechEnd(110_400)], frontier: 120_000)
+                == [SourceSpan(start: 86_400, end: 110_400)])
     }
 
     @Test func directAudioUsesSourceTimeForValidationAndNeverRequiresTranscript() {

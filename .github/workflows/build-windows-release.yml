@@ -1,0 +1,52 @@
+name: Build Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release label for the Windows archive
+        required: true
+        default: v0.2.0-alpha.2
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install check environments without GPU or model dependencies
+        run: |
+          python -m pip install uv==0.11.7
+          uv sync --project runtime --locked
+          uv sync --project harness --locked
+      - name: Compile WASAPI and shared real-time shim
+        run: uv run --project runtime python runtime/native/build.py
+      - name: Validate manifest and portable contracts
+        env:
+          PYTHONWARNDEFAULTENCODING: '1'
+        run: |
+          uv run --project harness python scripts/fetch_models.py --check
+          uv run --project runtime pytest runtime/tests -q -k "not test_windows_voices_render_cast_speakers_and_pace and not test_pipeline_translates_a_file_with_the_system_voice"
+      - name: Exercise harness against the portable pipeline
+        env:
+          A2A_PIPELINE: ${{ github.workspace }}\runtime\.venv\Scripts\a2a-pipeline-portable.exe
+          PYTHONWARNDEFAULTENCODING: '1'
+        run: uv run --project harness pytest harness/tests -q
+      - name: Package the checked Windows runtime
+        env:
+          A2A_RELEASE_TAG: ${{ inputs.tag }}
+        run: uv run --project harness python scripts/package_windows_release.py "$env:A2A_RELEASE_TAG"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: A2A-Windows11-x64
+          path: |
+            .local/releases/${{ inputs.tag }}/*-Windows11-x64.zip
+            .local/releases/${{ inputs.tag }}/SHA256SUMS-Windows.txt
+          if-no-files-found: error
+          include-hidden-files: true

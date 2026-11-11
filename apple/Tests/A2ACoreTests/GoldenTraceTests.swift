@@ -127,7 +127,7 @@ private func checkGolden(_ name: String, _ lines: [String], filePath: String = #
         #expect(s.effects.contains(.releaseHeld(UnitID(3))))
     }
 
-    /// Without a profile the session stays on the original voice; units are original-only.
+    /// Without a profile the session stays on the original bus while the unit waits for a voice.
     @Test func acquisitionWithoutProfileKeepsOriginal() throws {
         var s = Scenario()
         s.armed(profile: false)

@@ -48,6 +48,22 @@ def test_bed_delay_and_original_voice_replacement():
     assert bed.replace(SourceSpan(0, 480), np.ones(480, dtype=np.float32)) == 0
 
 
+def test_late_restoration_puts_the_rest_of_the_line_at_its_own_source_time():
+    # The stall rule restores a long line after its start has left the bed. The voice is the
+    # whole line's; the part that goes back must be the part that belongs there, not its start.
+    bed = BackgroundBed(delay_frames=0, max_hold_frames=4_000)
+    bed.push(np.zeros(960, dtype=np.float32))
+    assert len(bed.drain(300)) == 300
+    voice = np.arange(960, dtype=np.float32) / 960
+    assert bed.replace(SourceSpan(0, 960), voice) == 660
+    assert np.allclose(bed.drain(960), voice[300:])
+    # A span that starts inside the bed and a voice shorter than its span are still bounded.
+    bed.push(np.zeros(960, dtype=np.float32))
+    assert bed.replace(SourceSpan(1_200, 1_800), np.ones(300, dtype=np.float32)) == 300
+    out = bed.drain(1_920)
+    assert np.allclose(out[240:540], 1.0) and np.allclose(out[:240], 0) and np.allclose(out[540:], 0)
+
+
 def test_whisper_path_feeds_separator_and_buffers_partial_frames(tmp_path):
     from a2a_runtime.cli import parse
     from a2a_runtime.driver import Driver

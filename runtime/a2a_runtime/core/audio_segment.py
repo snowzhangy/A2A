@@ -33,9 +33,15 @@ class AudioSegmentPolicy:
 
     @classmethod
     def sentences(cls, presentation_delay_seconds: float) -> AudioSegmentPolicy:
-        # Leave 3.5 s for translation, voice onset and reserve; keep the cap within 3-6 s.
-        return cls(max_seconds=min(6.0, max(3.0, presentation_delay_seconds - 3.5)),
-                   min_seconds=0.25, dip_window_seconds=1.0)
+        # Longer delays keep the measured 3.5 s reserve for translation, voice onset and margin.
+        # Short delays need shorter spans to have any chance of reaching their slot; this trades
+        # phrase completeness for latency and is not a guarantee of a 3 s dub.
+        d = presentation_delay_seconds
+        maximum = min(6.0, max(min(3.0, max(1.8, d - 1.2)), d - 3.5))
+        # The unstreamed dip tail shrinks with the span, or Hy receives too little audio ahead of
+        # the cut to overlap its 800 ms turns with the source speech.
+        dip = min(1.0, max(0.4, maximum - 1.4))
+        return cls(max_seconds=maximum, min_seconds=0.25, dip_window_seconds=dip)
 
     @property
     def open_start(self) -> int | None:

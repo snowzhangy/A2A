@@ -77,7 +77,17 @@ The run summary reports `audio_units`: the cap, which detector ran (`voice`, `mi
 - Audio-only references are cut from these spans, so a reference can be up to 4.5 s long. It is still isolated and gated (ADR-0016). Isolating 6 s takes about 0.2 s on the driver thread; the capture ring holds 4 s.
 - Both clone workers are busy more often. Each learns its own level and pace, so voice consistency between them matters more; the follow-up is to share what they learn.
 - If an older line's synthesis is still running when a newer line's slot comes, the newer one plays first, and the older plays late or is skipped by the lag limit. With two workers starting together and 1.45 s median slack, that is rare. It was already possible.
-- The cap sets the smallest workable D: cap + 3.5 s. Lowering D in the app shortens the cap, down to the 3 s floor.
+- The original policy kept a 3 s cap floor even at shorter delays; the low-delay experiment below supersedes that floor.
+
+### Low-delay experiment
+
+For picture delays below 4.2 s, the cap is now allowed below the previous 3 s floor: at a
+3 s delay it is 1.8 s, with a 0.4 s dip window. Longer-delay behavior is unchanged. This
+allows Hy to process the start of the unit while the remaining audio is spoken, but it
+can split phrases more often and has not established 3 s playback or translation quality.
+The app's 3 s setting is an experiment, not a guarantee; single-speaker mode avoids
+waiting for per-unit speaker attribution when the source really has one speaker. At
+delays below 4 s, ADR-0018 original-voice restoration remains unavailable.
 
 DoD:
 

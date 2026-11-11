@@ -221,11 +221,23 @@ def test_cuts_continuous_speech_and_closes_on_silence_without_overlap():
 
 def test_sentence_units_grow_with_picture_delay_within_bounds():
     assert AudioSegmentPolicy.sentences(8).max_samples == 4.5 * RATE
-    assert AudioSegmentPolicy.sentences(4).max_samples == 3 * RATE
+    low_latency = AudioSegmentPolicy.sentences(3)
+    assert low_latency.max_samples == 86_400
+    assert low_latency.dip_window_samples == 19_200
+    assert low_latency.stream_limit_samples == 67_200
+    assert AudioSegmentPolicy.sentences(4).max_samples == 134_400
     assert AudioSegmentPolicy.sentences(20).max_samples == 6 * RATE
     policy = AudioSegmentPolicy.sentences(8)
     assert policy.stream_limit_samples == policy.max_samples - RATE
     assert AudioSegmentPolicy().stream_limit_samples == AudioSegmentPolicy().max_samples
+
+
+def test_three_second_picture_delay_cuts_continuous_speech_without_losing_audio():
+    policy = AudioSegmentPolicy.sentences(3)
+    policy.process([SpeechStart(0)], 0)
+    assert policy.process([], 86_399) == []
+    assert policy.process([], 86_400) == [SourceSpan(0, 86_400)]
+    assert policy.process([SpeechEnd(110_400)], 120_000) == [SourceSpan(86_400, 110_400)]
 
 
 def test_long_sentence_cut_uses_quietest_frame_before_cap():

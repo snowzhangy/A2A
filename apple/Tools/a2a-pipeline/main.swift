@@ -840,7 +840,8 @@ final class Driver {
         if restoresVoice {
             // Decide before the oldest part of a unit leaves the held bed. The margin covers
             // driver ticks, separator buffering and scheduling jitter; never guess a voice.
-            config.originalVoiceDecisionDeadlineSeconds = max(0.1, min(6, config.presentationDelaySeconds - 1.5) - 0.7)
+            config.originalVoiceDecisionDeadlineSeconds = PipelineConfig.originalVoiceDecisionDeadline(
+                presentationDelaySeconds: config.presentationDelaySeconds)
         }
         if let k = options.maxUnitKeys { config.commit.maxUnitKeys = k }
         if let s = options.maxUnitSeconds { config.commit.maxUnitSourceSeconds = s }
@@ -959,7 +960,7 @@ final class Driver {
                 // so D seconds of silence queued before callbacks start keep it D behind the
                 // capture for the session. The separator already lags its input by its own latency.
                 // ADR-0018: part of the delay holds the bed while each line is decided.
-                if restoresVoice { bedHoldNs = UInt64(min(6, delaySeconds - 1.5) * 1e9) }
+                if restoresVoice { bedHoldNs = UInt64(PipelineConfig.originalVoiceHoldSeconds(presentationDelaySeconds: delaySeconds) * 1e9) }
                 let queued = delaySeconds - separator.latencySeconds - Double(bedHoldNs) / 1e9
                 let frames = Int((max(0, queued) * Double(outRate)).rounded())
                 let silence = [Float](repeating: 0, count: frames)
@@ -2402,7 +2403,9 @@ func cloneWorkerCommand(_ o: Options) -> (URL, [String]) {
     }
     if o.cloneFake { arguments.append("--fake") }
     if o.fluent, o.cloneModel == .qwen { arguments += ["--temperature", "0.6"] }
-    if o.qualityFirst { arguments.append("--longer-speech-budget") }
+    // Full text needs enough time to finish at a slower voice's natural pace too. Keep this
+    // independent of whole-phrase buffering so normal streaming does not lose its last words.
+    if o.qualityFirst || !o.shorten { arguments.append("--longer-speech-budget") }
     if o.researchText { arguments.append("--research-text") }
     return (URL(fileURLWithPath: python), arguments)
 }

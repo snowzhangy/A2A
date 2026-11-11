@@ -131,9 +131,12 @@ private struct ContentView: View {
             DisclosureGroup("Playback settings") {
                 VStack(alignment: .leading, spacing: 10) {
                     Toggle("Prioritize complete phrases", isOn: $model.qualityFirst)
-                        .help("Keeps more of each translation, but speech may fall behind the picture.")
+                        .help("Waits for each phrase to finish generating before playback and allows more lag.")
                         .disabled(model.running || model.stopping)
                     Toggle("Keep music and effects", isOn: $model.keepBackground)
+                        .disabled(model.running || model.stopping)
+                    Toggle("Use less memory for voices", isOn: $model.reduceVoiceMemory)
+                        .help("Uses one Qwen worker instead of two. Speech may fall behind during rapid dialogue.")
                         .disabled(model.running || model.stopping)
                     if !model.multipleSpeakers {
                         HStack {
@@ -170,9 +173,17 @@ private struct ContentView: View {
                 }.disabled(model.stopping)
             }
 
-            if !model.voiceLearningDetail.isEmpty {
-                Text(model.voiceLearningDetail).font(.callout).foregroundStyle(.secondary)
-                    .accessibilityIdentifier("voice-learning-progress")
+            if model.running {
+                HStack {
+                    Text(model.voiceLearningDetail.isEmpty ? "Learning speakers…" : model.voiceLearningDetail)
+                        .font(.callout).foregroundStyle(.secondary)
+                        .accessibilityIdentifier("voice-learning-progress")
+                    Spacer()
+                    Button("Reset") { model.resetSpeakers() }
+                        .disabled(model.stopping)
+                        .help("Restarts translation and learns all speakers again from the current audio. A selected WAV reference is cleared.")
+                        .accessibilityIdentifier("reset-speakers")
+                }
             }
             if let error = model.error {
                 Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
@@ -194,7 +205,7 @@ private struct ContentView: View {
                     if let id = model.captions.last?.id { proxy.scrollTo(id, anchor: .bottom) }
                 }
             }.background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 12))
-            Text("Voice matching is experimental. Use it only with speakers who consented. Captions may be longer than the spoken translation.")
+            Text("Voice matching is experimental. Use it only with speakers who consented. Longer translations may finish after their picture.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .padding(24).frame(minWidth: 680, minHeight: 620)
@@ -207,7 +218,8 @@ private struct ContentView: View {
                 let voiceGate = model.voiceReady == (model.cloneWorker != nil)
                 let launchArgs = model.pipelineArguments(source: .systemAudio, trace: URL(fileURLWithPath: "/tmp/a2a-ui-smoke-trace"))
                 let directPipeline = launchArgs.contains("audio") && (launchArgs.contains("hy") || launchArgs.contains("hy-local"))
-                    && launchArgs.contains("qwen") && launchArgs.contains("xvector") && launchArgs.contains("--dual-clone")
+                    && launchArgs.contains("qwen") && launchArgs.contains("xvector") && launchArgs.contains("--no-shorten")
+                    && launchArgs.contains("--dual-clone") == !model.reduceVoiceMemory
                     && !launchArgs.contains("--qwen-cloud") && !launchArgs.contains("system")
                 let initialSpeakers = model.multipleSpeakers
                 model.multipleSpeakers = false
@@ -215,6 +227,13 @@ private struct ContentView: View {
                 model.multipleSpeakers = true
                 let multipleArgs = model.pipelineArguments(source: .systemAudio, trace: URL(fileURLWithPath: "/tmp/a2a-ui-smoke-trace"))
                 let speakerModesWork = singleArgs.contains("single") && multipleArgs.contains("auto")
+                let initialMemoryMode = model.reduceVoiceMemory
+                model.reduceVoiceMemory = true
+                let lowMemoryArgs = model.pipelineArguments(source: .systemAudio, trace: URL(fileURLWithPath: "/tmp/a2a-ui-smoke-trace"))
+                model.reduceVoiceMemory = false
+                let standardMemoryArgs = model.pipelineArguments(source: .systemAudio, trace: URL(fileURLWithPath: "/tmp/a2a-ui-smoke-trace"))
+                let memoryModesWork = !lowMemoryArgs.contains("--dual-clone") && standardMemoryArgs.contains("--dual-clone")
+                model.reduceVoiceMemory = initialMemoryMode
                 model.multipleSpeakers = initialSpeakers
                 model.multipleSpeakers = false
                 model.voiceReferenceURL = URL(fileURLWithPath: args[i + 1]).appendingPathExtension("missing.wav")
@@ -234,7 +253,6 @@ private struct ContentView: View {
                 model.multipleSpeakers = true
                 let multipleClearsReference = model.voiceReferenceURL == nil
                     && !model.pipelineArguments(source: .systemAudio, trace: URL(fileURLWithPath: "/tmp/a2a-ui-smoke-trace")).contains("--voice-ref")
-                try? FileManager.default.removeItem(at: sampleURL)
                 model.voiceReferenceURL = nil
                 model.multipleSpeakers = initialSpeakers
                 model.languagesReady = true
@@ -249,6 +267,48 @@ private struct ContentView: View {
                 model.playbackMode = .translated
                 if args.contains("--smoke-setup") { await model.setupModels(serverOnlyOverride: true) }
                 let setupSucceeded = !args.contains("--smoke-setup") || model.setupDetail == "Setup complete."
+                var resetRestarted = true, resetClearedReference = true, resetSuppressesStale = true
+                var resetKeepsDelay = true, stopCancelsReset = true
+                var resetDiagnostics: [String: Any] = [:]
+                if args.contains("--smoke-reset") {
+                    let initialPicture = model.matchPicture
+                    model.matchPicture = false
+                    model.multipleSpeakers = false
+                    model.languagesReady = true
+                    model.voiceReferenceURL = sampleURL
+                    model.start()
+                    model.simulateVoiceStatusForSmoke("S1")
+                    let firstPID = model.pipelineProcessID
+                    let hadVoice = !model.voiceLearningDetail.isEmpty
+                    model.sessionPictureDelayMs = 8_000
+                    model.resetSpeakers()
+                    resetClearedReference = model.voiceReferenceURL == nil && model.voiceLearningDetail.isEmpty
+                        && !model.pipelineArguments(source: .systemAudio, trace: URL(fileURLWithPath: "/tmp/a2a-ui-smoke-trace")).contains("--voice-ref")
+                    model.simulateVoiceStatusForSmoke("S9")
+                    resetSuppressesStale = model.stopping && model.voiceLearningDetail.isEmpty
+                    resetDiagnostics["first_pid"] = firstPID ?? -1
+                    resetDiagnostics["had_voice"] = hadVoice
+                    resetDiagnostics["stopping_after_150ms"] = model.stopping
+                    resetDiagnostics["voice_after_150ms"] = model.voiceLearningDetail
+                    for _ in 0..<100 {
+                        if let current = model.pipelineProcessID, current != firstPID, !model.stopping { break }
+                        try? await Task.sleep(for: .milliseconds(50))
+                    }
+                    resetRestarted = hadVoice && firstPID != nil && model.pipelineProcessID != nil
+                        && model.pipelineProcessID != firstPID && model.running && !model.stopping
+                    resetDiagnostics["second_pid"] = model.pipelineProcessID ?? -1
+                    resetDiagnostics["error"] = model.error ?? ""
+                    let restartedArgs = model.pipelineArguments(source: .systemAudio, trace: URL(fileURLWithPath: "/tmp/a2a-ui-smoke-trace"))
+                    resetKeepsDelay = model.sessionPictureDelayMs == 8_000 && restartedArgs.contains("--presentation-delay-ms")
+                    model.resetSpeakers()
+                    model.stop() // An explicit Stop while reset is pending must cancel its restart.
+                    for _ in 0..<100 where model.running { try? await Task.sleep(for: .milliseconds(50)) }
+                    try? await Task.sleep(for: .milliseconds(200))
+                    stopCancelsReset = !model.running && model.pipelineProcessID == nil
+                    model.matchPicture = initialPicture
+                    model.multipleSpeakers = initialSpeakers
+                }
+                try? FileManager.default.removeItem(at: sampleURL)
                 try? await Task.sleep(for: .milliseconds(500))
                 let url = URL(fileURLWithPath: args[i + 1])
                 let window = NSApp.windows.first(where: { $0.title == "A2A" })
@@ -256,10 +316,13 @@ private struct ContentView: View {
                     "window_number": window?.windowNumber ?? 0, "direction_initial": initialDirection,
                     "direction_final": model.direction.rawValue, "direction_reset_readiness": directionResetReadiness,
                     "qwen_ready": qwenReady, "voice_gate": voiceGate, "direct_pipeline": directPipeline,
-                    "speaker_modes": speakerModesWork, "missing_reference_blocked": missingReferenceBlocked,
+                    "speaker_modes": speakerModesWork, "memory_modes": memoryModesWork, "missing_reference_blocked": missingReferenceBlocked,
                     "short_reference_blocked": shortReferenceBlocked, "valid_reference_accepted": validReferenceAccepted,
                     "multiple_clears_reference": multipleClearsReference, "setup_succeeded": setupSucceeded,
                     "setup_detail": model.setupDetail, "setup_error": model.error ?? "",
+                    "reset_restarted": resetRestarted, "reset_cleared_reference": resetClearedReference,
+                    "reset_suppresses_stale": resetSuppressesStale, "reset_keeps_delay": resetKeepsDelay,
+                    "stop_cancels_reset": stopCancelsReset, "reset_diagnostics": resetDiagnostics,
                     "playback_initial": initialPlayback, "playback_original_selected": originalSelected,
                     "playback_final": model.playbackMode.rawValue]
                 try? JSONSerialization.data(withJSONObject: evidence, options: [.prettyPrinted, .sortedKeys])

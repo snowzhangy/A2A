@@ -43,12 +43,15 @@ class BackgroundBed:
         """Replace not-yet-emitted bed with the actor's isolated voice; 0 if it is too late."""
         pcm = np.asarray(samples, dtype=np.float32)
         start = max(span.start, self.emitted)
-        end = min(span.end, self.received, start + len(pcm))
+        end = min(span.end, self.received, span.start + len(pcm))
         if end <= start:
             return 0
         offset = start - self.emitted
+        # `samples` starts at the span's start. The part of the line that has already left the
+        # bed stays without its voice; what remains goes back at its own source time.
+        skipped = start - span.start
         self.pending[offset: offset + end - start] = np.clip(
-            self.pending[offset: offset + end - start] + pcm[: end - start], -1, 1)
+            self.pending[offset: offset + end - start] + pcm[skipped: skipped + end - start], -1, 1)
         self.restored += end - start
         return end - start
 

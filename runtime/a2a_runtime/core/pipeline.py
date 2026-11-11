@@ -104,6 +104,18 @@ class PipelineConfig:
     restores_original_voice: bool = False
     # Latest source age at which restoration is still covered by the host's held background bed.
     original_voice_decision_deadline_seconds: float = 0.0
+    # Only a stalled request is given up at that deadline: a unit as long as the deadline is still
+    # being answered when it passes (Hy answered within 1.6 s of close at p99 live; labels 2.7 s).
+    translation_stall_seconds: float = 2.0
+    speaker_label_stall_seconds: float = 3.0
+
+    @staticmethod
+    def original_voice_hold_seconds(presentation_delay_seconds: float) -> float:
+        return min(6.0, presentation_delay_seconds - 1.5)
+
+    @staticmethod
+    def original_voice_decision_deadline(presentation_delay_seconds: float) -> float:
+        return max(0.1, PipelineConfig.original_voice_hold_seconds(presentation_delay_seconds) - 0.7)
 
     def __post_init__(self) -> None:
         self.validator = TranslationValidator(target_language=self.direction.target)
@@ -847,12 +859,13 @@ class SessionPipeline:
             return out
         version = self._profile_versions.get(r.speaker)
         if not self.machine.has_profile(r.speaker) or version is None:
-            if cfg.multi_speaker:
-                r.stage = Stage.AWAITING_VOICE
+            # The initial reference is acquired concurrently with translation in single-
+            # speaker sessions too. Keep the line within the same bounded voice wait.
+            r.stage = Stage.AWAITING_VOICE
             if cfg.trace_text:
                 fields.append(f_str("text", text))
             out.append(self._trace(TraceKind.COMMIT_TARGET, fields))
-            return out if cfg.multi_speaker else out + self._finish(uid, SourceDisposition.ORIGINAL_ONLY, "no_profile")
+            return out
         fields.insert(2, f_int("prof", version))
         if cfg.trace_text:
             fields.append(f_str("text", text))
@@ -1216,12 +1229,15 @@ class SessionPipeline:
                 if r is None or self._lateness(r.source.span.start) <= health.max_source_lag_seconds:
                     continue
                 out += self._cancel(uid, SourceDisposition.ORIGINAL_ONLY, "source_expired")
-        # Restore before the held bed passes a stalled translation; late answers become stale.
+        # Restore a stalled translation: past the bed deadline and past the translator's normal
+        # answer time. A long unit still being answered at the deadline is restored late only if
+        # it then stalls. Late answers become stale.
         if cfg.restores_original_voice and cfg.original_voice_decision_deadline_seconds > 0 and self._anchors:
             for uid in list(self._order):
                 r = self._units.get(uid)
                 if (r is not None and r.stage == Stage.TRANSLATING
-                        and self._source_age_seconds(r.source.span.start) >= cfg.original_voice_decision_deadline_seconds):
+                        and self._source_age_seconds(r.source.span.start) >= cfg.original_voice_decision_deadline_seconds
+                        and self._source_age_seconds(r.source.span.end) >= cfg.translation_stall_seconds):
                     out.append(CancelTranslation(uid))
                     out += self._finish(uid, SourceDisposition.ORIGINAL_ONLY, "mt_timeout_restore")
                     out.append(RestoreOriginalVoice(r.source.span))
@@ -1230,9 +1246,12 @@ class SessionPipeline:
             r = self._units.get(uid)
             if r is None or r.stage not in (Stage.AWAITING_VOICE, Stage.AWAITING_SPEAKER):
                 continue
+            # A missing voice profile will not arrive within a line; a label normally does.
             restore_deadline = (cfg.restores_original_voice and cfg.original_voice_decision_deadline_seconds > 0
                                 and bool(self._anchors)
-                                and self._source_age_seconds(r.source.span.start) >= cfg.original_voice_decision_deadline_seconds)
+                                and self._source_age_seconds(r.source.span.start) >= cfg.original_voice_decision_deadline_seconds
+                                and (r.stage == Stage.AWAITING_VOICE
+                                     or self._source_age_seconds(r.source.span.end) >= cfg.speaker_label_stall_seconds))
             if not restore_deadline and self._lateness(r.source.span.end) <= health.max_source_lag_seconds:
                 continue
             out += self._finish(uid, SourceDisposition.ORIGINAL_ONLY,

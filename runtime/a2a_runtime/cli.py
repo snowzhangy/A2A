@@ -290,6 +290,8 @@ def clone_worker_command(o) -> list[str]:
         args.append("--fake")
     if o.fluent and o.clone_model == "qwen":
         args += ["--temperature", "0.6"]
+    if o.quality_first or not o.shorten:
+        args.append("--longer-speech-budget")
     if o.research_text:
         args.append("--research-text")
     return args

@@ -250,8 +250,8 @@ class Driver:
                                and o.presentation_delay_ms >= 4_000)
         config.restores_original_voice = self.restores_voice
         if self.restores_voice:
-            config.original_voice_decision_deadline_seconds = max(
-                0.1, min(6.0, config.presentation_delay_seconds - 1.5) - 0.7)
+            config.original_voice_decision_deadline_seconds = P.PipelineConfig.original_voice_decision_deadline(
+                config.presentation_delay_seconds)
         if o.max_unit_keys is not None:
             config.commit.max_unit_keys = o.max_unit_keys
         if o.max_unit_seconds is not None:

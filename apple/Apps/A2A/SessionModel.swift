@@ -66,6 +66,12 @@ private struct VoiceLearningProgress {
     }
     var qualityFirst = false
     var keepBackground = true
+    /// A single Qwen worker uses less memory but cannot synthesize two lines at once.
+    var reduceVoiceMemory = UserDefaults.standard.object(forKey: "reduceVoiceMemory") as? Bool ?? false {
+        didSet {
+            if !CommandLine.arguments.contains("--smoke-output") { UserDefaults.standard.set(reduceVoiceMemory, forKey: "reduceVoiceMemory") }
+        }
+    }
     /// Use one pinned voice unless the listener explicitly selects dialogue tracking.
     var multipleSpeakers = UserDefaults.standard.object(forKey: "multipleSpeakers") as? Bool ?? false {
         didSet {
@@ -79,7 +85,9 @@ private struct VoiceLearningProgress {
     /// phrase, the original audio and the separated background the same delay, so speech lands
     /// on its picture instead of trailing it by a varying amount.
     var matchPicture = UserDefaults.standard.object(forKey: "matchPicture") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(matchPicture, forKey: "matchPicture") }
+        didSet {
+            if !CommandLine.arguments.contains("--smoke-output") { UserDefaults.standard.set(matchPicture, forKey: "matchPicture") }
+        }
     }
     /// D. Measured live onset was 4.9 s median and 6.3 s at most with streaming speech
     /// (research/live_dub_lab/SOUNDTRACK-AND-DELAY.md), so 8 s leaves most phrases on time.
@@ -97,7 +105,7 @@ private struct VoiceLearningProgress {
     private var mirror: DelayedMirror?
     private var pictureWindow: PictureWindowController?
     /// The delay the running session was started with; 0 without a delayed picture.
-    private var sessionPictureDelayMs = 0
+    var sessionPictureDelayMs = 0
     var rememberedVoiceCount = 0
     private var voiceLearning: [String: VoiceLearningProgress] = [:]
     var voiceLearningDetail: String {
@@ -132,6 +140,7 @@ private struct VoiceLearningProgress {
     private var hyLocalModel: URL?
     var cloneWorker: (python: String, script: String)? { SessionModel.findCloneWorker() }
     private var process: Process?
+    private var restartAfterSpeakerReset = false
     private var outputPipe: Pipe?
     private var errorPipe: Pipe?
     private var controlPipe: Pipe?
@@ -378,8 +387,15 @@ private struct VoiceLearningProgress {
     }
 
     private var pipelineExecutable: URL {
-        Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/a2a-pipeline")
+        let args = CommandLine.arguments
+        if args.contains("--smoke-output"), let i = args.firstIndex(of: "--smoke-pipeline"), i + 1 < args.count {
+            return URL(fileURLWithPath: args[i + 1])
+        }
+        return Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/a2a-pipeline")
     }
+
+    /// Used by the synthetic lifecycle smoke test; never includes audio or text.
+    var pipelineProcessID: Int32? { process?.isRunning == true ? process?.processIdentifier : nil }
 
     /// Why a session cannot start, checked before the helper takes over audio.
     func preflightFailure() -> String? {
@@ -437,8 +453,7 @@ private struct VoiceLearningProgress {
             let data = handle.availableData
             if data.isEmpty { handle.readabilityHandler = nil; return }
             Task { @MainActor in
-                guard let self, self.generation == token else { return }
-                self.consume(data)
+                self?.acceptPipelineOutput(data, token: token)
             }
         }
         stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -446,7 +461,7 @@ private struct VoiceLearningProgress {
             if data.isEmpty { handle.readabilityHandler = nil; return }
             // Only operational errors are shown. stderr never carries captions.
             Task { @MainActor in
-                guard let self, self.generation == token else { return }
+                guard let self, self.generation == token, !self.stopping else { return }
                 let message = String(decoding: data.suffix(8_192), as: UTF8.self)
                 if message.contains("denied") || message.contains("assets not installed") || message.contains("stalled")
                     || message.contains("Audio capture fell behind") || message.contains("Translated audio could not keep up")
@@ -464,7 +479,18 @@ private struct VoiceLearningProgress {
                 if code != 0, !self.stopping, self.error == nil {
                     self.error = "Translation stopped (\(code)). Check audio recording permission and the translation server, then restart."
                 }
-                self.cleanUp()
+                let restart = self.restartAfterSpeakerReset
+                self.restartAfterSpeakerReset = false
+                self.cleanUp(keepPicture: restart)
+                if restart {
+                    self.status = "Resetting speakers…"
+                    self.launchPipeline()
+                    if self.process == nil {
+                        self.status = "Translation unavailable"
+                        self.sessionPictureDelayMs = 0
+                        Task { await self.stopPicture() }
+                    }
+                }
             }
         }
         process = child
@@ -484,7 +510,8 @@ private struct VoiceLearningProgress {
     }
 
     func pipelineArguments(source: AudioSource, trace: URL) -> [String] {
-        var voice = ["--tts", "clone", "--clone-model", "qwen", "--clone-mode", "xvector", "--dual-clone"]
+        var voice = ["--tts", "clone", "--clone-model", "qwen", "--clone-mode", "xvector"]
+        if !reduceVoiceMemory { voice.append("--dual-clone") }
         if let cloneWorker { voice += ["--clone-python", cloneWorker.python, "--clone-worker", cloneWorker.script] }
         if !multipleSpeakers, let voiceReferenceURL { voice += ["--voice-ref", voiceReferenceURL.path] }
         var translation = ["--mt", "hy", "--hy-server", hyServer]
@@ -495,7 +522,7 @@ private struct VoiceLearningProgress {
             }
         }
         var arguments = source.arguments + ["--asr", "audio"] + translation + ["--direction", direction.rawValue] + voice + [
-            "--translation-only", "--fluent", "--speakers", multipleSpeakers ? "auto" : "single", "--playback", playbackMode.rawValue, "--control-stdin",
+            "--translation-only", "--fluent", "--no-shorten", "--speakers", multipleSpeakers ? "auto" : "single", "--playback", playbackMode.rawValue, "--control-stdin",
             "--events-stdout", "--trace", trace.path, "--parent-pid", "\(getpid())"]
         if qualityFirst { arguments.append("--quality-first") }
         // With a delayed picture the lag limit counts from each phrase's slot: a phrase more than
@@ -517,7 +544,8 @@ private struct VoiceLearningProgress {
     }
 
     func stop() {
-        guard let process else { return }
+        restartAfterSpeakerReset = false
+        guard let process, !stopping else { return }
         stopping = true
         status = "Stopping…"
         process.terminate()
@@ -528,7 +556,19 @@ private struct VoiceLearningProgress {
         }
     }
 
-    private func cleanUp() {
+    /// Start a fresh helper and fresh resident voice workers; no old speaker profile or
+    /// in-flight model response can leak into the new session. The picture window remains.
+    func resetSpeakers() {
+        guard running, !stopping, process?.isRunning == true else { return }
+        voiceReferenceURL = nil
+        voiceLearning.removeAll()
+        error = nil
+        stop()
+        restartAfterSpeakerReset = true
+        status = "Resetting speakers…"
+    }
+
+    private func cleanUp(keepPicture: Bool = false) {
         outputPipe?.fileHandleForReading.readabilityHandler = nil
         errorPipe?.fileHandleForReading.readabilityHandler = nil
         try? controlPipe?.fileHandleForWriting.close()
@@ -545,8 +585,10 @@ private struct VoiceLearningProgress {
         pending.removeAll()
         if let traceURL { try? FileManager.default.removeItem(at: traceURL) }
         traceURL = nil
-        sessionPictureDelayMs = 0
-        if mirror != nil || pictureWindow != nil { Task { await stopPicture() } }
+        if !keepPicture {
+            sessionPictureDelayMs = 0
+            if mirror != nil || pictureWindow != nil { Task { await stopPicture() } }
+        }
     }
 
     private func consume(_ data: Data) {
@@ -590,5 +632,19 @@ private struct VoiceLearningProgress {
             }
             pending.removeSubrange(...newline)
         }
+    }
+
+    private func acceptPipelineOutput(_ data: Data, token: UUID) {
+        guard generation == token, !stopping else { return }
+        consume(data)
+    }
+
+    /// Exercise the same output gate in the synthetic UI lifecycle test.
+    func simulateVoiceStatusForSmoke(_ speaker: String) {
+        guard CommandLine.arguments.contains("--smoke-output") else { return }
+        let event: [String: Any] = ["voice_status": "ready", "speaker": speaker, "seconds": 3]
+        guard var data = try? JSONSerialization.data(withJSONObject: event) else { return }
+        data.append(10)
+        acceptPipelineOutput(data, token: generation)
     }
 }

@@ -53,16 +53,27 @@ for a conversation. Click **Start translation** and allow macOS System Audio
 Recording when prompted. **Original / Translated** switches what you hear without
 stopping translation. Speaker tracking and cross-language voice similarity can be
 wrong; one-speaker mode keeps one voice stable rather than detecting other speakers.
+Use **Reset** next to the speaker status to restart translation and learn the voices
+again. This clears any selected WAV reference and briefly interrupts translation;
+the picture window and playback settings stay in place.
 
 Under **Playback settings**, you can keep music and effects, choose a delayed video
-window, or prioritize complete phrases. A clean 1–15 second WAV of the intended
+window, or buffer complete phrases before playback. The app sends the full validated
+translation to the voice worker, with a longer bounded speech budget so slower voices
+can finish sentence endings. A clean 1–15 second WAV of the intended
 speaker can optionally be supplied for a single-speaker session; it is used locally
 and is not saved by the app. Voice matching is not guaranteed. Longer translations
-may play late or be skipped, and captions can contain more text than the speech.
+may play late or be skipped when the session falls behind; model generation also remains bounded.
 A delayed picture needs Screen Recording access, and protected video may appear black.
+At a 3-second picture delay, shorter audio segments can increase translation speed but
+may split phrases, and the original-voice fallback is unavailable. **Use less memory
+for voices** runs one Qwen worker instead of two, which can increase delays in dialogue.
 
-This release contains source, not a self-contained installer or model weights. The
-local build is ad-hoc signed by default and is not notarized. No top-level project
+Releases include source, an optimized macOS development app, and an experimental
+[Windows 11 x64 desktop bundle](docs/releases/windows-development-build.md). The Mac app needs
+the matching checkout and local model setup; it is not a self-contained installer and
+includes no model weights. See the [build installation instructions](docs/releases/macos-development-build.md).
+The development build is ad-hoc signed and is not notarized. No top-level project
 license has been declared; model and dependency provenance and licenses are recorded
 in the manifest.
 
@@ -72,6 +83,16 @@ in the manifest.
 scripts/check.sh
 scripts/smoke_app.sh
 ```
+
+To package an optimized macOS build from a clean, tagged checkout:
+
+```sh
+scripts/package_release.sh v0.2.0-alpha.2
+```
+
+The archive and its SHA-256 checksum are written under `.local/releases/` for upload
+as GitHub release assets. Model caches, recordings, voice profiles and diagnostics
+stay out of the archive.
 
 The checks cover deterministic Swift and harness tests. Live capture, voice identity,
 translation accuracy, device behavior, and signing need separate interactive tests.

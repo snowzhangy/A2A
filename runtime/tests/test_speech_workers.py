@@ -206,6 +206,15 @@ def test_cli_stage_device_overrides():
     assert command[command.index("--device") + 1] == "cpu"
 
 
+@pytest.mark.parametrize("mode,extended", [([], False), (["--no-shorten"], True), (["--quality-first"], True)])
+def test_complete_text_has_a_longer_bounded_voice_budget(mode, extended):
+    from a2a_runtime.cli import clone_worker_command, parse
+
+    options = parse(["--input", "clip.wav", "--clock", "host", "--asr-script", "script.json",
+                     "--tts", "clone", "--clone-fake", *mode])
+    assert ("--longer-speech-budget" in clone_worker_command(options)) is extended
+
+
 def test_tail_limit_fails_when_recognition_has_not_finished():
     from a2a_runtime.driver import Driver
 

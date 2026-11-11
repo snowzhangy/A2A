@@ -39,7 +39,7 @@ def test_caption_and_voice_session_commands_preserve_control_and_privacy(tmp_pat
     assert voice[voice.index("--direction") + 1] == "en-zh"
     assert voice[voice.index("--output-device") + 1] == "device-id"
     assert voice[voice.index("--tts") + 1] == "clone"
-    assert "--translation-only" in voice
+    assert "--translation-only" in voice and "--no-shorten" in voice
     assert "--control-stdin" in voice and "--events-stdout" in voice and "--research-text" not in voice
     captions = pipeline_command(SessionOptions(123, captions_only=True), tmp_path / "captions.jsonl")
     assert "--captions-only" in captions and captions[captions.index("--tts") + 1] == "tone"

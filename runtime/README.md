@@ -7,6 +7,11 @@ The Windows runtime is not yet a release-ready replacement: source-volume recove
 the full live pipeline have not been qualified on interactive devices.
 See [ADR-0007](../docs/adr/0007-portable-runtime-experiment.md) for the design and evidence.
 
+GitHub prereleases also provide a Windows 11 x64 archive with the source, desktop
+launcher and compiled native audio library. See the
+[archive installation instructions](../docs/releases/windows-development-build.md).
+Models and Python dependencies remain separate explicit setup steps.
+
 ## Setup on Windows
 
 Install Python 3.12 or 3.13, `uv`, and Visual Studio 2022 with the C++ desktop workload
@@ -77,6 +82,8 @@ the Mac app's:
 
 The listen selector switches between original and translated audio while a voice session
 is running. **Stop** ends the session, restores every ducked app, and clears captions.
+Desktop playback sends full validated translations to the voice worker, with a longer
+bounded speech budget; a long line can finish late or cause later lines to be skipped.
 
 For a first trial, start playback in the source app, select that application after pressing
 **Refresh**, and choose **System voice** or **Captions only**. System audio captures and

@@ -4,28 +4,67 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "$ROOT/scripts/env.sh"
+SMOKE_PYTHON="$(command -v python3)"
 APP="${A2A_APP_PATH:-$ROOT/.local/apps/A2A.app}"
 [[ -d "$APP" ]] || { echo "Run scripts/build_app.sh first" >&2; exit 1; }
 mkdir -p "$ROOT/.local/runs"
 OUT="$(mktemp -d "$ROOT/.local/runs/app-smoke.XXXXXX")"
 # The preview never captures audio. Close only the instance for this run, including on failure.
+SMOKE_PID=""
 cleanup() {
-  local pids
-  pids="$(pgrep -f -- "--smoke-output $OUT/app.png" || true)"
-  if [[ -n "$pids" ]]; then kill $pids 2>/dev/null || true; fi
+  if [[ -n "$SMOKE_PID" ]]; then
+    kill "$SMOKE_PID" 2>/dev/null || true
+    wait "$SMOKE_PID" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
-if [[ "${A2A_SMOKE_SETUP:-0}" == 1 ]]; then
-  open -n "$APP" --args --smoke-output "$OUT/app.png" --smoke-setup
-else
-  open -n "$APP" --args --smoke-output "$OUT/app.png"
+SMOKE_ARGS=(--smoke-output "$OUT/app.png")
+if [[ "${A2A_SMOKE_RESET:-0}" == 1 ]]; then
+  printf '#!%s\n' "$SMOKE_PYTHON" > "$OUT/fake-pipeline"
+  cat >> "$OUT/fake-pipeline" <<'PY'
+import json, os, signal, sys, threading, time
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+def on_eof():
+    sys.stdin.buffer.read()
+    os._exit(0)
+threading.Thread(target=on_eof, daemon=True).start()
+print(json.dumps({"voice_status": "ready", "speaker": "S1", "seconds": 3}), flush=True)
+while True:
+    time.sleep(0.1)
+PY
+  chmod +x "$OUT/fake-pipeline"
+  SMOKE_ARGS+=(--smoke-reset --smoke-pipeline "$OUT/fake-pipeline")
+elif [[ "${A2A_SMOKE_SETUP:-0}" == 1 ]]; then
+  SMOKE_ARGS+=(--smoke-setup)
 fi
-for _ in {1..150}; do
+# Launch the exact executable: Launch Services can select an older registered A2A copy.
+"$APP/Contents/MacOS/A2A" "${SMOKE_ARGS[@]}" &
+SMOKE_PID=$!
+for _ in {1..300}; do
   [[ -f "$OUT/app.json" ]] && break
   sleep 0.1
 done
 [[ -f "$OUT/app.json" ]] || { echo "App did not produce startup evidence" >&2; exit 1; }
-WINDOW="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1])); assert e["mode"] == "synthetic-ui" and not e["running"]; assert e["playback_initial"] == "translated" and e["playback_original_selected"] and e["playback_final"] == "translated"; assert e["direction_initial"] == "zh-en" and e["direction_final"] == "en-zh" and e["direction_reset_readiness"]; assert e["qwen_ready"] and e["voice_gate"] and e["direct_pipeline"] and e["speaker_modes"] and e["missing_reference_blocked"] and e["short_reference_blocked"] and e["valid_reference_accepted"] and e["multiple_clears_reference"] and e["setup_succeeded"]; print(e["window_number"])' "$OUT/app.json")"
+WINDOW="$("$SMOKE_PYTHON" - "$OUT/app.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    evidence = json.load(stream)
+assert evidence["mode"] == "synthetic-ui" and not evidence["running"]
+assert evidence["playback_initial"] == evidence["playback_final"] == "translated"
+assert evidence["direction_initial"] == "zh-en" and evidence["direction_final"] == "en-zh"
+checks = (
+    "playback_original_selected", "direction_reset_readiness", "qwen_ready", "voice_gate",
+    "direct_pipeline", "speaker_modes", "memory_modes", "missing_reference_blocked",
+    "short_reference_blocked", "valid_reference_accepted", "multiple_clears_reference",
+    "setup_succeeded", "reset_restarted", "reset_cleared_reference", "reset_suppresses_stale",
+    "reset_keeps_delay", "stop_cancels_reset",
+)
+assert all(evidence[key] for key in checks), {key: evidence[key] for key in checks if not evidence[key]}
+print(evidence["window_number"])
+PY
+)"
 [[ "$WINDOW" -gt 0 ]] || { echo "App did not create a window" >&2; exit 1; }
 if [[ "${1:-}" == "--screenshot" ]]; then
   screencapture -x -o -l "$WINDOW" "$OUT/app.png"
