@@ -5,6 +5,13 @@ import A2AModels
 import SwiftUI
 import UniformTypeIdentifiers
 
+private enum AppVersion {
+    static var release: String {
+        Bundle.main.object(forInfoDictionaryKey: "A2AReleaseVersion") as? String ?? "development"
+    }
+    static var windowTitle: String { "A2A v\(release)" }
+}
+
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
     var model: SessionModel?
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -25,7 +32,7 @@ import UniformTypeIdentifiers
     @State private var model = SessionModel()
 
     var body: some Scene {
-        Window("A2A", id: "main") {
+        Window(AppVersion.windowTitle, id: "main") {
             ContentView(model: model).onAppear { delegate.model = model }
         }
         .defaultSize(width: 780, height: 700)
@@ -311,8 +318,9 @@ private struct ContentView: View {
                 try? FileManager.default.removeItem(at: sampleURL)
                 try? await Task.sleep(for: .milliseconds(500))
                 let url = URL(fileURLWithPath: args[i + 1])
-                let window = NSApp.windows.first(where: { $0.title == "A2A" })
+                let window = NSApp.windows.first(where: { $0.title == AppVersion.windowTitle })
                 let evidence: [String: Any] = ["mode": "synthetic-ui", "running": model.running,
+                    "app_version": AppVersion.release, "window_title": window?.title ?? "",
                     "window_number": window?.windowNumber ?? 0, "direction_initial": initialDirection,
                     "direction_final": model.direction.rawValue, "direction_reset_readiness": directionResetReadiness,
                     "qwen_ready": qwenReady, "voice_gate": voiceGate, "direct_pipeline": directPipeline,

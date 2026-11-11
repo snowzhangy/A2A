@@ -29,6 +29,8 @@ fi
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers"
 cp "$BIN/A2A" "$APP/Contents/MacOS/A2A"
 cp "$ROOT/apple/Apps/A2A/Info.plist" "$APP/Contents/Info.plist"
+RELEASE_VERSION="$(tr -d '\r\n' < "$ROOT/VERSION")"
+/usr/libexec/PlistBuddy -c "Add :A2AReleaseVersion string $RELEASE_VERSION" "$APP/Contents/Info.plist"
 # Remove helpers no longer used by the app.
 rm -f "$APP/Contents/Helpers/a2a-preflight" "$APP/Contents/Helpers/a2a-transcribe"
 for tool in a2a-pipeline; do

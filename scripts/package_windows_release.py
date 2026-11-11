@@ -33,6 +33,8 @@ def main() -> None:
         ap.error("build and package the Windows library on Windows")
     if not re.fullmatch(r"v[0-9][A-Za-z0-9._-]*", args.tag):
         ap.error("invalid release tag")
+    if args.tag != "v" + (ROOT / "VERSION").read_text(encoding="utf-8").strip():
+        ap.error("the tag must match VERSION")
     if git("status", "--porcelain"):
         ap.error("commit the source changes before packaging")
     commit = git("rev-parse", "HEAD")

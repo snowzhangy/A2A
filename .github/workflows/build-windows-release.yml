@@ -32,7 +32,25 @@ jobs:
           PYTHONWARNDEFAULTENCODING: '1'
         run: |
           uv run --project harness python scripts/fetch_models.py --check
-          uv run --project runtime pytest runtime/tests -q -k "not test_windows_voices_render_cast_speakers_and_pace and not test_pipeline_translates_a_file_with_the_system_voice"
+          # The hosted server lacks the provisioned Windows 11 speech voices and Chinese
+          # word dictionary used by these OS-asset integration tests. Pure policy/native
+          # contracts still run; installed-language checks belong on the interactive host.
+          $selection = "not test_windows_voices_render_cast_speakers_and_pace and not test_pipeline_translates_a_file_with_the_system_voice and not test_the_windows_segmenter_keeps_a_length_cut_off_han_words"
+          uv run --project runtime pytest runtime/tests -q -k $selection
+      - name: Verify desktop title without capture or model discovery
+        run: |
+          @'
+          import tkinter as tk
+          from a2a_runtime import release_version
+          from a2a_runtime.ui import A2AWindow
+          root = tk.Tk()
+          root.withdraw()
+          A2AWindow(root, enumerate_on_start=False)
+          root.update_idletasks()
+          assert f"v{release_version()}" in root.title(), root.title()
+          print(root.title())
+          root.destroy()
+          '@ | uv run --project runtime python -
       - name: Exercise harness against the portable pipeline
         env:
           A2A_PIPELINE: ${{ github.workspace }}\runtime\.venv\Scripts\a2a-pipeline-portable.exe

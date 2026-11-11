@@ -10,6 +10,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from . import release_version
 from .ui_session import LoadingStages, PipelineProcess, SessionOptions, enumerate_devices, preflight, voice_progress_text
 
 BG = "#0e1421"
@@ -25,7 +26,7 @@ PRIMARY = "#3267d6"
 class A2AWindow:
     def __init__(self, root: tk.Tk, *, enumerate_on_start: bool = True) -> None:
         self.root = root
-        self.root.title("A2A — Live translation")
+        self.root.title(f"A2A v{release_version()} — Live translation")
         self.root.geometry("960x900")
         self.root.minsize(820, 760)
         self.root.configure(bg=BG)

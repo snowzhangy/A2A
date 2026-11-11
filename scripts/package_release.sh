@@ -7,6 +7,7 @@ source scripts/env.sh
 [[ "$(uname -m)" == "arm64" ]] || { echo "Build the macOS release on Apple silicon." >&2; exit 1; }
 TAG="${1:-}"
 [[ "$TAG" =~ ^v[0-9][A-Za-z0-9._-]*$ ]] || { echo "usage: scripts/package_release.sh TAG" >&2; exit 2; }
+[[ "$TAG" == "v$(tr -d '\r\n' < VERSION)" ]] || { echo "The tag must match VERSION." >&2; exit 1; }
 [[ -z "$(git status --porcelain)" ]] || { echo "Commit the source changes before packaging." >&2; exit 1; }
 COMMIT="$(git rev-parse HEAD)"
 [[ "$(git rev-parse "$TAG^{commit}")" == "$COMMIT" ]] || { echo "The release tag must point at HEAD." >&2; exit 1; }

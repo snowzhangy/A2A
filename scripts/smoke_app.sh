@@ -45,13 +45,17 @@ for _ in {1..300}; do
   sleep 0.1
 done
 [[ -f "$OUT/app.json" ]] || { echo "App did not produce startup evidence" >&2; exit 1; }
-WINDOW="$("$SMOKE_PYTHON" - "$OUT/app.json" <<'PY'
+WINDOW="$("$SMOKE_PYTHON" - "$OUT/app.json" "$ROOT/VERSION" <<'PY'
 import json
+from pathlib import Path
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as stream:
     evidence = json.load(stream)
 assert evidence["mode"] == "synthetic-ui" and not evidence["running"]
+expected_version = Path(sys.argv[2]).read_text(encoding="utf-8").strip()
+assert evidence["app_version"] == expected_version
+assert evidence["window_title"] == f"A2A v{expected_version}"
 assert evidence["playback_initial"] == evidence["playback_final"] == "translated"
 assert evidence["direction_initial"] == "zh-en" and evidence["direction_final"] == "en-zh"
 checks = (

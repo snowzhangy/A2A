@@ -28,6 +28,7 @@ If a source remains quiet after an interrupted run, follow the recovery instruct
 in `runtime/README.md`.
 
 The release workflow builds the DLL and checks deterministic runtime/harness behavior
-on a Windows runner without downloading models. Installed Windows voices, real model
+on a Windows runner without downloading models. The desktop title is also checked
+without starting discovery or inference. Installed Windows voices/Chinese word data, real model
 inference, devices, capture permissions, crash recovery and A/V quality require
 interactive Windows 11 qualification. This preview does not claim Mac production parity.
